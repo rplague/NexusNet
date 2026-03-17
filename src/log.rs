@@ -5,6 +5,7 @@ use std::sync::Mutex;
 use chrono::{DateTime, Local};
 use flate2::Compression;
 use flate2::write::GzEncoder;
+use colored::*;
 
 static LOG_FILE_MUTEX: Mutex<()> = Mutex::new(());
 
@@ -20,14 +21,25 @@ pub enum LogLevel {
 impl LogLevel {
     fn as_str(&self) -> &'static str {
         match self {
-            LogLevel::Important => "[IMPORTANT] ",
-            LogLevel::Debug => "[+] ",
-            LogLevel::Preset => "[-] ",
-            LogLevel::Warning => "[*] ",
-            LogLevel::Error => "[!] ",
-            LogLevel::Critical => "[CRITICAL] ",
+            LogLevel::Important => "[IMPORTANT]",
+            LogLevel::Debug => "[+]",
+            LogLevel::Preset => "[-]",
+            LogLevel::Warning => "[*]",
+            LogLevel::Error => "[!]",
+            LogLevel::Critical => "[CRITICAL]",
         }
     }
+    fn color(&self) -> ColoredString {
+        match self {
+            LogLevel::Important => "[IMPORTANT]".on_green().bold(),
+            LogLevel::Debug => "[+]".cyan(),
+            LogLevel::Preset => "[-]".into(),
+            LogLevel::Warning => "[*]".yellow(),
+            LogLevel::Error => "[!]".red(),
+            LogLevel::Critical => "[CRITICAL]".on_red().bold().blink(),
+        }
+    }
+    
 }
 
 pub struct LogStruct {
@@ -157,10 +169,13 @@ fn log(info : &LogStruct) {
     
 
     let prefix = info.level.as_str();
-    let text = format!("{}{}\n    {}\n    {}", prefix, time, info.topic, info.content);
+    let color_prefix = info.level.color();
+    let text = format!("{} {}\n    {}\n    {}", prefix, time, info.topic, info.content);
+    let cli_text = format!("{} {}\n    {}\n    {}", color_prefix, time, info.topic, info.content);
 
     // 输出到CLI
-    println!("{}", text);
+    println!("{}", cli_text);
+
     // 写入内容
     let _guard = LOG_FILE_MUTEX.lock().unwrap();
     let log_open_result = fs::OpenOptions::new()
@@ -196,8 +211,8 @@ fn log(info : &LogStruct) {
 
 fn log_onlycli(info : &LogStruct) {
     let time = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-    let prefix = info.level.as_str();
-    let text = format!("{}{}\n    {}\n    {}", prefix, time, info.topic, info.content);
+    let color_prefix = info.level.color();
+    let text = format!("{} {}\n    {}\n    {}", color_prefix, time, info.topic, info.content);
 
     // 输出到CLI
     println!("{}", text);
