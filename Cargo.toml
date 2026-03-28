@@ -1,5 +1,5 @@
 [package]
-name = "RUST_basic"
+name = "NexusNet"
 version = "0.1.0"
 edition = "2024"
 
@@ -7,4 +7,6 @@ edition = "2024"
 chrono = "0.4.44"
 colored = "3.1.1"
 flate2 = "1.1.9"
+libp2p = { version = "0.56.0", features = ["full"] }
 log = "0.4.29"
+tokio = { version = "1", features = ["full"] }
