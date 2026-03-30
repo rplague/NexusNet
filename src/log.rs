@@ -57,7 +57,6 @@ impl LogStruct {
 
 fn rolling_check() {
     const LOG_FILE: &str = "log";
-    const TMP_FILE: &str = "log.tmp";
     const MAX_SIZE: u64 = 10 * 1024 * 1024; // 10MB
     // 检查文件是否存在并获取大小
     let metadata = match fs::metadata(LOG_FILE) {
@@ -148,7 +147,6 @@ fn rolling_check() {
                         content: e.to_string(),
                     };
                     log(&_log);
-                    return;
                 }
             }
             Err(e) => {
@@ -158,7 +156,6 @@ fn rolling_check() {
                     content: e.to_string(),
                 };
                 log(&_log);
-                return;
             },
         };
     });
