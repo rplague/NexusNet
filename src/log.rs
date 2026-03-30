@@ -168,7 +168,7 @@ fn log(info : &LogStruct) {
     let prefix = info.level.as_str();
     let color_prefix = info.level.color();
     let text = format!("{} {}\n    {}\n    {}", prefix, time, info.topic, info.content);
-    let cli_text = format!("{} {}\n    {}\n    {}", color_prefix, time, info.topic, info.content);
+    let cli_text = format!("{} {}\n    {}", color_prefix, info.topic, info.content);
 
     // 输出到CLI
     println!("{}", cli_text);
@@ -193,7 +193,7 @@ fn log(info : &LogStruct) {
     };
     let write_result = writeln!(log, "{}", text);
     match write_result {
-        Ok(_) => return,
+        Ok(_) => {},
         Err(_error) => {
             let log = LogStruct {
                 level: LogLevel::Error,
@@ -201,15 +201,13 @@ fn log(info : &LogStruct) {
                 content: "log文件无法被追加写入".to_string(),
             };
             log_onlycli(&log);
-            return;
         },
     };
 }
 
 fn log_onlycli(info : &LogStruct) {
-    let time = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     let color_prefix = info.level.color();
-    let text = format!("{} {}\n    {}\n    {}", color_prefix, time, info.topic, info.content);
+    let text = format!("{} {}\n    {}", color_prefix, info.topic, info.content);
 
     // 输出到CLI
     println!("{}", text);
