@@ -1,20 +1,13 @@
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, UdpSocket, SocketAddr};
 use std::fs;
+use std::time::Duration;
 
-use crate::{
-    LogStruct,
-    LogLevel
-};
-
-use libp2p::swarm::behaviour;
-use tokio::time::{interval, Duration, Interval};
 use libp2p::{
     PeerId,
     Multiaddr,
     identity,
     ping,
     swarm::NetworkBehaviour,
-    Swarm,
     identify,
     StreamProtocol,
 };
@@ -46,38 +39,46 @@ impl From<identify::Event> for NetBehaviourEvent {
     }
 }
 
-pub fn get_network_addresses() -> Result<(String, String), Box<dyn std::error::Error>> {
-    let mut ipv4_address = String::new();
-    let mut ipv6_address = String::new();
 
-    // 尝试获取本地IP地址
-    if let Ok(local_ip) = get_local_ip() {
-        match local_ip {
-            IpAddr::V4(ip) => ipv4_address = ip.to_string(),
-            IpAddr::V6(ip) => ipv6_address = ip.to_string(),
+pub fn get_network_addresses() -> Result<(String, String), Box<dyn std::error::Error>> {
+    let mut ipv4_addresses = String::new();
+    let mut ipv6_addresses = String::new();
+
+    // 获取所有网络接口的IP地址
+    for iface in get_if_addrs::get_if_addrs()? {
+        let addr = iface.addr;
+        
+        match addr.ip() {
+            IpAddr::V4(ipv4) => {
+                // 过滤掉本地回环和私有地址
+                if !ipv4.is_loopback() && !ipv4.is_private() && !ipv4.is_link_local() {
+                    ipv4_addresses = ipv4.to_string();
+                }
+            }
+            IpAddr::V6(ipv6) => {
+                // 过滤掉本地回环、本地链路和唯一本地地址
+                if !(ipv6.is_loopback() 
+                  || ipv6.is_unspecified()
+                  || ipv6.is_multicast()
+                  || ipv6.octets()[0] == 0xfe || (ipv6.octets()[1] & 0xc0) == 0x80 // 本地链路地址 fe80::/10
+                  || (ipv6.octets()[0] == 0xfc || ipv6.octets()[0] == 0xfd)) // 唯一本地地址 fc00::/7
+                {
+                    ipv6_addresses = ipv6.to_string();
+                }
+            }
         }
     }
 
-    // 通过外部服务获取公网IP（备选）
-    if ipv4_address.is_empty() && let Ok(public_ip) = get_public_ipv4() {
-        ipv4_address = public_ip;
+    // 如果没有找到公网IP，尝试通过外部服务获取
+    if ipv4_addresses.is_empty() && let Ok(public_ip) = get_public_ipv4() {
+        ipv4_addresses = public_ip;
+    }
+    
+    if ipv6_addresses.is_empty() && let Ok(public_ip) = get_public_ipv6() {
+        ipv6_addresses = public_ip;
+    }
 
-    };
-
-    if ipv6_address.is_empty() && let Ok(public_ip) = get_public_ipv6() {
-        ipv6_address = public_ip;
-    };
-
-    Ok((ipv4_address, ipv6_address))
-}
-
-// 获取本地IP地址
-fn get_local_ip() -> Result<IpAddr, Box<dyn std::error::Error>> {
-    // 尝试绑定一个UDP socket来获取本地地址
-    let socket = UdpSocket::bind("0.0.0.0:0")?;
-    socket.connect("8.8.8.8:80")?;
-    let local_addr = socket.local_addr()?;
-    Ok(local_addr.ip())
+    Ok((ipv4_addresses, ipv6_addresses))
 }
 
 // 通过外部服务获取公网IPv4
@@ -166,8 +167,8 @@ pub fn create_behaviour(
     
     // 创建组合行为
     let behaviour = NetBehaviour {
-        // ping: ping::Behaviour::new(ping::Config::new().with_interval(std::time::Duration::from_secs(20))), 
-        ping: ping::Behaviour::new(ping::Config::new()), 
+        ping: ping::Behaviour::new(ping::Config::new().with_interval(std::time::Duration::from_secs(20))), 
+        // ping: ping::Behaviour::new(ping::Config::new()), 
         identify: identify::Behaviour::new(identify_config),
     };
     
@@ -207,60 +208,5 @@ pub struct PeerInfo {
     pub score: Option<i32>,
     // 其他自定义标签
     pub tags: Option<Vec<String>>,
-}
-
-struct ScheduledTask {
-    name: String,
-    interval: Duration,
-    last_run: Option<std::time::Instant>,
-    enabled: bool,
-}
-
-impl ScheduledTask {
-    fn new(name: &str, interval_secs: u64) -> Self {
-        Self {
-            name: name.to_string(),
-            interval: Duration::from_secs(interval_secs),
-            last_run: None,
-            enabled: true,
-        }
-    }
-}
-
-pub struct TaskScheduler {
-    tasks: Vec<ScheduledTask>,
-    intervals: Vec<Interval>,
-}
-
-impl TaskScheduler {
-    pub fn new() -> Self {
-        Self {
-            tasks: Vec::new(),
-            intervals: Vec::new(),
-        }
-    }
-    
-    pub fn add_task(&mut self, name: &str, interval_secs: u64) {
-        let task = ScheduledTask::new(name, interval_secs);
-        self.tasks.push(task);
-        self.intervals.push(interval(Duration::from_secs(interval_secs)));
-    }
-    
-    pub async fn run(&mut self, swarm: &mut Swarm<NetBehaviour>, peer_list: &Vec<PeerInfo>) {
-        for (i, interval) in self.intervals.iter_mut().enumerate() {
-            tokio::select! {
-                _ = interval.tick() => {
-                    match self.tasks[i].name.as_str() {
-                        "ping" => {
-                            // 删除报错的 perform_regular_ping(swarm, peer_list).await; 调用
-                            // libp2p 的 ping 机制是自动化的，交由底层网络流处理即可
-                        }
-                        _ => {}
-                    }
-                    self.tasks[i].last_run = Some(std::time::Instant::now());
-                }
-            }
-        }
-    }
 }
 
