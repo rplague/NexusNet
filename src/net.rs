@@ -167,7 +167,11 @@ pub fn create_behaviour(
     
     // 创建组合行为
     let behaviour = NetBehaviour {
-        ping: ping::Behaviour::new(ping::Config::new().with_interval(std::time::Duration::from_secs(20))), 
+        ping: ping::Behaviour::new(
+            ping::Config::new()
+            .with_interval(std::time::Duration::from_secs(5))
+            .with_timeout(std::time::Duration::from_secs(10))
+            ),
         // ping: ping::Behaviour::new(ping::Config::new()), 
         identify: identify::Behaviour::new(identify_config),
     };

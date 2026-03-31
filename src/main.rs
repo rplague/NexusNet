@@ -28,6 +28,7 @@ use libp2p::futures::StreamExt;
 
 use std::env;
 use std::error::Error;
+use std::time::Duration;
 
 use crate::config::NodeConfig;
 
@@ -142,6 +143,7 @@ async fn run_node(port: u16, connect_list: Vec<String>, config: &mut NodeConfig)
             yamux::Config::default,
         )?
         .with_behaviour(|_| behaviour)?
+        .with_swarm_config(|config| {config.with_idle_connection_timeout(Duration::from_secs(30))})
         .build();
 
     // 根据配置启用IPv4监听
@@ -226,32 +228,33 @@ async fn run_node(port: u16, connect_list: Vec<String>, config: &mut NodeConfig)
                 };
                 log.logout();
                 
-                let new_peer_info = PeerInfo {
-                    peer_id,
-                    name_string: None,
-                    addresses: Some(endpoint.get_remote_address().clone()),
-                    observed_addresses: None,
-                    public_key: None,
-                    rtt: None,
-                    connection_status: ConnectionStatus::Connected,
-                    supported_protocols: None,
-                    agent_version: None,
-                    score: None,
-                    tags: None,
-                };
+                
                 if let Some(index) = net_peer_list.iter().position(|p| p.peer_id == peer_id) {
                     net_peer_list[index].connection_status = ConnectionStatus::Connected;
                 } else {
+                    let new_peer_info = PeerInfo {
+                        peer_id,
+                        name_string: None,
+                        addresses: Some(endpoint.get_remote_address().clone()),
+                        observed_addresses: None,
+                        public_key: None,
+                        rtt: None,
+                        connection_status: ConnectionStatus::Connected,
+                        supported_protocols: None,
+                        agent_version: None,
+                        score: None,
+                        tags: None,
+                    };
                     net_peer_list.push(new_peer_info);
                 }
             }
             
             // 连接已关闭
-            SwarmEvent::ConnectionClosed { peer_id, .. } => {
+            SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
                 let log = LogStruct {
                     level: LogLevel::Preset,
                     topic: "连接关闭".to_string(),
-                    content: format!("连接关闭: {}", peer_id),
+                    content: format!("连接关闭: {}\n\t原因: {:?}", peer_id, cause),
                 };
                 log.logout();
                 // 修改状态
@@ -271,12 +274,6 @@ async fn run_node(port: u16, connect_list: Vec<String>, config: &mut NodeConfig)
                         match result {
                             // Ping成功，输出延迟
                             Ok(rtt) => {
-                                let log = LogStruct {
-                                    level: LogLevel::Debug,
-                                    topic: "Ping 响应".to_string(),
-                                    content: format!("收到 {} 的 Ping，延迟: {:?}", peer, rtt),
-                                };
-                                log.logout();
                                 if let Some(index) = net_peer_list.iter().position(|p| p.peer_id == peer_id) {
                                     net_peer_list[index].rtt = Some(rtt);
                                 }
