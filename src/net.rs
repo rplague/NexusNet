@@ -1,22 +1,30 @@
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, UdpSocket, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::fs;
-use std::time::Duration;
-
+use crate::{
+    LogStruct,
+    LogLevel,
+};
 use libp2p::{
-    PeerId,
-    Multiaddr,
+    kad, // 新增Kademlia
     identity,
     ping,
     swarm::NetworkBehaviour,
     identify,
     StreamProtocol,
+    Multiaddr,
+    PeerId,
 };
+
+// 导入Kademlia相关类型
+use libp2p::kad::store::MemoryStore;
+use libp2p::kad::RecordKey;
 // 定义组合行为
 #[derive(NetworkBehaviour)]
 #[behaviour(out_event = "NetBehaviourEvent")]
 pub struct NetBehaviour {
     pub ping: ping::Behaviour,
     pub identify: identify::Behaviour,
+    pub kademlia: kad::Behaviour<MemoryStore>, // 新增Kademlia行为
 }
 
 // 定义行为事件枚举
@@ -24,6 +32,7 @@ pub struct NetBehaviour {
 pub enum NetBehaviourEvent {
     Ping(ping::Event),
     Identify(identify::Event),
+    Kademlia(kad::Event),
 }
 
 // 实现 From trait 用于事件转换
@@ -39,6 +48,11 @@ impl From<identify::Event> for NetBehaviourEvent {
     }
 }
 
+impl From<kad::Event> for NetBehaviourEvent {
+    fn from(event: kad::Event) -> Self {
+        NetBehaviourEvent::Kademlia(event)
+    }
+}
 
 pub fn get_network_addresses() -> Result<(String, String), Box<dyn std::error::Error>> {
     let mut ipv4_addresses = String::new();
@@ -70,13 +84,25 @@ pub fn get_network_addresses() -> Result<(String, String), Box<dyn std::error::E
     }
 
     // 如果没有找到公网IP，尝试通过外部服务获取
-    if ipv4_addresses.is_empty() && let Ok(public_ip) = get_public_ipv4() {
-        ipv4_addresses = public_ip;
-    }
+    // if ipv4_addresses.is_empty() && let Ok(public_ip) = get_public_ipv4() {
+    //     let log = LogStruct {
+    //         level: LogLevel::Warning,
+    //         topic: "IPv4获取异常".to_string(),
+    //         content: "公网测试中……".to_string(),
+    //     };
+    //     log.logout();
+    //     ipv4_addresses = public_ip;
+    // }
     
-    if ipv6_addresses.is_empty() && let Ok(public_ip) = get_public_ipv6() {
-        ipv6_addresses = public_ip;
-    }
+    // if ipv6_addresses.is_empty() && let Ok(public_ip) = get_public_ipv6() {
+    //     let log = LogStruct {
+    //         level: LogLevel::Warning,
+    //         topic: "IPzv6获取异常".to_string(),
+    //         content: "公网测试中……".to_string(),
+    //     };
+    //     log.logout();
+    //     ipv6_addresses = public_ip;
+    // }
 
     Ok((ipv4_addresses, ipv6_addresses))
 }
@@ -157,26 +183,57 @@ pub fn create_behaviour(
     keypair: &identity::Keypair,
     protocol_name: &str,
 ) -> Result<NetBehaviour, Box<dyn std::error::Error>> {
-    
-    // 创建 Identify 配置
+    // Ping 配置
+    let ping_config = ping::Config::new()
+        .with_interval(std::time::Duration::from_secs(15))
+        .with_timeout(std::time::Duration::from_secs(10));
+
+    // Identify 配置
     let identify_config = identify::Config::new(
         format!("{}/{}", protocol_name, env!("CARGO_PKG_VERSION")),
         keypair.public(),
-    )
-    .with_agent_version(format!("{}/{}", protocol_name, env!("CARGO_PKG_VERSION")));
+    ).with_agent_version(format!("{}/{}", protocol_name, env!("CARGO_PKG_VERSION")));
     
+    // Kademlia 配置
+    let store = MemoryStore::new(keypair.public().to_peer_id());
+    let mut kademlia_config = kad::Config::default();
+    kademlia_config.set_record_ttl(Some(std::time::Duration::from_secs(3600)));
+
     // 创建组合行为
     let behaviour = NetBehaviour {
-        ping: ping::Behaviour::new(
-            ping::Config::new()
-            .with_interval(std::time::Duration::from_secs(5))
-            .with_timeout(std::time::Duration::from_secs(10))
-            ),
-        // ping: ping::Behaviour::new(ping::Config::new()), 
+        ping: ping::Behaviour::new(ping_config),
         identify: identify::Behaviour::new(identify_config),
+        kademlia: kad::Behaviour::with_config(keypair.public().to_peer_id(), store, kademlia_config)
     };
     
     Ok(behaviour)
+}
+
+pub fn store_record(
+    behaviour: &mut kad::Behaviour<MemoryStore>,
+    key: &[u8],
+    value: &[u8],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let key = RecordKey::new(&key);
+    behaviour.put_record(
+        kad::Record {
+            key,
+            value: value.to_vec(),
+            publisher: None,
+            expires: None,
+        },
+        kad::Quorum::One,
+    )?;
+    Ok(())
+}
+
+pub fn find_record(
+    behaviour: &mut kad::Behaviour<MemoryStore>,
+    key: &[u8],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let key = RecordKey::new(&key);
+    behaviour.get_record(key);
+    Ok(())
 }
 
 // 节点连接列表构建

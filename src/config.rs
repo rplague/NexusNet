@@ -23,7 +23,6 @@ pub struct NodeConfig {
 pub struct NodeInfo {
     pub name: String,
     pub description: String,
-    pub version: String,
 }
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
@@ -39,25 +38,29 @@ pub struct NetworkConfig {
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
 pub struct ServicesConfig {
     pub ping: PingService,
-    pub discovery: DiscoveryService,
+    pub kademlia: KademliaService,
 }
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
 pub struct PingService {
     pub enabled: bool,
-    pub interval_secs: u64,
+    pub interval_secs: u32,
+    pub with_timeout: u32,
 }
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
-pub struct DiscoveryService {
+pub struct KademliaService {
     pub enabled: bool,
+    pub record_ttl_seconds: u64,
+    pub replication_factor: usize,
+    pub query_timeout_seconds: u64,
     pub bootstrap_nodes: Vec<String>,
 }
 
 impl NodeConfig {
     pub fn insert_bootstrap_nodes(&mut self, info: String) {
-        if !self.services.discovery.bootstrap_nodes.iter().any(|node| node == &info) {
-            self.services.discovery.bootstrap_nodes.push(info);
+        if !self.services.kademlia.bootstrap_nodes.iter().any(|node| node == &info) {
+            self.services.kademlia.bootstrap_nodes.push(info);
         }
         let json_string = serde_json::to_string_pretty(self).unwrap();
         fs::write("./config.json", json_string).unwrap();
@@ -73,7 +76,6 @@ pub fn create_new_config_file() -> Result<NodeConfig, Box<dyn std::error::Error>
         node: NodeInfo {
             name: "未设置的p2p节点".to_string(),
             description: "无详细描述".to_string(),
-            version: "0.1.0".to_string(),
         },
         network: NetworkConfig {
             ipv4_enabled: !ipv4_address.is_empty(),
@@ -103,10 +105,14 @@ pub fn create_new_config_file() -> Result<NodeConfig, Box<dyn std::error::Error>
         services: ServicesConfig {
             ping: PingService {
                 enabled: true,
-                interval_secs: 30,
+                interval_secs: 15,
+                with_timeout: 10,
             },
-            discovery: DiscoveryService {
+            kademlia: KademliaService {
                 enabled: true,
+                record_ttl_seconds: 3600, // 1小时
+                replication_factor: 20,
+                query_timeout_seconds: 60,
                 bootstrap_nodes: vec![],
             },
         },

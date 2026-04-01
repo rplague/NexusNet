@@ -14,9 +14,10 @@ use net::{
     PeerInfo,
     ConnectionStatus,
 };
-
+use libp2p::kad::QueryResult;
 use libp2p::{
     tcp,
+    kad,
     noise,
     yamux,
     swarm::SwarmEvent,
@@ -37,8 +38,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut config = read_config_file().unwrap();
 
     // 从配置中获取初始连接列表
-    let mut connect_list: Vec<String> = if config.services.discovery.enabled {
-        config.services.discovery.bootstrap_nodes.clone()
+    let mut connect_list: Vec<String> = if config.services.kademlia.enabled {
+        config.services.kademlia.bootstrap_nodes.clone()
     } else {
         Vec::new()
     };
@@ -228,21 +229,47 @@ async fn run_node(port: u16, connect_list: Vec<String>, config: &mut NodeConfig)
                 };
                 log.logout();
                 
-                
+                let remote_addr = endpoint.get_remote_address();
+                swarm.behaviour_mut().kademlia.add_address(&peer_id, remote_addr.clone());
+                if config.services.kademlia.bootstrap_nodes.iter().any(|addr| 
+                addr.contains(&peer_id.to_string())) {
+                    match swarm.behaviour_mut().kademlia.bootstrap() {
+                        Ok(query_id) => {
+                            let log = LogStruct {
+                                level: LogLevel::Important,
+                                topic: "Kademlia引导".to_string(),
+                                content: format!("启动Kademlia引导，查询ID: {:?}", query_id),
+                            };
+                            log.logout();
+
+                            swarm.behaviour_mut().kademlia.get_closest_peers(peer_id);
+                        }
+                        Err(e) => {
+                            let log = LogStruct {
+                                level: LogLevel::Warning,
+                                topic: "Kademlia引导失败".to_string(),
+                                content: format!("无法启动引导: {:?}", e),
+                            };
+                            log.logout();
+                        }
+                    }
+                }
+
                 if let Some(index) = net_peer_list.iter().position(|p| p.peer_id == peer_id) {
+                    net_peer_list[index].addresses = Some(remote_addr.clone());
                     net_peer_list[index].connection_status = ConnectionStatus::Connected;
                 } else {
                     let new_peer_info = PeerInfo {
                         peer_id,
                         name_string: None,
-                        addresses: Some(endpoint.get_remote_address().clone()),
+                        addresses: Some(remote_addr.clone()),
                         observed_addresses: None,
                         public_key: None,
                         rtt: None,
                         connection_status: ConnectionStatus::Connected,
                         supported_protocols: None,
                         agent_version: None,
-                        score: None,
+                        score: Some(50),
                         tags: None,
                     };
                     net_peer_list.push(new_peer_info);
@@ -259,10 +286,12 @@ async fn run_node(port: u16, connect_list: Vec<String>, config: &mut NodeConfig)
                 log.logout();
                 // 修改状态
                 if let Some(index) = net_peer_list.iter().position(|p| p.peer_id == peer_id) {
-                    net_peer_list[index].connection_status = ConnectionStatus::Disconnected;
+                    if net_peer_list[index].agent_version == format!("/OAHD/{}", env!("CARGO_PKG_VERSION")).into(){
+                        net_peer_list[index].connection_status = ConnectionStatus::Disconnected;
+                    } else {
+                        net_peer_list.retain(|peer| peer.peer_id != peer_id);
+                    }
                 }
-                // 直接清理
-                // net_peer_list.retain(|peer| peer.peer_id != peer_id);
             }
             
             // 网络行为产生的事件
@@ -272,13 +301,11 @@ async fn run_node(port: u16, connect_list: Vec<String>, config: &mut NodeConfig)
                     NetBehaviourEvent::Ping(event) => {
                         let libp2p::ping::Event { peer, result, connection: _ } = event;
                         match result {
-                            // Ping成功，输出延迟
                             Ok(rtt) => {
-                                if let Some(index) = net_peer_list.iter().position(|p| p.peer_id == peer_id) {
+                                if let Some(index) = net_peer_list.iter().position(|p| p.peer_id == peer) {
                                     net_peer_list[index].rtt = Some(rtt);
                                 }
                             }
-                            // Ping失败
                             Err(e) => {
                                 let log = LogStruct {
                                     level: LogLevel::Warning,
@@ -286,7 +313,7 @@ async fn run_node(port: u16, connect_list: Vec<String>, config: &mut NodeConfig)
                                     content: format!("Ping 失败 {}: {:?}", peer, e),
                                 };
                                 log.logout();
-                                if let Some(index) = net_peer_list.iter().position(|p| p.peer_id == peer_id) {
+                                if let Some(index) = net_peer_list.iter().position(|p| p.peer_id == peer) {
                                     net_peer_list[index].connection_status = ConnectionStatus::Disconnected;
                                 }
                             }
@@ -312,9 +339,10 @@ async fn run_node(port: u16, connect_list: Vec<String>, config: &mut NodeConfig)
                                 net_peer_list[index].public_key = Some(info.public_key.clone());
                                 net_peer_list[index].supported_protocols = Some(info.protocols.clone());
                                 // 若为我的节点则加入连接表中
-                                if config.services.discovery.enabled
+                                if config.services.kademlia.enabled
                                 && format!("/OAHD/{}", env!("CARGO_PKG_VERSION")) == info.agent_version.clone()
-                                && let Some(addr) = &net_peer_list[index].addresses {
+                                && let Some(addr) = &net_peer_list[index].addresses 
+                                && addr.iter().any(|proto| {matches!(proto, libp2p::multiaddr::Protocol::P2p(_))}){
                                     let addr_string = addr.to_string();
                                     config.insert_bootstrap_nodes(addr_string);
                                 }
@@ -336,6 +364,105 @@ async fn run_node(port: u16, connect_list: Vec<String>, config: &mut NodeConfig)
                         // 其他Identify事件（忽略）
                         _ => {}
                     },
+                    // Kademlia 事件处理
+                    NetBehaviourEvent::Kademlia(event) => {
+                        match event {
+                            kad::Event::OutboundQueryProgressed {id, result, ..} => {
+                                match result {
+                                    QueryResult::Bootstrap(result) => match result {
+                                        Ok(_ok) => {}
+                                        Err(e) => {
+                                            let log = LogStruct {
+                                                level: LogLevel::Warning,
+                                                topic: "Kademlia引导失败".to_string(),
+                                                content: format!("引导失败，查询ID: {:?}，错误: {:?}", id, e),
+                                            };
+                                            log.logout();
+                                        }
+                                    },
+                                    QueryResult::GetRecord(result) => match result {
+                                        Ok(_ok) => {}
+                                        Err(e) => {
+                                            let log = LogStruct {
+                                                level: LogLevel::Warning,
+                                                topic: "Kademlia查找失败".to_string(),
+                                                content: format!("查找失败: {:?}", e),
+                                            };
+                                            log.logout();
+                                        }
+                                    },
+                                    QueryResult::PutRecord(result) => match result {
+                                        Ok(kad::PutRecordOk { key, .. }) => {
+                                            let log = LogStruct {
+                                                level: LogLevel::Debug,
+                                                topic: "Kademlia存储记录".to_string(),
+                                                content: format!("成功存储记录: {:?}", key),
+                                            };
+                                            log.logout();
+                                        }
+                                        Err(e) => {
+                                            let log = LogStruct {
+                                                level: LogLevel::Warning,
+                                                topic: "Kademlia存储失败".to_string(),
+                                                content: format!("存储失败: {:?}", e),
+                                            };
+                                            log.logout();
+                                        }
+                                    },
+                                    QueryResult::GetClosestPeers(result) => match result {
+                                        Ok(ok) => {
+                                            let log = LogStruct {
+                                                level: LogLevel::Debug,
+                                                topic: "Kademlia发现节点".to_string(),
+                                                content: format!("发现 {} 个最近节点", ok.peers.len()),
+                                            };
+                                            log.logout();
+                                            
+                                            // 将发现的节点添加到net_peer_list
+                                            for peer_id in &ok.peers {
+                                                if net_peer_list.iter().all(|p| p.peer_id != peer_id.peer_id) {
+                                                    let new_peer = PeerInfo {
+                                                        peer_id: peer_id.peer_id,
+                                                        name_string: None,
+                                                        addresses: None,
+                                                        observed_addresses: None,
+                                                        public_key: None,
+                                                        rtt: None,
+                                                        connection_status: ConnectionStatus::Disconnected,
+                                                        supported_protocols: None,
+                                                        agent_version: None,
+                                                        score: Some(50), // 初始分数
+                                                        tags: None,
+                                                    };
+                                                    net_peer_list.push(new_peer);
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            let log = LogStruct {
+                                                level: LogLevel::Warning,
+                                                topic: "Kademlia节点发现失败".to_string(),
+                                                content: format!("发现失败: {:?}", e),
+                                            };
+                                            log.logout();
+                                        }
+                                    },
+                                    _ => {} // 其他查询结果类型
+                                }
+                            }
+                            // kad::Event::RoutingUpdated { peer, .. } => {
+                            // }
+                            kad::Event::UnroutablePeer { peer, .. } => {
+                                let log = LogStruct {
+                                    level: LogLevel::Warning,
+                                    topic: "Kademlia无法路由".to_string(),
+                                    content: format!("无法路由到节点: {}", peer),
+                                };
+                                log.logout();
+                            }
+                            _ => {} // 其他Kademlia事件
+                        }
+                    }
                 }
             }
             // 其他事件（忽略）
