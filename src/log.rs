@@ -32,10 +32,10 @@ impl LogLevel {
     fn color(&self) -> ColoredString {
         match self {
             LogLevel::Important => "[IMPORTANT]".on_green().bold(),
-            LogLevel::Debug =>     "        [+]".cyan(),
-            LogLevel::Preset =>    "        [-]".into(),
-            LogLevel::Warning =>   "        [*]".yellow(),
-            LogLevel::Error =>     "        [!]".red(),
+            LogLevel::Debug =>     "[+]".cyan(),
+            LogLevel::Preset =>    "[-]".into(),
+            LogLevel::Warning =>   "[*]".yellow(),
+            LogLevel::Error =>     "[!]".red(),
             LogLevel::Critical => "[CRITICAL]".on_red().bold().blink(),
         }
     }
