@@ -1,9 +1,7 @@
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::IpAddr;
 use std::fs;
-use crate::{
-    LogStruct,
-    LogLevel,
-};
+use crate::config::NodeConfig;
+use libp2p::multiaddr::Protocol;
 use libp2p::{
     kad, // 新增Kademlia
     identity,
@@ -17,7 +15,6 @@ use libp2p::{
 
 // 导入Kademlia相关类型
 use libp2p::kad::store::MemoryStore;
-use libp2p::kad::RecordKey;
 // 定义组合行为
 #[derive(NetworkBehaviour)]
 #[behaviour(out_event = "NetBehaviourEvent")]
@@ -83,86 +80,37 @@ pub fn get_network_addresses() -> Result<(String, String), Box<dyn std::error::E
         }
     }
 
-    // 如果没有找到公网IP，尝试通过外部服务获取
-    // if ipv4_addresses.is_empty() && let Ok(public_ip) = get_public_ipv4() {
-    //     let log = LogStruct {
-    //         level: LogLevel::Warning,
-    //         topic: "IPv4获取异常".to_string(),
-    //         content: "公网测试中……".to_string(),
-    //     };
-    //     log.logout();
-    //     ipv4_addresses = public_ip;
-    // }
-    
-    // if ipv6_addresses.is_empty() && let Ok(public_ip) = get_public_ipv6() {
-    //     let log = LogStruct {
-    //         level: LogLevel::Warning,
-    //         topic: "IPzv6获取异常".to_string(),
-    //         content: "公网测试中……".to_string(),
-    //     };
-    //     log.logout();
-    //     ipv6_addresses = public_ip;
-    // }
-
     Ok((ipv4_addresses, ipv6_addresses))
 }
 
-// 通过外部服务获取公网IPv4
-fn get_public_ipv4() -> Result<String, Box<dyn std::error::Error>> {
-    let services = [
-        "https://api.ipify.org",
-        "https://checkip.amazonaws.com",
-        "https://icanhazip.com",
-    ];
+pub fn appropriate_address_filter(
+    listen_addrs: &[Multiaddr],
+    config: &NodeConfig,
+) -> Option<Multiaddr> {
+    // 定义优先级：如果两者都启用，IPv4优先
+    let preferred_order = if config.network.ipv4_enabled && config.network.ipv6_enabled {
+        vec![Protocol::Ip4([0, 0, 0, 0].into()), Protocol::Ip6([0, 0, 0, 0, 0, 0, 0, 0].into())]
+    } else if config.network.ipv4_enabled {
+        vec![Protocol::Ip4([0, 0, 0, 0].into())]
+    } else if config.network.ipv6_enabled {
+        vec![Protocol::Ip6([0, 0, 0, 0, 0, 0, 0, 0].into())]
+    } else {
+        return None; // 两者都禁用
+    };
 
-    for service in services {
-        match reqwest::blocking::get(service) {
-            Ok(response) => {
-                if let Ok(ip) = response.text() {
-                    let ip = ip.trim().to_string();
-                    // 验证是否为有效的IP地址
-                    if ip.parse::<Ipv4Addr>().is_ok() || ip.parse::<Ipv6Addr>().is_ok() {
-                        return Ok(ip);
-                    }
-                }
+    // 按优先级查找地址
+    for protocol_type in preferred_order {
+        for addr in listen_addrs {
+            if addr.iter().any(|proto| {
+                matches!(proto, Protocol::Ip4(_)) && matches!(protocol_type, Protocol::Ip4(_)) ||
+                matches!(proto, Protocol::Ip6(_)) && matches!(protocol_type, Protocol::Ip6(_))
+            }) {
+                return Some(addr.clone());
             }
-            Err(_) => continue,
         }
     }
-
-    Err("无法获取公网IP".into())
-}
-
-fn get_public_ipv6() -> Result<String, Box<dyn std::error::Error>> {
-    let services = [
-        "https://api6.ipify.org",          // ipify 的 IPv6 专用端点
-        "https://icanhazip.com",           // 支持 IPv6
-        "https://checkip.amazonaws.com",   // 支持 IPv6
-        "https://v6.ident.me",             // IPv6 专用
-        "https://ipv6.seeip.org",          // IPv6 专用
-    ];
-
-    for service in services {
-        match reqwest::blocking::get(service) {
-            Ok(response) => {
-                if let Ok(ip) = response.text() {
-                    let ip = ip.trim().to_string();
-                    
-                    // 优先验证 IPv6，如果是 IPv4 则跳过
-                    if ip.parse::<Ipv6Addr>().is_ok() {
-                        return Ok(ip);
-                    }
-                    // 如果是 IPv4，继续尝试其他服务获取 IPv6
-                    else if ip.parse::<Ipv4Addr>().is_ok() {
-                        continue; // 跳过 IPv4 地址，继续寻找 IPv6
-                    }
-                }
-            }
-            Err(_) => continue,
-        }
-    }
-
-    Err("无法获取公网IPv6地址".into())
+    
+    None
 }
 
 pub fn get_key() -> Result<identity::Keypair, Box<dyn std::error::Error>> {
@@ -196,44 +144,19 @@ pub fn create_behaviour(
     
     // Kademlia 配置
     let store = MemoryStore::new(keypair.public().to_peer_id());
-    let mut kademlia_config = kad::Config::default();
+    let mut kademlia_config = kad::Config::new(libp2p::StreamProtocol::new("/ipfs/kad/1.0.0"));
     kademlia_config.set_record_ttl(Some(std::time::Duration::from_secs(3600)));
-
+    kademlia_config.set_periodic_bootstrap_interval(Some(std::time::Duration::from_secs(20)));
+    let mut kademlia = kad::Behaviour::with_config(keypair.public().to_peer_id(), store, kademlia_config);
+    kademlia.set_mode(Some(kad::Mode::Server));
     // 创建组合行为
     let behaviour = NetBehaviour {
         ping: ping::Behaviour::new(ping_config),
         identify: identify::Behaviour::new(identify_config),
-        kademlia: kad::Behaviour::with_config(keypair.public().to_peer_id(), store, kademlia_config)
+        kademlia
     };
     
     Ok(behaviour)
-}
-
-pub fn store_record(
-    behaviour: &mut kad::Behaviour<MemoryStore>,
-    key: &[u8],
-    value: &[u8],
-) -> Result<(), Box<dyn std::error::Error>> {
-    let key = RecordKey::new(&key);
-    behaviour.put_record(
-        kad::Record {
-            key,
-            value: value.to_vec(),
-            publisher: None,
-            expires: None,
-        },
-        kad::Quorum::One,
-    )?;
-    Ok(())
-}
-
-pub fn find_record(
-    behaviour: &mut kad::Behaviour<MemoryStore>,
-    key: &[u8],
-) -> Result<(), Box<dyn std::error::Error>> {
-    let key = RecordKey::new(&key);
-    behaviour.get_record(key);
-    Ok(())
 }
 
 // 节点连接列表构建
@@ -270,4 +193,3 @@ pub struct PeerInfo {
     // 其他自定义标签
     pub tags: Option<Vec<String>>,
 }
-

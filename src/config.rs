@@ -9,7 +9,7 @@ use std::path::Path;
 use std::io::ErrorKind;
 use serde_json::from_str;
 
-use libp2p::PeerId;
+use libp2p::{Multiaddr, PeerId};
 
 // 定义配置结构体
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
@@ -59,12 +59,58 @@ pub struct KademliaService {
 
 impl NodeConfig {
     pub fn insert_bootstrap_nodes(&mut self, info: String) {
-        if !self.services.kademlia.bootstrap_nodes.iter().any(|node| node == &info) {
-            self.services.kademlia.bootstrap_nodes.push(info);
+        // 从info中提取peer_id
+        let new_peer_id = extract_peer_id_from_multiaddr(&info);
+        
+        if let Some(new_peer_id) = new_peer_id {
+            // 查找是否已存在相同peer_id的节点
+            let existing_index = self.services.kademlia.bootstrap_nodes.iter()
+                .position(|node| {
+                    if let Some(existing_peer_id) = extract_peer_id_from_multiaddr(node) {
+                        existing_peer_id == new_peer_id
+                    } else {
+                        false
+                    }
+                });
+            
+            match existing_index {
+                Some(index) => {
+                    // 替换现有节点的地址
+                    self.services.kademlia.bootstrap_nodes[index] = info;
+                }
+                None => {
+                    // 添加新节点
+                    self.services.kademlia.bootstrap_nodes.push(info);
+                    // let log = LogStruct {
+                    //     level: LogLevel::Debug,
+                    //     topic: "添加引导节点".to_string(),
+                    //     content: format!("添加新节点 {}", new_peer_id),
+                    // };
+                    // log.logout();
+                }
+            }
+        } else {
+            return;
         }
+        
+        // 保存到配置文件
         let json_string = serde_json::to_string_pretty(self).unwrap();
         fs::write("./config.json", json_string).unwrap();
     }
+}
+
+// 辅助函数：从Multiaddr中提取PeerId
+fn extract_peer_id_from_multiaddr(addr: &str) -> Option<String> {
+    // 尝试解析为Multiaddr
+    if let Ok(multiaddr) = addr.parse::<Multiaddr>() {
+        // 遍历协议组件，查找p2p部分
+        for protocol in multiaddr.iter() {
+            if let libp2p::multiaddr::Protocol::P2p(peer_id) = protocol {
+                return Some(peer_id.to_string());
+            }
+        }
+    }
+    None
 }
 
 pub fn create_new_config_file() -> Result<NodeConfig, Box<dyn std::error::Error>> {
@@ -98,6 +144,8 @@ pub fn create_new_config_file() -> Result<NodeConfig, Box<dyn std::error::Error>
                 }else{
                     vec![format!("/ip4/{}/tcp/5000/p2p/{}", ipv4_address, PeerId::from(keypair.public()))]
                 }
+            } else if !ipv6_address.is_empty() {
+                    vec![format!("/ip6/{}/tcp/5000/p2p/{}", ipv6_address, PeerId::from(keypair.public()))]
             } else {
                 vec![]
             },
@@ -221,8 +269,6 @@ pub fn read_config_file() -> Result<NodeConfig, Box<dyn std::error::Error>> {
         },
     }
 }
-
-
 fn init_update_config(config: &mut NodeConfig) {
     let keypair = get_key().unwrap();
     let (ipv4_address, ipv6_address) = get_network_addresses().unwrap();

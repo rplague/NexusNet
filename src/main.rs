@@ -8,24 +8,25 @@ use config::read_config_file;
 mod net;
 use net::{
     get_network_addresses,
+    appropriate_address_filter,
     get_key,
     create_behaviour,
     NetBehaviourEvent,
     PeerInfo,
     ConnectionStatus,
 };
-use libp2p::kad::QueryResult;
 use libp2p::{
     tcp,
     kad,
+    kad::QueryResult,
     noise,
     yamux,
     swarm::SwarmEvent,
     SwarmBuilder,
     PeerId,
     Multiaddr,
+    futures::StreamExt,
 };
-use libp2p::futures::StreamExt;
 
 use std::env;
 use std::error::Error;
@@ -65,11 +66,6 @@ fn main() -> Result<(), Box<dyn Error>> {
                     connect_list.push(args[i + 1].clone());
                     i += 1;
                 }
-            }
-            // 可以添加多连接参数支持
-            "--connect-multi" => {
-                // 如果需要支持多个 --connect 参数
-                // 可以收集多个地址
             }
             _ => {}
         }
@@ -122,15 +118,7 @@ async fn run_node(port: u16, connect_list: Vec<String>, config: &mut NodeConfig)
     let keypair = get_key()?;
     
     // 从公钥计算Peer ID（节点的唯一标识符）
-    let peer_id = PeerId::from(keypair.public());
-    
-    // 输出节点的Peer ID
-    let log = LogStruct {
-        level: LogLevel::Important,
-        topic: format!("节点 Peer ID: {}", peer_id),
-        content: "".to_string(),
-    };
-    log.logout();
+    let my_peer_id = PeerId::from(keypair.public());
     
     // 创建网络行为组合（包含ping、identify等协议）
     let behaviour = create_behaviour(&keypair, "/OAHD")?;
@@ -144,28 +132,28 @@ async fn run_node(port: u16, connect_list: Vec<String>, config: &mut NodeConfig)
             yamux::Config::default,
         )?
         .with_behaviour(|_| behaviour)?
-        .with_swarm_config(|config| {config.with_idle_connection_timeout(Duration::from_secs(30))})
+        .with_swarm_config(|config| {config.with_idle_connection_timeout(Duration::from_secs(300))})
         .build();
-
+    
+    let (ipv4_address, ipv6_address) = get_network_addresses()?;
     // 根据配置启用IPv4监听
     if config.network.ipv4_enabled {
-        let listen_addr_v4: Multiaddr = format!("/ip4/0.0.0.0/tcp/{}", port).parse()?;
+        let listen_addr_v4: Multiaddr = format!("/ip4/{}/tcp/{}", ipv4_address, port).parse()?;
         swarm.listen_on(listen_addr_v4)?;  // 绑定到所有IPv4接口的指定端口
     }
     
     // 根据配置启用IPv6监听
     if config.network.ipv6_enabled {
-        let listen_addr_v6: Multiaddr = format!("/ip6/::/tcp/{}", port).parse()?;
+        let listen_addr_v6: Multiaddr = format!("/ip6/{}/tcp/{}", ipv6_address, port).parse()?;
         swarm.listen_on(listen_addr_v6)?;  // 绑定到所有IPv6接口的指定端口
     }
     
     // 如果有连接参数，尝试连接到指定的远程节点
-
     for connect_to in connect_list{
         match connect_to.parse::<Multiaddr>() {
             Ok(remote_addr) => {
                 let log = LogStruct {
-                    level: LogLevel::Important,
+                    level: LogLevel::Preset,
                     topic: "尝试连接".to_string(),
                     content: format!("尝试连接到: {}", remote_addr),
                 };
@@ -200,7 +188,7 @@ async fn run_node(port: u16, connect_list: Vec<String>, config: &mut NodeConfig)
     let log = LogStruct {
         level: LogLevel::Important,
         topic: "节点启动".to_string(),
-        content: format!("节点已启动，监听端口: {}", port),
+        content: format!("节点已启动，监听端口: {}\n\tpeer_id: {}", port, my_peer_id),
     };
     log.logout();
     
@@ -209,7 +197,6 @@ async fn run_node(port: u16, connect_list: Vec<String>, config: &mut NodeConfig)
         match swarm.select_next_some().await {
             // // 新的监听地址已添加
             // SwarmEvent::NewListenAddr { .. } => {}
-            
             // 传入连接错误事件
             SwarmEvent::IncomingConnectionError { connection_id, local_addr: _, send_back_addr, error, peer_id: _ } => {
                 let log = LogStruct {
@@ -219,63 +206,35 @@ async fn run_node(port: u16, connect_list: Vec<String>, config: &mut NodeConfig)
                 };
                 log.logout();
             }
-            
             // 连接已成功建立
-            SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
+            SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                 let log = LogStruct {
                     level: LogLevel::Preset,
                     topic: "连接建立".to_string(),
                     content: format!("已连接到节点: {}", peer_id),
                 };
                 log.logout();
-                
-                let remote_addr = endpoint.get_remote_address();
-                swarm.behaviour_mut().kademlia.add_address(&peer_id, remote_addr.clone());
-                if config.services.kademlia.bootstrap_nodes.iter().any(|addr| 
-                addr.contains(&peer_id.to_string())) {
-                    match swarm.behaviour_mut().kademlia.bootstrap() {
-                        Ok(query_id) => {
-                            let log = LogStruct {
-                                level: LogLevel::Important,
-                                topic: "Kademlia引导".to_string(),
-                                content: format!("启动Kademlia引导，查询ID: {:?}", query_id),
-                            };
-                            log.logout();
+                let peer = peer_id;
 
-                            swarm.behaviour_mut().kademlia.get_closest_peers(peer_id);
-                        }
-                        Err(e) => {
-                            let log = LogStruct {
-                                level: LogLevel::Warning,
-                                topic: "Kademlia引导失败".to_string(),
-                                content: format!("无法启动引导: {:?}", e),
-                            };
-                            log.logout();
-                        }
-                    }
-                }
-
-                if let Some(index) = net_peer_list.iter().position(|p| p.peer_id == peer_id) {
-                    net_peer_list[index].addresses = Some(remote_addr.clone());
+                if let Some(index) = net_peer_list.iter().position(|p| p.peer_id == peer) {
                     net_peer_list[index].connection_status = ConnectionStatus::Connected;
                 } else {
                     let new_peer_info = PeerInfo {
-                        peer_id,
+                        peer_id: peer ,
                         name_string: None,
-                        addresses: Some(remote_addr.clone()),
+                        addresses: None,
                         observed_addresses: None,
                         public_key: None,
                         rtt: None,
                         connection_status: ConnectionStatus::Connected,
                         supported_protocols: None,
                         agent_version: None,
-                        score: Some(50),
+                        score: Some(0),
                         tags: None,
                     };
                     net_peer_list.push(new_peer_info);
                 }
             }
-            
             // 连接已关闭
             SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
                 let log = LogStruct {
@@ -289,11 +248,10 @@ async fn run_node(port: u16, connect_list: Vec<String>, config: &mut NodeConfig)
                     if net_peer_list[index].agent_version == format!("/OAHD/{}", env!("CARGO_PKG_VERSION")).into(){
                         net_peer_list[index].connection_status = ConnectionStatus::Disconnected;
                     } else {
-                        net_peer_list.retain(|peer| peer.peer_id != peer_id);
+                        net_peer_list.retain(|p| p.peer_id != peer_id);
                     }
                 }
             }
-            
             // 网络行为产生的事件
             SwarmEvent::Behaviour(event) => {
                 match event {
@@ -314,7 +272,11 @@ async fn run_node(port: u16, connect_list: Vec<String>, config: &mut NodeConfig)
                                 };
                                 log.logout();
                                 if let Some(index) = net_peer_list.iter().position(|p| p.peer_id == peer) {
-                                    net_peer_list[index].connection_status = ConnectionStatus::Disconnected;
+                                    if net_peer_list[index].agent_version == format!("/OAHD/{}", env!("CARGO_PKG_VERSION")).into(){
+                                        net_peer_list[index].connection_status = ConnectionStatus::Disconnected;
+                                    } else {
+                                        net_peer_list.retain(|p| p.peer_id != peer);
+                                    }
                                 }
                             }
                         }
@@ -324,10 +286,10 @@ async fn run_node(port: u16, connect_list: Vec<String>, config: &mut NodeConfig)
                         // 收到其他节点的身份信息
                         libp2p::identify::Event::Received { peer_id, info, connection_id: _ } => {
                             let log = LogStruct {
-                                level: LogLevel::Important,
+                                level: LogLevel::Preset,
                                 topic: "身份交换".to_string(),
                                 content: format!(
-                                    "收到 {} 的身份信息\n监听地址: {:?}\n协议: {:?}\n版本: {}",
+                                    "收到 {} 的身份信息\n\t地址: {:?}\n\t协议: {:?}\n\t版本: {}",
                                     peer_id, info.listen_addrs, info.protocols, info.agent_version
                                 ),
                             };
@@ -335,17 +297,48 @@ async fn run_node(port: u16, connect_list: Vec<String>, config: &mut NodeConfig)
                             // 确认身份并录入信息
                             if let Some(index) = net_peer_list.iter().position(|p| p.peer_id == peer_id) {
                                 net_peer_list[index].agent_version = Some(info.agent_version.clone());
+                                let mut addr_with_peer_id = appropriate_address_filter(&info.listen_addrs, config).expect("");
+                                addr_with_peer_id.push(libp2p::multiaddr::Protocol::P2p(peer_id));
+                                net_peer_list[index].addresses = Some(addr_with_peer_id.clone());
                                 net_peer_list[index].observed_addresses = Some(info.observed_addr.clone());
                                 net_peer_list[index].public_key = Some(info.public_key.clone());
                                 net_peer_list[index].supported_protocols = Some(info.protocols.clone());
-                                // 若为我的节点则加入连接表中
+                                // 若为我的节点则加入连接表中并开始kad协议
                                 if config.services.kademlia.enabled
                                 && format!("/OAHD/{}", env!("CARGO_PKG_VERSION")) == info.agent_version.clone()
                                 && let Some(addr) = &net_peer_list[index].addresses 
                                 && addr.iter().any(|proto| {matches!(proto, libp2p::multiaddr::Protocol::P2p(_))}){
                                     let addr_string = addr.to_string();
                                     config.insert_bootstrap_nodes(addr_string);
+                                    // 加入节点列表
+                                    swarm.behaviour_mut().kademlia.add_address(&peer_id, addr_with_peer_id.clone());
+                                    let log = LogStruct {
+                                        level: LogLevel::Preset,
+                                        topic: format!("{}已被加入路由节点", peer_id),
+                                        content: "".to_string(),
+                                    };
+                                    log.logout();
+                                    println!("路由表总节点数: {}", swarm.behaviour_mut().kademlia.kbuckets().count());
+
+                                } else {
+                                    let log = LogStruct {
+                                        level: LogLevel::Warning,
+                                        topic: "未知节点接入网络".to_string(),
+                                        content: format!(
+                                            "收到 {} 后未能创建列表内容！{}",
+                                            peer_id,
+                                            net_peer_list[index].addresses.as_ref().unwrap()
+                                        ),
+                                    };
+                                    log.logout();
                                 }
+                            } else {
+                                let log = LogStruct {
+                                    level: LogLevel::Warning,
+                                    topic: "异常".to_string(),
+                                    content: "net_peer_list未找到节点信息？".to_string()
+                                };
+                                log.logout();
                             }
                         }
 
@@ -370,7 +363,8 @@ async fn run_node(port: u16, connect_list: Vec<String>, config: &mut NodeConfig)
                             kad::Event::OutboundQueryProgressed {id, result, ..} => {
                                 match result {
                                     QueryResult::Bootstrap(result) => match result {
-                                        Ok(_ok) => {}
+                                        Ok(_) => {
+                                        }
                                         Err(e) => {
                                             let log = LogStruct {
                                                 level: LogLevel::Warning,
@@ -381,7 +375,14 @@ async fn run_node(port: u16, connect_list: Vec<String>, config: &mut NodeConfig)
                                         }
                                     },
                                     QueryResult::GetRecord(result) => match result {
-                                        Ok(_ok) => {}
+                                        Ok(_ok) => {
+                                            let log = LogStruct {
+                                                level: LogLevel::Debug,
+                                                topic: "Kademlia查找详情".to_string(),
+                                                content: format!("查找结果: {:?}", _ok),
+                                            };
+                                            log.logout();
+                                        }
                                         Err(e) => {
                                             let log = LogStruct {
                                                 level: LogLevel::Warning,
@@ -411,20 +412,25 @@ async fn run_node(port: u16, connect_list: Vec<String>, config: &mut NodeConfig)
                                     },
                                     QueryResult::GetClosestPeers(result) => match result {
                                         Ok(ok) => {
-                                            let log = LogStruct {
-                                                level: LogLevel::Debug,
-                                                topic: "Kademlia发现节点".to_string(),
-                                                content: format!("发现 {} 个最近节点", ok.peers.len()),
-                                            };
-                                            log.logout();
+                                            if ! ok.peers.is_empty(){
+                                                let log = LogStruct {
+                                                    level: LogLevel::Debug,
+                                                    topic: "Kademlia发现节点".to_string(),
+                                                    content: format!("发现 {} 个最近节点", ok.peers.len()),
+                                                };
+                                                log.logout();
+                                            }
+                                            
                                             
                                             // 将发现的节点添加到net_peer_list
-                                            for peer_id in &ok.peers {
-                                                if net_peer_list.iter().all(|p| p.peer_id != peer_id.peer_id) {
+                                            for peer in &ok.peers {
+                                                if let Some(index) = net_peer_list.iter().position(|p| p.peer_id == peer.peer_id) {
+                                                    net_peer_list[index].addresses = Some(peer.addrs.to_vec()[0].clone());
+                                                } else {
                                                     let new_peer = PeerInfo {
-                                                        peer_id: peer_id.peer_id,
+                                                        peer_id: peer.peer_id,
                                                         name_string: None,
-                                                        addresses: None,
+                                                        addresses: Some(peer.addrs.to_vec()[0].clone()),
                                                         observed_addresses: None,
                                                         public_key: None,
                                                         rtt: None,
@@ -435,6 +441,16 @@ async fn run_node(port: u16, connect_list: Vec<String>, config: &mut NodeConfig)
                                                         tags: None,
                                                     };
                                                     net_peer_list.push(new_peer);
+                                                }
+                                                if let Some(index) = net_peer_list.iter().position(|p| p.peer_id == peer.peer_id) 
+                                                && net_peer_list[index].connection_status == ConnectionStatus::Disconnected{
+                                                    let log = LogStruct {
+                                                        level: LogLevel::Preset,
+                                                        topic: "尝试连接".to_string(),
+                                                        content: format!("尝试连接到: {}", peer.addrs.to_vec()[0].clone()),
+                                                    };
+                                                    log.logout();
+                                                    let _ = swarm.dial(peer.addrs.to_vec()[0].clone());
                                                 }
                                             }
                                         }
