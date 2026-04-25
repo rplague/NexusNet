@@ -8,37 +8,70 @@ NexusNet 是 OAHD（Open Autonomous Hosting & Decentralization）计划的网络
 
 - **动态 IP 地址更新** — 节点 IP 变化后自动更新网络拓扑，确保其他节点仍能访问
 - **服务注册与发现** — 节点可声明自身提供的服务（如 OCR、冷存储），其他节点可查询可用服务
+- **本地服务调度** — 通信层与业务层分离，通过边车代理将请求转发到本地业务进程
 - **去中心化路由** — 不依赖中心服务器，通过 Kademlia DHT 实现分布式节点发现和寻址
 
 ## 项目状态
 
-当前版本：**0.1.1** — 核心 P2P 功能可用，服务注册/发现功能开发中。
+当前版本：**0.1.2** — 核心 P2P 功能可用，服务注册/发现与本地调度可用。
 
 ## 架构
 
 ```
-┌─────────────┐
-│  NexusNet   │
-│  P2P 节点    │
-├─────────────┤
-│ Ping        │ ← 节点健康检测、RTT 测量
-├─────────────┤
-│ Identify    │ ← 节点身份交换、版本协商
-├─────────────┤
-│ Kademlia    │ ← DHT 路由表、节点发现、记录存储
-├─────────────┤
-│ Service Reg │ ← [开发中] 服务注册/发现
-└─────────────┘
+                     ┌──────────────────────────────┐
+                     │        NexusNet 节点           │
+                     │   ┌──────────────────────┐   │
+                     │   │     P2P 通信层         │   │
+                     │   │  ┌─────┐ ┌────────┐  │   │
+                     │   │  │Ping │ │Identify│  │   │
+                     │   │  └─────┘ └────────┘  │   │
+                     │   │  ┌──────────┐        │   │
+                     │   │  │Kademlia  │        │   │
+                     │   │  │DHT 路由  │        │   │
+                     │   │  └──────────┘        │   │
+                     │   │  ┌────────────────┐  │   │
+                     │   │  │ 服务发现        │  │   │
+                     │   │  │(DHT 宣告/查询)  │  │   │
+                     │   │  └────────────────┘  │   │
+                     │   └────────┬─────────────┘   │
+                     │            │                  │
+                     │   ┌────────▼─────────────┐   │
+                     │   │  ServiceDispatcher    │   │
+                     │   │  (边车代理/本地路由)   │   │
+                     │   └────────┬─────────────┘   │
+                     └────────────┼─────────────────┘
+                                  │
+         ┌────────────────────────┼──────────────────────┐
+         ▼                        ▼                      ▼
+  ┌──────────────┐      ┌──────────────┐      ┌──────────────┐
+  │ OCR 服务      │      │ 冷存储服务    │      │ 其他业务进程   │
+  │ 127.0.0.1:5013│      │ 127.0.0.1:5050│      │   ...        │
+  └──────────────┘      └──────────────┘      └──────────────┘
 ```
 
-### 模块说明
+### 核心设计理念：微内核 + 边车
+
+NexusNet 采用通信与业务分离的架构：
+
+- **P2P 通信层**（NexusNet 主进程）— 负责节点发现、连接维护、DHT 路由、服务宣告
+- **ServiceDispatcher** — 内置的边车代理，收到外部请求后根据 `service=xxx` 字段将请求转发到本地回环地址上的业务进程
+- **业务进程** — 独立的子进程，语言无关，监听本地端口，专注处理业务逻辑
+
+这种架构的好处：
+- 语言无关（业务服务可以用 Rust/Python/Go/任何语言）
+- 热更新（业务进程独立重启，不影响 P2P 连接）
+- 松耦合（新增服务只需配一行 TOML）
+
+## 模块说明
 
 | 模块 | 文件 | 说明 |
 |------|------|------|
 | **main** | `src/main.rs` | 入口：加载配置、初始化节点、事件循环 |
-| **config** | `src/config.rs` | JSON 配置管理：节点信息、网络参数、服务开关 |
+| **config** | `src/config.rs` | TOML 配置管理：节点信息、网络参数、服务路由 |
 | **net** | `src/net.rs` | 网络核心：libp2p 行为组合、节点密钥、IP 发现 |
 | **log** | `src/log.rs` | 日志系统：彩色终端输出、文件日志、10MB 自动轮转 |
+| **service_discovery** | `src/service_discovery.rs` | Kademlia DHT 服务注册与发现 |
+| **service_dispatcher** | `src/service_dispatcher.rs` | 本地服务调度器（边车代理） |
 
 ## 快速开始
 
@@ -59,40 +92,31 @@ cargo run
 
 首次启动后会在当前目录生成：
 
-- `config.json` — 节点配置文件
+- `config.toml` — 节点配置文件（TOML 格式，支持注释，方便手动编辑）
 - `keypair.bin` — 节点身份密钥（请妥善保管）
 
 ### 配置说明
 
-```json
-{
-  "node": {
-    "name": "节点名称",
-    "description": "节点描述"
-  },
-  "network": {
-    "ipv4_enabled": true,
-    "ipv4_address": "自动检测",
-    "ipv6_enabled": false,
-    "ipv6_address": "不可用",
-    "port": 5000,
-    "announce_addresses": []
-  },
-  "services": {
-    "ping": {
-      "enabled": true,
-      "interval_secs": 15,
-      "with_timeout": 10
-    },
-    "kademlia": {
-      "enabled": true,
-      "record_ttl_seconds": 3600,
-      "replication_factor": 20,
-      "query_timeout_seconds": 60,
-      "bootstrap_nodes": []
-    }
-  }
-}
+```toml
+[node]
+name = "节点名称"
+description = "节点描述"
+
+[network]
+port = 5000
+
+[services.dispatcher]
+enabled = true
+
+[[services.dispatcher.local_services]]
+name = "ocr"
+host = "127.0.0.1"
+port = 5013
+
+[[services.dispatcher.local_services]]
+name = "cold-storage"
+host = "127.0.0.1"
+port = 5050
 ```
 
 ### 命令行参数
@@ -103,6 +127,9 @@ cargo run -- -p 5001
 
 # 连接指定节点
 cargo run -- -c /ip4/192.168.1.100/tcp/5000/p2p/12D3KooW...
+
+# 启动后查询指定服务
+cargo run -- -q ocr
 ```
 
 ## 协议标识
@@ -112,7 +139,8 @@ cargo run -- -c /ip4/192.168.1.100/tcp/5000/p2p/12D3KooW...
 ## 开发计划
 
 - [x] 核心 P2P 网络（Ping / Identify / Kademlia）
-- [ ] 服务注册与发现协议
+- [x] 服务注册与发现（DHT 宣告/查询）
+- [x] 本地服务调度器（边车代理，通信与业务分离）
 - [ ] 节点地址动态更新机制
 - [ ] 冷存储服务接口
 - [ ] OCR 服务接口

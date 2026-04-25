@@ -39,6 +39,7 @@ pub struct ServicesConfig {
     pub ping: PingService,
     pub kademlia: KademliaService,
     pub service_discovery: ServiceDiscoveryConfig,
+    pub dispatcher: DispatcherConfig,
 }
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
@@ -50,6 +51,26 @@ pub struct ServiceDiscoveryConfig {
     pub query_timeout_secs: u64,
     /// 宣告记录的TTL（秒）
     pub record_ttl_secs: u64,
+}
+
+/// 本地服务调度器配置
+/// 每个服务是一个独立进程，监听本地回环地址的某个端口。
+/// 通信层收到外部请求后，根据 service=xxx 字段将请求转发到对应端口。
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct DispatcherConfig {
+    pub enabled: bool,
+    /// 本地服务的路由表: 服务名 → 后端地址
+    pub local_services: Vec<LocalServiceEntry>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct LocalServiceEntry {
+    /// 服务标识名，如 "ocr"、"cold-storage"
+    pub name: String,
+    /// 后端进程监听地址
+    pub host: String,
+    /// 后端进程监听端口
+    pub port: u16,
 }
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
@@ -179,6 +200,16 @@ pub fn create_new_config_file() -> Result<NodeConfig, Box<dyn std::error::Error>
                 services: vec![],
                 query_timeout_secs: 30,
                 record_ttl_secs: 1800,
+            },
+            dispatcher: DispatcherConfig {
+                enabled: true,
+                local_services: vec![
+                    LocalServiceEntry {
+                        name: "ocr".to_string(),
+                        host: "127.0.0.1".to_string(),
+                        port: 5013,
+                    },
+                ],
             },
         },
     };
