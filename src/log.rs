@@ -32,10 +32,10 @@ impl LogLevel {
     fn color(&self) -> ColoredString {
         match self {
             LogLevel::Important => "[IMPORTANT]".on_green().bold(),
-            LogLevel::Debug =>     "[+]".cyan(),
-            LogLevel::Preset =>    "[-]".into(),
-            LogLevel::Warning =>   "[*]".yellow(),
-            LogLevel::Error =>     "[!]".red(),
+            LogLevel::Debug => "[+]".cyan(),
+            LogLevel::Preset => "[-]".into(),
+            LogLevel::Warning => "[*]".yellow(),
+            LogLevel::Error => "[!]".red(),
             LogLevel::Critical => "[CRITICAL]".on_red().bold().blink(),
         }
     }
@@ -147,6 +147,7 @@ fn rolling_check() {
                         content: e.to_string(),
                     };
                     log(&_log);
+                    return;
                 }
             }
             Err(e) => {
@@ -156,60 +157,96 @@ fn rolling_check() {
                     content: e.to_string(),
                 };
                 log(&_log);
+                return;
             },
         };
     });
 }
 
-fn log(info : &LogStruct) {
+fn format_log_entry(level: &LogLevel, time: &str, topic: &str, content: &str, color: bool) -> String {
+    if color {
+        let prefix = level.color();
+        if content.is_empty() {
+            format!("{} {}\n    {}", prefix, time, topic)
+        } else {
+            format!("{} {}\n    {}\n    {}", prefix, time, topic, content)
+        }
+    } else {
+        let prefix = level.as_str();
+        if content.is_empty() {
+            format!("{} {}\n    {}", prefix, time, topic)
+        } else {
+            format!("{} {}\n    {}\n    {}", prefix, time, topic, content)
+        }
+    }
+}
+
+fn log(info: &LogStruct) {
     let time = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-    
 
-    let prefix = info.level.as_str();
-    let color_prefix = info.level.color();
-    let text = format!("{} {}\n    {}\n    {}", prefix, time, info.topic, info.content);
-    let cli_text = format!("{} {}\n    {}", color_prefix, info.topic, info.content);
+    // 生成带颜色的 CLI 输出和不带颜色的文件输出
+    let cli_text = format_log_entry(&info.level, &time, &info.topic, &info.content, true);
+    let text = format_log_entry(&info.level, &time, &info.topic, &info.content, false);
 
-    // 输出到CLI
-    println!("{}", cli_text);
+    match info.level {
+        LogLevel::Error | LogLevel::Critical => {
+            // 错误和严重错误输出到 stderr
+            eprintln!("{}", cli_text);
+        }
+        LogLevel::Warning => {
+            // 警告也输出到 stderr（可选）
+            eprintln!("{}", cli_text);
+        }
+        _ => {
+            // 普通信息输出到 stdout
+            println!("{}", cli_text);
+        }
+    }
 
-    // 写入内容
+    // 写入文件
     let _guard = LOG_FILE_MUTEX.lock().unwrap();
     let log_open_result = fs::OpenOptions::new()
-        .append(true)       // 追加模式
-        .create(true)       // 如果文件不存在则创建
+        .append(true)
+        .create(true)
         .open("log");
     let mut log = match log_open_result {
         Ok(file) => file,
         Err(_error) => {
-            let log = LogStruct {
+            let err_log = LogStruct {
                 level: LogLevel::Error,
                 topic: "无法录入日志".to_string(),
                 content: "log文件无法被追加写入".to_string(),
             };
-            log_onlycli(&log);
+            log_onlycli(&err_log);
             return;
-        },
+        }
     };
     let write_result = writeln!(log, "{}", text);
     match write_result {
-        Ok(_) => {},
+        Ok(_) => (),
         Err(_error) => {
-            let log = LogStruct {
+            let err_log = LogStruct {
                 level: LogLevel::Error,
                 topic: "无法录入日志".to_string(),
                 content: "log文件无法被追加写入".to_string(),
             };
-            log_onlycli(&log);
-        },
-    };
+            log_onlycli(&err_log);
+        }
+    }
 }
 
-fn log_onlycli(info : &LogStruct) {
-    let color_prefix = info.level.color();
-    let text = format!("{} {}\n    {}", color_prefix, info.topic, info.content);
-
-    // 输出到CLI
-    println!("{}", text);
-
+fn log_onlycli(info: &LogStruct) {
+    let time = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let text = format_log_entry(&info.level, &time, &info.topic, &info.content, true);
+    match info.level {
+        LogLevel::Error | LogLevel::Critical => {
+            eprintln!("{}", text);
+        }
+        LogLevel::Warning => {
+            eprintln!("{}", text);
+        }
+        _ => {
+            println!("{}", text);
+        }
+    }
 }
