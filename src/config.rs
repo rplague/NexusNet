@@ -7,7 +7,6 @@ use crate::{
 use std::fs;
 use std::path::Path;
 use std::io::ErrorKind;
-use serde_json::from_str;
 
 use libp2p::{Multiaddr, PeerId};
 
@@ -106,8 +105,8 @@ impl NodeConfig {
         }
         
         // 保存到配置文件
-        let json_string = serde_json::to_string_pretty(self).unwrap();
-        fs::write("./config.json", json_string).unwrap();
+        let toml_string = toml::to_string_pretty(self).unwrap();
+        fs::write("./config.toml", toml_string).unwrap();
     }
 }
 
@@ -126,7 +125,7 @@ fn extract_peer_id_from_multiaddr(addr: &str) -> Option<String> {
 }
 
 pub fn create_new_config_file() -> Result<NodeConfig, Box<dyn std::error::Error>> {
-    let config_path = Path::new("./config.json");
+    let config_path = Path::new("./config.toml");
     
     let (ipv4_address, ipv6_address) = get_network_addresses()?;
     let keypair = get_key()?;
@@ -184,13 +183,13 @@ pub fn create_new_config_file() -> Result<NodeConfig, Box<dyn std::error::Error>
         },
     };
     
-    let json_string = serde_json::to_string_pretty(&config)?;
-    fs::write(config_path, json_string)?;
+    let toml_string = toml::to_string_pretty(&config)?;
+    fs::write(config_path, toml_string)?;
     
     Ok(config)
 }
 pub fn read_config_file() -> Result<NodeConfig, Box<dyn std::error::Error>> {
-    let path = Path::new("./config.json");
+    let path = Path::new("./config.toml");
     
     match fs::read_to_string(path) {
         Ok(content) => {
@@ -216,13 +215,13 @@ pub fn read_config_file() -> Result<NodeConfig, Box<dyn std::error::Error>> {
                 }
             } else {
                 // 解析配置文件
-                match from_str::<NodeConfig>(&content) {
+                match toml::from_str::<NodeConfig>(&content) {
                     Ok(mut config) => {
                         // 成功解析后，更新网络地址信息
                         init_update_config(&mut config);
                         
-                        let json_string = serde_json::to_string_pretty(&config)?;
-                        fs::write("./config.json", json_string)?;
+                        let toml_string = toml::to_string_pretty(&config)?;
+                        fs::write("./config.toml", toml_string)?;
                         
                         Ok(config)
                     }
