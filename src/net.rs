@@ -1,9 +1,10 @@
 use std::net::IpAddr;
 use std::fs;
 use crate::config::NodeConfig;
+use crate::service_discovery::ServiceDiscovery;
 use libp2p::multiaddr::Protocol;
 use libp2p::{
-    kad, // 新增Kademlia
+    kad,
     identity,
     ping,
     swarm::NetworkBehaviour,
