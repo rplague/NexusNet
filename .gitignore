@@ -1,0 +1,5 @@
+/target
+config.json
+keypair.bin
+log
+Cargo.lock
