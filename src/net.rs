@@ -16,13 +16,17 @@ use libp2p::{
 
 // 导入Kademlia相关类型
 use libp2p::kad::store::MemoryStore;
+
+use crate::addr_watcher;
+
 // 定义组合行为
 #[derive(NetworkBehaviour)]
 #[behaviour(out_event = "NetBehaviourEvent")]
 pub struct NetBehaviour {
     pub ping: ping::Behaviour,
     pub identify: identify::Behaviour,
-    pub kademlia: kad::Behaviour<MemoryStore>, // 新增Kademlia行为
+    pub kademlia: kad::Behaviour<MemoryStore>,
+    pub addr_watcher: addr_watcher::Behaviour,
 }
 
 // 定义行为事件枚举
@@ -31,6 +35,7 @@ pub enum NetBehaviourEvent {
     Ping(ping::Event),
     Identify(identify::Event),
     Kademlia(kad::Event),
+    AddrWatcher(addr_watcher::AddrWatcherEvent),
 }
 
 // 实现 From trait 用于事件转换
@@ -49,6 +54,12 @@ impl From<identify::Event> for NetBehaviourEvent {
 impl From<kad::Event> for NetBehaviourEvent {
     fn from(event: kad::Event) -> Self {
         NetBehaviourEvent::Kademlia(event)
+    }
+}
+
+impl From<addr_watcher::AddrWatcherEvent> for NetBehaviourEvent {
+    fn from(event: addr_watcher::AddrWatcherEvent) -> Self {
+        NetBehaviourEvent::AddrWatcher(event)
     }
 }
 
@@ -131,6 +142,7 @@ pub fn get_key() -> Result<identity::Keypair, Box<dyn std::error::Error>> {
 pub fn create_behaviour(
     keypair: &identity::Keypair,
     protocol_name: &str,
+    config: &NodeConfig,
 ) -> Result<NetBehaviour, Box<dyn std::error::Error>> {
     // Ping 配置
     let ping_config = ping::Config::new()
@@ -154,7 +166,8 @@ pub fn create_behaviour(
     let behaviour = NetBehaviour {
         ping: ping::Behaviour::new(ping_config),
         identify: identify::Behaviour::new(identify_config),
-        kademlia
+        kademlia,
+        addr_watcher: addr_watcher::Behaviour::new(&config.services.address_watcher),
     };
     
     Ok(behaviour)
