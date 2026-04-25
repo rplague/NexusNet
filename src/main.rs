@@ -9,6 +9,9 @@ mod service_discovery;
 use service_discovery::ServiceDiscovery;
 
 mod net;
+
+mod service_dispatcher;
+use service_dispatcher::ServiceDispatcher;
 use net::{
     get_network_addresses,
     appropriate_address_filter,
@@ -129,6 +132,27 @@ async fn run_node(
 
     // 初始化服务发现
     let mut sd = ServiceDiscovery::new(&config.services.service_discovery, my_peer_id);
+    
+    // 初始化本地服务调度器（微内核+边车模式）
+    let dispatcher = ServiceDispatcher::new(&config.services.dispatcher);
+    if dispatcher.is_enabled() {
+        let unhealthy = dispatcher.health_check();
+        if unhealthy.is_empty() {
+            let log = LogStruct {
+                level: LogLevel::Debug,
+                topic: "服务调度器".to_string(),
+                content: "所有本地后端服务均可达".to_string(),
+            };
+            log.logout();
+        } else {
+            let log = LogStruct {
+                level: LogLevel::Warning,
+                topic: "服务调度器".to_string(),
+                content: format!("以下后端服务不可达: {}", unhealthy.join(", ")),
+            };
+            log.logout();
+        }
+    }
     if sd.is_enabled() {
         let log = LogStruct {
             level: LogLevel::Preset,
