@@ -40,6 +40,7 @@ pub struct ServicesConfig {
     pub kademlia: KademliaService,
     pub service_discovery: ServiceDiscoveryConfig,
     pub dispatcher: DispatcherConfig,
+    #[serde(default)]
     pub address_watcher: AddressWatcherConfig,
 }
 
@@ -48,6 +49,15 @@ pub struct AddressWatcherConfig {
     pub enabled: bool,
     /// 地址检测间隔（秒）
     pub check_interval_secs: u64,
+}
+
+impl Default for AddressWatcherConfig {
+    fn default() -> Self {
+        AddressWatcherConfig {
+            enabled: true,
+            check_interval_secs: 60,
+        }
+    }
 }
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
