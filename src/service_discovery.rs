@@ -86,6 +86,8 @@ impl ServiceInfo {
 pub struct ServiceDiscovery {
     /// 配置
     config: ServiceDiscoveryConfig,
+    /// 本地节点 PeerId
+    local_peer_id: PeerId,
     /// 本地宣告的服务（service_type -> ServiceInfo）
     local_services: HashMap<String, ServiceInfo>,
     /// 从网络中缓存的服务（service_type -> Vec<ServiceInfo>）
@@ -116,6 +118,7 @@ impl ServiceDiscovery {
         }
 
         ServiceDiscovery {
+            local_peer_id,
             config,
             local_services,
             cached_services: HashMap::new(),
@@ -221,6 +224,25 @@ impl ServiceDiscovery {
         self.config.enabled
     }
 
+    /// 移除过期缓存并返回移除数量
+    pub fn purge_expired_cache(&mut self) -> usize {
+        let mut total = 0;
+        for infos in self.cached_services.values_mut() {
+            let before = infos.len();
+            infos.retain(|info| !info.is_expired());
+            total += before - infos.len();
+        }
+        self.cached_services.retain(|_, v| !v.is_empty());
+        total
+    }
+
+    /// 重新宣告所有本地服务（地址或配置变更后调用）
+    /// 返回新的宣告记录列表
+    pub fn reannounce(&mut self, addrs: &[String]) -> Vec<Record> {
+        self.set_addresses(addrs);
+        self.get_announce_records()
+    }
+
     /// 新增本地服务（运行时动态注册）
     pub fn add_local_service(
         &mut self,
@@ -230,14 +252,7 @@ impl ServiceDiscovery {
     ) -> Option<Record> {
         let info = ServiceInfo::new(
             service_type,
-            self.local_services
-                .values()
-                .next()
-                .map(|i| i.provider.clone())
-                .unwrap_or_default()
-                .parse()
-                .ok()
-                .unwrap_or(PeerId::random()),
+            self.local_peer_id,
             addrs,
             metadata,
             self.config.record_ttl_secs,

@@ -223,14 +223,39 @@ async fn run_node(
         match swarm.select_next_some().await {
             // 新的监听地址已添加
             SwarmEvent::NewListenAddr { address, .. } => {
-                if !listeners_ready && sd.is_enabled() {
-                    let log = LogStruct {
-                        level: LogLevel::Debug,
-                        topic: "监听地址".to_string(),
-                        content: format!("监听于: {}", address),
-                    };
-                    log.logout();
-                    listeners_ready = true;
+                let log = LogStruct {
+                    level: LogLevel::Debug,
+                    topic: "监听地址".to_string(),
+                    content: format!("监听于: {}", address),
+                };
+                log.logout();
+                if sd.is_enabled() {
+                    // 标记 listeners 已就绪
+                    if !listeners_ready {
+                        listeners_ready = true;
+                    }
+                    // 如果已宣告过，地址更新后重新宣告
+                    if sd_announced {
+                        let announce_addrs: Vec<String> = swarm
+                            .listeners()
+                            .map(|a| format!("{}/p2p/{}", a, my_peer_id))
+                            .collect();
+                        let records = sd.reannounce(&announce_addrs);
+                        for record in records {
+                            let key_str = String::from_utf8_lossy(&record.key.as_ref());
+                            if let Some(svc_type) = key_str.strip_prefix(
+                                std::str::from_utf8(SD_KEY_PREFIX).unwrap_or("")
+                            ) {
+                                let log = LogStruct {
+                                    level: LogLevel::Debug,
+                                    topic: "服务发现".to_string(),
+                                    content: format!("更新宣告: {}", svc_type),
+                                };
+                                log.logout();
+                            }
+                            let _ = swarm.behaviour_mut().kademlia.put_record(record, kad::Quorum::One);
+                        }
+                    }
                 }
             }
             // 传入连接错误事件
