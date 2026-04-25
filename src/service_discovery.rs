@@ -1,10 +1,10 @@
 use libp2p::{
-    kad::{self, QueryResult, Record, RecordKey},
+    kad::{self, Record, RecordKey},
     PeerId,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{
     config::ServiceDiscoveryConfig,
