@@ -40,6 +40,24 @@ pub struct ServicesConfig {
     pub kademlia: KademliaService,
     pub service_discovery: ServiceDiscoveryConfig,
     pub dispatcher: DispatcherConfig,
+    #[serde(default)]
+    pub address_watcher: AddressWatcherConfig,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct AddressWatcherConfig {
+    pub enabled: bool,
+    /// 地址检测间隔（秒）
+    pub check_interval_secs: u64,
+}
+
+impl Default for AddressWatcherConfig {
+    fn default() -> Self {
+        AddressWatcherConfig {
+            enabled: true,
+            check_interval_secs: 60,
+        }
+    }
 }
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
@@ -210,6 +228,10 @@ pub fn create_new_config_file() -> Result<NodeConfig, Box<dyn std::error::Error>
                         port: 5013,
                     },
                 ],
+            },
+            address_watcher: AddressWatcherConfig {
+                enabled: true,
+                check_interval_secs: 60,
             },
         },
     };

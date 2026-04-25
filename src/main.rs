@@ -10,6 +10,8 @@ use service_discovery::ServiceDiscovery;
 
 mod net;
 
+mod addr_watcher;
+
 mod service_dispatcher;
 use service_dispatcher::ServiceDispatcher;
 use net::{
@@ -165,7 +167,7 @@ async fn run_node(
     // 从公钥计算Peer ID（节点的唯一标识符）
     
     // 创建网络行为组合（包含ping、identify等协议）
-    let behaviour = create_behaviour(&keypair, "/OAHD")?;
+    let behaviour = create_behaviour(&keypair, "/OAHD", &config)?;
     
     // 使用SwarmBuilder构建节点管理器
     let mut swarm = SwarmBuilder::with_existing_identity(keypair)
@@ -634,6 +636,75 @@ async fn run_node(
                                 log.logout();
                             }
                             _ => {} // 其他Kademlia事件
+                        }
+                    }
+                    // 地址检测事件
+                    NetBehaviourEvent::AddrWatcher(event) => {
+                        match event {
+                            addr_watcher::AddrWatcherEvent::Changed(change) => {
+                                let log = LogStruct {
+                                    level: LogLevel::Preset,
+                                    topic: "地址变更".to_string(),
+                                    content: format!(
+                                        "IP地址变化: {} → {}",
+                                        change.old_addrs.join(", "),
+                                        change.new_addrs.join(", ")
+                                    ),
+                                };
+                                log.logout();
+
+                                // 更新 announce_addresses
+                                let announce_addrs: Vec<String> = swarm
+                                    .listeners()
+                                    .map(|a| format!("{}/p2p/{}", a, my_peer_id))
+                                    .collect();
+
+                                // 重新宣告服务
+                                if sd.is_enabled() && sd_announced {
+                                    let records = sd.reannounce(&announce_addrs);
+                                    for record in records {
+                                        let key_str = String::from_utf8_lossy(&record.key.as_ref());
+                                        if let Some(svc_type) = key_str.strip_prefix(
+                                            std::str::from_utf8(SD_KEY_PREFIX).unwrap_or("")
+                                        ) {
+                                            let log = LogStruct {
+                                                level: LogLevel::Debug,
+                                                topic: "服务发现".to_string(),
+                                                content: format!("地址变更后重新宣告: {}", svc_type),
+                                            };
+                                            log.logout();
+                                        }
+                                        let _ = swarm.behaviour_mut().kademlia.put_record(record, kad::Quorum::One);
+                                    }
+                                }
+
+                                // 更新配置
+                                config.network.announce_addresses = announce_addrs;
+
+                                // 重连所有已知节点
+                                let known_nodes = config.services.kademlia.bootstrap_nodes.clone();
+                                for node_addr in &known_nodes {
+                                    match node_addr.parse::<Multiaddr>() {
+                                        Ok(addr) => {
+                                            let log = LogStruct {
+                                                level: LogLevel::Debug,
+                                                topic: "地址变更".to_string(),
+                                                content: format!("尝试重连: {}", addr),
+                                            };
+                                            log.logout();
+                                            let _ = swarm.dial(addr);
+                                        }
+                                        Err(e) => {
+                                            let log = LogStruct {
+                                                level: LogLevel::Warning,
+                                                topic: "地址变更".to_string(),
+                                                content: format!("重连地址解析失败 {}: {:?}", node_addr, e),
+                                            };
+                                            log.logout();
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
