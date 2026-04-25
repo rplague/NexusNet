@@ -39,6 +39,18 @@ pub struct NetworkConfig {
 pub struct ServicesConfig {
     pub ping: PingService,
     pub kademlia: KademliaService,
+    pub service_discovery: ServiceDiscoveryConfig,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct ServiceDiscoveryConfig {
+    pub enabled: bool,
+    /// 本节点提供的服务列表
+    pub services: Vec<String>,
+    /// 查询超时（秒）
+    pub query_timeout_secs: u64,
+    /// 宣告记录的TTL（秒）
+    pub record_ttl_secs: u64,
 }
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
@@ -162,6 +174,12 @@ pub fn create_new_config_file() -> Result<NodeConfig, Box<dyn std::error::Error>
                 replication_factor: 20,
                 query_timeout_seconds: 60,
                 bootstrap_nodes: vec![],
+            },
+            service_discovery: ServiceDiscoveryConfig {
+                enabled: true,
+                services: vec![],
+                query_timeout_secs: 30,
+                record_ttl_secs: 1800,
             },
         },
     };
