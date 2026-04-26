@@ -2,6 +2,7 @@ use std::net::IpAddr;
 use std::fs;
 use crate::config::NodeConfig;
 use crate::service_discovery::ServiceDiscovery;
+use std::time::Duration;
 use libp2p::multiaddr::Protocol;
 use libp2p::{
     kad,
@@ -18,6 +19,8 @@ use libp2p::{
 use libp2p::kad::store::MemoryStore;
 
 use crate::addr_watcher;
+use crate::request_handler::{ServiceRequest, ServiceResponse};
+use libp2p::request_response;
 
 // 定义组合行为
 #[derive(NetworkBehaviour)]
@@ -27,6 +30,7 @@ pub struct NetBehaviour {
     pub identify: identify::Behaviour,
     pub kademlia: kad::Behaviour<MemoryStore>,
     pub addr_watcher: addr_watcher::Behaviour,
+    pub request_response: request_response::cbor::Behaviour<ServiceRequest, ServiceResponse>,
 }
 
 // 定义行为事件枚举
@@ -36,6 +40,7 @@ pub enum NetBehaviourEvent {
     Identify(identify::Event),
     Kademlia(kad::Event),
     AddrWatcher(addr_watcher::AddrWatcherEvent),
+    RequestResponse(request_response::Event<ServiceRequest, ServiceResponse>),
 }
 
 // 实现 From trait 用于事件转换
@@ -60,6 +65,12 @@ impl From<kad::Event> for NetBehaviourEvent {
 impl From<addr_watcher::AddrWatcherEvent> for NetBehaviourEvent {
     fn from(event: addr_watcher::AddrWatcherEvent) -> Self {
         NetBehaviourEvent::AddrWatcher(event)
+    }
+}
+
+impl From<request_response::Event<ServiceRequest, ServiceResponse>> for NetBehaviourEvent {
+    fn from(event: request_response::Event<ServiceRequest, ServiceResponse>) -> Self {
+        NetBehaviourEvent::RequestResponse(event)
     }
 }
 
@@ -162,12 +173,21 @@ pub fn create_behaviour(
     kademlia_config.set_periodic_bootstrap_interval(Some(std::time::Duration::from_secs(20)));
     let mut kademlia = kad::Behaviour::with_config(keypair.public().to_peer_id(), store, kademlia_config);
     kademlia.set_mode(Some(kad::Mode::Server));
+    // 请求/响应 behaviour（边车通信协议）
+    let req_res_config = request_response::Config::default()
+        .with_request_timeout(Duration::from_secs(60));
+    let request_response = request_response::cbor::Behaviour::new(
+        vec![(StreamProtocol::new("/oahd/req/1.0.0"), request_response::ProtocolSupport::Full)],
+        req_res_config,
+    );
+
     // 创建组合行为
     let behaviour = NetBehaviour {
         ping: ping::Behaviour::new(ping_config),
         identify: identify::Behaviour::new(identify_config),
         kademlia,
         addr_watcher: addr_watcher::Behaviour::new(&config.services.address_watcher),
+        request_response,
     };
     
     Ok(behaviour)
