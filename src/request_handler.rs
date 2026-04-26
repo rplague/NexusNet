@@ -3,11 +3,11 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{LogStruct, LogLevel};
+use crate::net::NetBehaviour;
 use crate::service_dispatcher::ServiceDispatcher;
+use crate::{LogLevel, LogStruct};
 use libp2p::PeerId;
 use libp2p::swarm::Swarm;
-use crate::net::NetBehaviour;
 
 /// 请求体：向远程节点发送的服务调用请求
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,11 +58,17 @@ pub fn send_service_request(
     let log = LogStruct {
         level: LogLevel::Debug,
         topic: "P2P请求".to_string(),
-        content: format!("向 {} 发送请求: service={}, request_id={}", peer, service, request_id),
+        content: format!(
+            "向 {} 发送请求: service={}, request_id={}",
+            peer, service, request_id
+        ),
     };
     log.logout();
 
-    let _outbound_id = swarm.behaviour_mut().request_response.send_request(peer, request);
+    let _outbound_id = swarm
+        .behaviour_mut()
+        .request_response
+        .send_request(peer, request);
     Ok(request_id)
 }
 
@@ -74,7 +80,10 @@ pub fn handle_incoming_request(
     let log = LogStruct {
         level: LogLevel::Debug,
         topic: "请求处理".to_string(),
-        content: format!("收到远程请求: service={}, request_id={}", request.service, request.request_id),
+        content: format!(
+            "收到远程请求: service={}, request_id={}",
+            request.service, request.request_id
+        ),
     };
     log.logout();
 

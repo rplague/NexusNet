@@ -1,12 +1,7 @@
-use crate::{
-    LogStruct,
-    LogLevel,
-    get_network_addresses,
-    get_key
-};
+use crate::{LogLevel, LogStruct, get_key, get_network_addresses};
 use std::fs;
-use std::path::Path;
 use std::io::ErrorKind;
+use std::path::Path;
 
 use libp2p::{Multiaddr, PeerId};
 
@@ -198,20 +193,48 @@ impl Default for KademliaService {
 
 // ─── 默认值辅助函数 ─────────────────────────────────────────
 
-fn default_true() -> bool { true }
-fn default_false() -> bool { false }
-fn default_port() -> u16 { 5000 }
-fn default_ip_unavailable() -> String { "不可用".to_string() }
-fn default_ping_interval() -> u32 { 15 }
-fn default_ping_timeout() -> u32 { 10 }
-fn default_kad_ttl() -> u64 { 3600 }
-fn default_kad_replication() -> usize { 20 }
-fn default_kad_query_timeout() -> u64 { 60 }
-fn default_sd_query_timeout() -> u64 { 30 }
-fn default_sd_ttl() -> u64 { 1800 }
-fn default_addr_watch_interval() -> u64 { 60 }
-fn default_proxy_port() -> u16 { 5200 }
-fn default_proxy_bind() -> String { "127.0.0.1".to_string() }
+fn default_true() -> bool {
+    true
+}
+fn default_false() -> bool {
+    false
+}
+fn default_port() -> u16 {
+    5000
+}
+fn default_ip_unavailable() -> String {
+    "不可用".to_string()
+}
+fn default_ping_interval() -> u32 {
+    15
+}
+fn default_ping_timeout() -> u32 {
+    10
+}
+fn default_kad_ttl() -> u64 {
+    3600
+}
+fn default_kad_replication() -> usize {
+    20
+}
+fn default_kad_query_timeout() -> u64 {
+    60
+}
+fn default_sd_query_timeout() -> u64 {
+    30
+}
+fn default_sd_ttl() -> u64 {
+    1800
+}
+fn default_addr_watch_interval() -> u64 {
+    60
+}
+fn default_proxy_port() -> u16 {
+    5200
+}
+fn default_proxy_bind() -> String {
+    "127.0.0.1".to_string()
+}
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct OutboundProxyConfig {
@@ -239,10 +262,14 @@ impl NodeConfig {
     pub fn insert_bootstrap_nodes(&mut self, info: String) {
         // 从info中提取peer_id
         let new_peer_id = extract_peer_id_from_multiaddr(&info);
-        
+
         if let Some(new_peer_id) = new_peer_id {
             // 查找是否已存在相同peer_id的节点
-            let existing_index = self.services.kademlia.bootstrap_nodes.iter()
+            let existing_index = self
+                .services
+                .kademlia
+                .bootstrap_nodes
+                .iter()
                 .position(|node| {
                     if let Some(existing_peer_id) = extract_peer_id_from_multiaddr(node) {
                         existing_peer_id == new_peer_id
@@ -250,7 +277,7 @@ impl NodeConfig {
                         false
                     }
                 });
-            
+
             match existing_index {
                 Some(index) => {
                     // 替换现有节点的地址
@@ -264,7 +291,7 @@ impl NodeConfig {
         } else {
             return;
         }
-        
+
         // 保存到配置文件
         let toml_string = toml::to_string_pretty(self).unwrap();
         fs::write("./config.toml", toml_string).unwrap();
@@ -289,7 +316,7 @@ fn extract_peer_id_from_multiaddr(addr: &str) -> Option<String> {
 
 pub fn create_new_config_file() -> Result<NodeConfig, Box<dyn std::error::Error>> {
     let config_path = Path::new("./config.toml");
-    
+
     let (ipv4_address, ipv6_address) = get_network_addresses()?;
     let keypair = get_key()?;
     let peer_id = PeerId::from(keypair.public());
@@ -311,24 +338,32 @@ pub fn create_new_config_file() -> Result<NodeConfig, Box<dyn std::error::Error>
         },
         network: NetworkConfig {
             ipv4_enabled: has_v4,
-            ipv4_address: if has_v4 { ipv4_address.clone() } else { "不可用".to_string() },
+            ipv4_address: if has_v4 {
+                ipv4_address.clone()
+            } else {
+                "不可用".to_string()
+            },
             ipv6_enabled: has_v6,
-            ipv6_address: if has_v6 { ipv6_address } else { "不可用".to_string() },
+            ipv6_address: if has_v6 {
+                ipv6_address
+            } else {
+                "不可用".to_string()
+            },
             port: 5000,
             announce_addresses: announce,
         },
         services: ServicesConfig::default(),
     };
-    
+
     let toml_string = toml::to_string_pretty(&config)?;
     fs::write(config_path, toml_string)?;
-    
+
     Ok(config)
 }
 
 pub fn read_config_file() -> Result<NodeConfig, Box<dyn std::error::Error>> {
     let path = Path::new("./config.toml");
-    
+
     match fs::read_to_string(path) {
         Ok(content) => {
             if content.trim().is_empty() {
@@ -338,7 +373,7 @@ pub fn read_config_file() -> Result<NodeConfig, Box<dyn std::error::Error>> {
                     content: "配置文件为空，自动创建新的设置文件".to_string(),
                 };
                 log.logout();
-                
+
                 match create_new_config_file() {
                     Ok(config) => Ok(config),
                     Err(e) => {
@@ -357,10 +392,10 @@ pub fn read_config_file() -> Result<NodeConfig, Box<dyn std::error::Error>> {
                     Ok(mut config) => {
                         // 成功解析后，更新网络地址信息
                         init_update_config(&mut config);
-                        
+
                         let toml_string = toml::to_string_pretty(&config)?;
                         fs::write("./config.toml", toml_string)?;
-                        
+
                         Ok(config)
                     }
                     Err(e) => {
@@ -370,14 +405,14 @@ pub fn read_config_file() -> Result<NodeConfig, Box<dyn std::error::Error>> {
                             content: format!("解析失败: {}，尝试创建新配置", e),
                         };
                         log.logout();
-                        
+
                         // 格式错误，尝试创建新配置
                         create_new_config_file()
                     }
                 }
             }
         }
-        
+
         Err(error) => match error.kind() {
             ErrorKind::NotFound => {
                 let log = LogStruct {
@@ -386,7 +421,7 @@ pub fn read_config_file() -> Result<NodeConfig, Box<dyn std::error::Error>> {
                     content: "自动创建新的设置文件".to_string(),
                 };
                 log.logout();
-                
+
                 match create_new_config_file() {
                     Ok(config) => Ok(config),
                     Err(e) => {
@@ -409,7 +444,7 @@ pub fn read_config_file() -> Result<NodeConfig, Box<dyn std::error::Error>> {
                 log.logout();
                 Err(Box::new(std::io::Error::new(
                     ErrorKind::PermissionDenied,
-                    "权限不足，无法读取配置文件"
+                    "权限不足，无法读取配置文件",
                 )))?
             }
             _ => {
@@ -428,35 +463,39 @@ pub fn read_config_file() -> Result<NodeConfig, Box<dyn std::error::Error>> {
 fn init_update_config(config: &mut NodeConfig) {
     let keypair = get_key().unwrap();
     let (ipv4_address, ipv6_address) = get_network_addresses().unwrap();
-    
+
     let peer_id = PeerId::from(keypair.public());
     let has_ipv4 = !ipv4_address.is_empty();
     let has_ipv6 = !ipv6_address.is_empty();
 
     config.network.ipv4_enabled = has_ipv4;
-    config.network.ipv4_address = if has_ipv4 { 
-        ipv4_address.clone() 
-    } else { 
-        "不可用".to_string() 
+    config.network.ipv4_address = if has_ipv4 {
+        ipv4_address.clone()
+    } else {
+        "不可用".to_string()
     };
-    
+
     config.network.ipv6_enabled = has_ipv6;
-    config.network.ipv6_address = if has_ipv6 { 
-        ipv6_address.clone() 
-    } else { 
-        "不可用".to_string() 
+    config.network.ipv6_address = if has_ipv6 {
+        ipv6_address.clone()
+    } else {
+        "不可用".to_string()
     };
-    
+
     let mut announce_addresses = Vec::new();
-    
+
     if has_ipv4 {
-        announce_addresses.push(format!("/ip4/{}/tcp/{}/p2p/{}", 
-            ipv4_address, config.network.port, peer_id));
+        announce_addresses.push(format!(
+            "/ip4/{}/tcp/{}/p2p/{}",
+            ipv4_address, config.network.port, peer_id
+        ));
     }
     if has_ipv6 {
-        announce_addresses.push(format!("/ip6/{}/tcp/{}/p2p/{}", 
-            ipv6_address, config.network.port, peer_id));
+        announce_addresses.push(format!(
+            "/ip6/{}/tcp/{}/p2p/{}",
+            ipv6_address, config.network.port, peer_id
+        ));
     }
-    
+
     config.network.announce_addresses = announce_addresses;
 }

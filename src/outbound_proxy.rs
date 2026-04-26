@@ -1,4 +1,4 @@
-use crate::{LogStruct, LogLevel, config::OutboundProxyConfig};
+use crate::{LogLevel, LogStruct, config::OutboundProxyConfig};
 use libp2p::PeerId;
 use std::net::SocketAddr;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -118,7 +118,8 @@ pub async fn start(
                         let cmd_type = cmd.get("type").and_then(|v| v.as_str()).unwrap_or("");
                         match cmd_type {
                             "discover" => {
-                                let service = cmd.get("service")
+                                let service = cmd
+                                    .get("service")
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("")
                                     .to_string();
@@ -150,16 +151,15 @@ pub async fn start(
                                 }
                             }
                             "request" => {
-                                let peer_str = cmd.get("peer")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("");
-                                let service = cmd.get("service")
+                                let peer_str =
+                                    cmd.get("peer").and_then(|v| v.as_str()).unwrap_or("");
+                                let service = cmd
+                                    .get("service")
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("")
                                     .to_string();
-                                let payload_b64 = cmd.get("payload")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("");
+                                let payload_b64 =
+                                    cmd.get("payload").and_then(|v| v.as_str()).unwrap_or("");
 
                                 if peer_str.is_empty() || service.is_empty() {
                                     ProxyResult {
@@ -176,9 +176,13 @@ pub async fn start(
                                                 message: format!("无效的 PeerId: {}", peer_str),
                                                 data: None,
                                             };
-                                            let _ = writer.write_all(
-                                                serde_json::to_string(&resp).unwrap().as_bytes()
-                                            ).await;
+                                            let _ = writer
+                                                .write_all(
+                                                    serde_json::to_string(&resp)
+                                                        .unwrap()
+                                                        .as_bytes(),
+                                                )
+                                                .await;
                                             let _ = writer.write_all(b"\n").await;
                                             continue;
                                         }
@@ -191,9 +195,13 @@ pub async fn start(
                                                 message: format!("payload base64 解码失败: {}", e),
                                                 data: None,
                                             };
-                                            let _ = writer.write_all(
-                                                serde_json::to_string(&resp).unwrap().as_bytes()
-                                            ).await;
+                                            let _ = writer
+                                                .write_all(
+                                                    serde_json::to_string(&resp)
+                                                        .unwrap()
+                                                        .as_bytes(),
+                                                )
+                                                .await;
                                             let _ = writer.write_all(b"\n").await;
                                             continue;
                                         }
@@ -221,29 +229,23 @@ pub async fn start(
                                     }
                                 }
                             }
-                            "ping" => {
-                                ProxyResult {
-                                    success: true,
-                                    message: "pong".to_string(),
-                                    data: None,
-                                }
-                            }
-                            _ => {
-                                ProxyResult {
-                                    success: false,
-                                    message: format!("未知命令类型: {}", cmd_type),
-                                    data: None,
-                                }
-                            }
+                            "ping" => ProxyResult {
+                                success: true,
+                                message: "pong".to_string(),
+                                data: None,
+                            },
+                            _ => ProxyResult {
+                                success: false,
+                                message: format!("未知命令类型: {}", cmd_type),
+                                data: None,
+                            },
                         }
                     }
-                    Err(e) => {
-                        ProxyResult {
-                            success: false,
-                            message: format!("JSON 解析错误: {}", e),
-                            data: None,
-                        }
-                    }
+                    Err(e) => ProxyResult {
+                        success: false,
+                        message: format!("JSON 解析错误: {}", e),
+                        data: None,
+                    },
                 };
 
                 let response_json = serde_json::to_string(&response).unwrap();

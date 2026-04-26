@@ -1,14 +1,13 @@
-use libp2p::swarm::{
-    behaviour::ToSwarm,
-    dummy,
-    ConnectionDenied, ConnectionId, FromSwarm, THandler, THandlerInEvent, THandlerOutEvent,
-};
+use crate::config::AddressWatcherConfig;
+use crate::net::get_network_addresses;
 use libp2p::core::Endpoint;
+use libp2p::swarm::{
+    ConnectionDenied, ConnectionId, FromSwarm, THandler, THandlerInEvent, THandlerOutEvent,
+    behaviour::ToSwarm, dummy,
+};
 use libp2p::{Multiaddr, PeerId};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
-use crate::config::AddressWatcherConfig;
-use crate::net::get_network_addresses;
 
 /// 地址变化事件
 #[derive(Debug, Clone)]
@@ -42,8 +41,12 @@ impl Behaviour {
         let initial = if config.enabled {
             let (v4, v6) = get_network_addresses().unwrap_or_default();
             let mut addrs = Vec::new();
-            if !v4.is_empty() { addrs.push(v4); }
-            if !v6.is_empty() { addrs.push(v6); }
+            if !v4.is_empty() {
+                addrs.push(v4);
+            }
+            if !v6.is_empty() {
+                addrs.push(v6);
+            }
             addrs
         } else {
             Vec::new()
@@ -93,7 +96,10 @@ impl libp2p::swarm::NetworkBehaviour for Behaviour {
     ) {
     }
 
-    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<ToSwarm<Self::ToSwarm, THandlerInEvent<Self>>> {
+    fn poll(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<ToSwarm<Self::ToSwarm, THandlerInEvent<Self>>> {
         if !self.enabled {
             return Poll::Pending;
         }
@@ -117,8 +123,12 @@ impl libp2p::swarm::NetworkBehaviour for Behaviour {
         };
 
         let mut current_addrs = Vec::new();
-        if !v4.is_empty() { current_addrs.push(v4); }
-        if !v6.is_empty() { current_addrs.push(v6); }
+        if !v4.is_empty() {
+            current_addrs.push(v4);
+        }
+        if !v6.is_empty() {
+            current_addrs.push(v6);
+        }
 
         if current_addrs == self.last_addrs {
             return Poll::Pending;
@@ -130,7 +140,7 @@ impl libp2p::swarm::NetworkBehaviour for Behaviour {
             AddressChangeEvent {
                 new_addrs: current_addrs,
                 old_addrs,
-            }
+            },
         )))
     }
 

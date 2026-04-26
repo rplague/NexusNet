@@ -2,17 +2,14 @@
 #![allow(dead_code)]
 
 use libp2p::{
-    kad::{self, Record, RecordKey},
     PeerId,
+    kad::{self, Record, RecordKey},
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::{
-    config::ServiceDiscoveryConfig,
-    LogStruct, LogLevel,
-};
+use crate::{LogLevel, LogStruct, config::ServiceDiscoveryConfig};
 
 /// 服务类型
 ///
@@ -175,16 +172,11 @@ impl ServiceDiscovery {
                     .strip_prefix(std::str::from_utf8(SD_KEY_PREFIX).unwrap_or(""))
                     .unwrap_or("")
                     .to_string();
-                if let Ok(info) =
-                    serde_json::from_slice::<ServiceInfo>(&peer_record.record.value)
-                {
+                if let Ok(info) = serde_json::from_slice::<ServiceInfo>(&peer_record.record.value) {
                     if info.is_expired() {
                         return;
                     }
-                    self.cached_services
-                        .entry(svc_type)
-                        .or_default()
-                        .push(info);
+                    self.cached_services.entry(svc_type).or_default().push(info);
                 }
             }
             kad::GetRecordOk::FinishedWithNoAdditionalRecord { .. } => {}
@@ -261,7 +253,10 @@ impl ServiceDiscovery {
             self.config.record_ttl_secs,
         );
         let key = ServiceInfo::record_key(service_type);
-        log_info("服务注册".to_string(), format!("注册服务: {}", service_type));
+        log_info(
+            "服务注册".to_string(),
+            format!("注册服务: {}", service_type),
+        );
         self.local_services
             .insert(service_type.to_string(), info.clone());
         if let Ok(bytes) = serde_json::to_vec(&info) {

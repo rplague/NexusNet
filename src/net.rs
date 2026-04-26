@@ -1,18 +1,11 @@
-use std::net::IpAddr;
-use std::fs;
 use crate::config::NodeConfig;
-use std::time::Duration;
 use libp2p::multiaddr::Protocol;
 use libp2p::{
-    kad,
-    identity,
-    ping,
-    swarm::NetworkBehaviour,
-    identify,
-    StreamProtocol,
-    Multiaddr,
-    PeerId,
+    Multiaddr, PeerId, StreamProtocol, identify, identity, kad, ping, swarm::NetworkBehaviour,
 };
+use std::fs;
+use std::net::IpAddr;
+use std::time::Duration;
 
 // 导入Kademlia相关类型
 use libp2p::kad::store::MemoryStore;
@@ -80,7 +73,7 @@ pub fn get_network_addresses() -> Result<(String, String), Box<dyn std::error::E
     // 获取所有网络接口的IP地址
     for iface in get_if_addrs::get_if_addrs()? {
         let addr = iface.addr;
-        
+
         match addr.ip() {
             IpAddr::V4(ipv4) => {
                 // 过滤掉本地回环和私有地址
@@ -90,11 +83,12 @@ pub fn get_network_addresses() -> Result<(String, String), Box<dyn std::error::E
             }
             IpAddr::V6(ipv6) => {
                 // 过滤掉本地回环、本地链路和唯一本地地址
-                if !(ipv6.is_loopback() 
+                if !(ipv6.is_loopback()
                   || ipv6.is_unspecified()
                   || ipv6.is_multicast()
                   || ipv6.octets()[0] == 0xfe || (ipv6.octets()[1] & 0xc0) == 0x80 // 本地链路地址 fe80::/10
-                  || (ipv6.octets()[0] == 0xfc || ipv6.octets()[0] == 0xfd)) // 唯一本地地址 fc00::/7
+                  || (ipv6.octets()[0] == 0xfc || ipv6.octets()[0] == 0xfd))
+                // 唯一本地地址 fc00::/7
                 {
                     ipv6_addresses = ipv6.to_string();
                 }
@@ -111,7 +105,10 @@ pub fn appropriate_address_filter(
 ) -> Option<Multiaddr> {
     // 定义优先级：如果两者都启用，IPv4优先
     let preferred_order = if config.network.ipv4_enabled && config.network.ipv6_enabled {
-        vec![Protocol::Ip4([0, 0, 0, 0].into()), Protocol::Ip6([0, 0, 0, 0, 0, 0, 0, 0].into())]
+        vec![
+            Protocol::Ip4([0, 0, 0, 0].into()),
+            Protocol::Ip6([0, 0, 0, 0, 0, 0, 0, 0].into()),
+        ]
     } else if config.network.ipv4_enabled {
         vec![Protocol::Ip4([0, 0, 0, 0].into())]
     } else if config.network.ipv6_enabled {
@@ -124,14 +121,15 @@ pub fn appropriate_address_filter(
     for protocol_type in preferred_order {
         for addr in listen_addrs {
             if addr.iter().any(|proto| {
-                matches!(proto, Protocol::Ip4(_)) && matches!(protocol_type, Protocol::Ip4(_)) ||
-                matches!(proto, Protocol::Ip6(_)) && matches!(protocol_type, Protocol::Ip6(_))
+                matches!(proto, Protocol::Ip4(_)) && matches!(protocol_type, Protocol::Ip4(_))
+                    || matches!(proto, Protocol::Ip6(_))
+                        && matches!(protocol_type, Protocol::Ip6(_))
             }) {
                 return Some(addr.clone());
             }
         }
     }
-    
+
     None
 }
 
@@ -145,7 +143,7 @@ pub fn get_key() -> Result<identity::Keypair, Box<dyn std::error::Error>> {
         fs::write("keypair.bin", &encoded)?;
         keypair
     };
-    
+
     Ok(keypair)
 }
 
@@ -163,20 +161,25 @@ pub fn create_behaviour(
     let identify_config = identify::Config::new(
         format!("{}/{}", protocol_name, env!("CARGO_PKG_VERSION")),
         keypair.public(),
-    ).with_agent_version(format!("{}/{}", protocol_name, env!("CARGO_PKG_VERSION")));
-    
+    )
+    .with_agent_version(format!("{}/{}", protocol_name, env!("CARGO_PKG_VERSION")));
+
     // Kademlia 配置
     let store = MemoryStore::new(keypair.public().to_peer_id());
     let mut kademlia_config = kad::Config::new(libp2p::StreamProtocol::new("/ipfs/kad/1.0.0"));
     kademlia_config.set_record_ttl(Some(std::time::Duration::from_secs(3600)));
     kademlia_config.set_periodic_bootstrap_interval(Some(std::time::Duration::from_secs(20)));
-    let mut kademlia = kad::Behaviour::with_config(keypair.public().to_peer_id(), store, kademlia_config);
+    let mut kademlia =
+        kad::Behaviour::with_config(keypair.public().to_peer_id(), store, kademlia_config);
     kademlia.set_mode(Some(kad::Mode::Server));
     // 请求/响应 behaviour（边车通信协议）
-    let req_res_config = request_response::Config::default()
-        .with_request_timeout(Duration::from_secs(60));
+    let req_res_config =
+        request_response::Config::default().with_request_timeout(Duration::from_secs(60));
     let request_response = request_response::cbor::Behaviour::new(
-        vec![(StreamProtocol::new("/oahd/req/1.0.0"), request_response::ProtocolSupport::Full)],
+        vec![(
+            StreamProtocol::new("/oahd/req/1.0.0"),
+            request_response::ProtocolSupport::Full,
+        )],
         req_res_config,
     );
 
@@ -188,7 +191,7 @@ pub fn create_behaviour(
         addr_watcher: addr_watcher::Behaviour::new(&config.services.address_watcher),
         request_response,
     };
-    
+
     Ok(behaviour)
 }
 
@@ -197,8 +200,8 @@ pub fn create_behaviour(
 // 节点连接状态
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConnectionStatus {
-    Connected,        // 已连接
-    Disconnected,     // 未连接
+    Connected,    // 已连接
+    Disconnected, // 未连接
 }
 
 #[derive(Debug, Clone)]

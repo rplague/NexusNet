@@ -2,7 +2,7 @@
 #![allow(dead_code)]
 
 use crate::config::DispatcherConfig;
-use crate::{LogStruct, LogLevel};
+use crate::{LogLevel, LogStruct};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -35,10 +35,7 @@ impl ServiceDispatcher {
                 format!("已加载 {} 个本地服务路由", count),
             );
             for (name, addr) in &routes {
-                log_info(
-                    "服务调度器".to_string(),
-                    format!("  {} -> {}", name, addr),
-                );
+                log_info("服务调度器".to_string(), format!("  {} -> {}", name, addr));
             }
         }
 
@@ -67,8 +64,8 @@ impl ServiceDispatcher {
             format!("转发请求到 {} ({})", service_name, backend),
         );
 
-        let mut stream = TcpStream::connect(backend)
-            .map_err(|e| format!("连接后端 {} 失败: {}", backend, e))?;
+        let mut stream =
+            TcpStream::connect(backend).map_err(|e| format!("连接后端 {} 失败: {}", backend, e))?;
 
         stream
             .write_all(request_body)
