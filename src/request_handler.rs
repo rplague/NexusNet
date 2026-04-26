@@ -1,6 +1,10 @@
 use serde::{Deserialize, Serialize};
 use crate::{LogStruct, LogLevel};
 use crate::service_dispatcher::ServiceDispatcher;
+use libp2p::PeerId;
+use libp2p::swarm::Swarm;
+use crate::net::NetBehaviour;
+use libp2p::request_response;
 
 /// 请求体：向远程节点发送的服务调用请求
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -34,6 +38,29 @@ impl ServiceRequest {
             request_id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
         }
     }
+}
+
+/// 向远程节点发送服务调用请求
+///
+/// 返回 `request_id`，调用方可通过该 ID 匹配后续的 `OutboundResponse` 事件。
+pub fn send_service_request(
+    swarm: &mut Swarm<NetBehaviour>,
+    peer: &PeerId,
+    service: &str,
+    payload: Vec<u8>,
+) -> Result<u64, String> {
+    let request = ServiceRequest::new(service, payload);
+    let request_id = request.request_id;
+
+    let log = LogStruct {
+        level: LogLevel::Debug,
+        topic: "P2P请求".to_string(),
+        content: format!("向 {} 发送请求: service={}, request_id={}", peer, service, request_id),
+    };
+    log.logout();
+
+    let _outbound_id = swarm.behaviour_mut().request_response.send_request(peer, request);
+    Ok(request_id)
 }
 
 /// 处理接收到的远程请求：解析 ServiceRequest → dispatcher.forward → 返回 ServiceResponse
