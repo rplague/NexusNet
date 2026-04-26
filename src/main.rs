@@ -14,6 +14,9 @@ mod addr_watcher;
 
 mod service_dispatcher;
 use service_dispatcher::ServiceDispatcher;
+
+mod request_handler;
+use request_handler::handle_incoming_request;
 use net::{
     get_network_addresses,
     appropriate_address_filter,
@@ -636,6 +639,68 @@ async fn run_node(
                                 log.logout();
                             }
                             _ => {} // 其他Kademlia事件
+                        }
+                    }
+                    // 请求/响应事件
+                    NetBehaviourEvent::RequestResponse(event) => {
+                        match event {
+                            libp2p::request_response::Event::Message { peer, message, .. } => {
+                                match message {
+                                    libp2p::request_response::Message::Request {
+                                        request, channel, ..
+                                    } => {
+                                        let log = LogStruct {
+                                            level: LogLevel::Debug,
+                                            topic: "P2P请求".to_string(),
+                                            content: format!(
+                                                "收到来自 {} 的服务请求: service={}, request_id={}",
+                                                peer, request.service, request.request_id
+                                            ),
+                                        };
+                                        log.logout();
+
+                                        let response = handle_incoming_request(request, &dispatcher);
+                                        let _ = swarm
+                                            .behaviour_mut()
+                                            .request_response
+                                            .send_response(channel, response);
+                                    }
+                                    libp2p::request_response::Message::Response {
+                                        response, ..
+                                    } => {
+                                        let log = LogStruct {
+                                            level: LogLevel::Debug,
+                                            topic: "P2P响应".to_string(),
+                                            content: format!(
+                                                "收到来自 {} 的服务响应: status={}, request_id={}",
+                                                peer, response.status, response.request_id
+                                            ),
+                                        };
+                                        log.logout();
+                                    }
+                                }
+                            }
+                            libp2p::request_response::Event::OutboundFailure {
+                                peer, error, ..
+                            } => {
+                                let log = LogStruct {
+                                    level: LogLevel::Warning,
+                                    topic: "P2P请求失败".to_string(),
+                                    content: format!("向 {} 发送请求失败: {:?}", peer, error),
+                                };
+                                log.logout();
+                            }
+                            libp2p::request_response::Event::InboundFailure {
+                                peer, error, ..
+                            } => {
+                                let log = LogStruct {
+                                    level: LogLevel::Warning,
+                                    topic: "P2P响应失败".to_string(),
+                                    content: format!("来自 {} 的请求处理失败: {:?}", peer, error),
+                                };
+                                log.logout();
+                            }
+                            _ => {}
                         }
                     }
                     // 地址检测事件
