@@ -1,10 +1,13 @@
+// 公共 API 方法：供外部调用，当前未使用
+#![allow(dead_code)]
+
 use serde::{Deserialize, Serialize};
+
 use crate::{LogStruct, LogLevel};
 use crate::service_dispatcher::ServiceDispatcher;
 use libp2p::PeerId;
 use libp2p::swarm::Swarm;
 use crate::net::NetBehaviour;
-use libp2p::request_response;
 
 /// 请求体：向远程节点发送的服务调用请求
 #[derive(Debug, Clone, Serialize, Deserialize)]

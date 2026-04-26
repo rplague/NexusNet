@@ -1,7 +1,6 @@
 use std::net::IpAddr;
 use std::fs;
 use crate::config::NodeConfig;
-use crate::service_discovery::ServiceDiscovery;
 use std::time::Duration;
 use libp2p::multiaddr::Protocol;
 use libp2p::{
@@ -206,8 +205,6 @@ pub enum ConnectionStatus {
 pub struct PeerInfo {
     // 基础信息
     pub peer_id: PeerId,
-    // 化名
-    pub name_string: Option<String>,
     // 本机实际观测到的地址
     pub observed_addresses: Option<Multiaddr>,
     // 连接的对方地址
@@ -222,8 +219,4 @@ pub struct PeerInfo {
     pub supported_protocols: Option<Vec<StreamProtocol>>,
     // 版本
     pub agent_version: Option<String>,
-    // 节点评分或信誉值
-    pub score: Option<i32>,
-    // 其他自定义标签
-    pub tags: Option<Vec<String>>,
 }

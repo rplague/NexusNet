@@ -311,7 +311,6 @@ async fn run_node(
                 } else {
                     let new_peer_info = PeerInfo {
                         peer_id: peer ,
-                        name_string: None,
                         addresses: None,
                         observed_addresses: None,
                         public_key: None,
@@ -319,8 +318,6 @@ async fn run_node(
                         connection_status: ConnectionStatus::Connected,
                         supported_protocols: None,
                         agent_version: None,
-                        score: Some(0),
-                        tags: None,
                     };
                     net_peer_list.push(new_peer_info);
                 }
@@ -591,7 +588,6 @@ async fn run_node(
                                                 } else {
                                                     let new_peer = PeerInfo {
                                                         peer_id: peer.peer_id,
-                                                        name_string: None,
                                                         addresses: Some(peer.addrs.to_vec()[0].clone()),
                                                         observed_addresses: None,
                                                         public_key: None,
@@ -599,8 +595,6 @@ async fn run_node(
                                                         connection_status: ConnectionStatus::Disconnected,
                                                         supported_protocols: None,
                                                         agent_version: None,
-                                                        score: Some(50), // 初始分数
-                                                        tags: None,
                                                     };
                                                     net_peer_list.push(new_peer);
                                                 }
