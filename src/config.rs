@@ -58,6 +58,8 @@ pub struct ServicesConfig {
     pub dispatcher: DispatcherConfig,
     #[serde(default)]
     pub address_watcher: AddressWatcherConfig,
+    #[serde(default)]
+    pub outbound_proxy: OutboundProxyConfig,
 }
 
 impl Default for ServicesConfig {
@@ -68,6 +70,7 @@ impl Default for ServicesConfig {
             service_discovery: ServiceDiscoveryConfig::default(),
             dispatcher: DispatcherConfig::default(),
             address_watcher: AddressWatcherConfig::default(),
+            outbound_proxy: OutboundProxyConfig::default(),
         }
     }
 }
@@ -207,6 +210,28 @@ fn default_kad_query_timeout() -> u64 { 60 }
 fn default_sd_query_timeout() -> u64 { 30 }
 fn default_sd_ttl() -> u64 { 1800 }
 fn default_addr_watch_interval() -> u64 { 60 }
+fn default_proxy_port() -> u16 { 5200 }
+fn default_proxy_bind() -> String { "127.0.0.1".to_string() }
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct OutboundProxyConfig {
+    #[serde(default = "default_false")]
+    pub enabled: bool,
+    #[serde(default = "default_proxy_bind")]
+    pub bind: String,
+    #[serde(default = "default_proxy_port")]
+    pub port: u16,
+}
+
+impl Default for OutboundProxyConfig {
+    fn default() -> Self {
+        OutboundProxyConfig {
+            enabled: false,
+            bind: "127.0.0.1".to_string(),
+            port: 5200,
+        }
+    }
+}
 
 // ─── 节点管理 ───────────────────────────────────────────────
 
