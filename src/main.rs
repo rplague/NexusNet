@@ -57,32 +57,26 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            "--port" | "-p" => {
-                if i + 1 < args.len() {
-                    port = args[i + 1].parse().unwrap_or(5000);
-                    i += 1;
-                }
+            "--port" | "-p" if i + 1 < args.len() => {
+                port = args[i + 1].parse().unwrap_or(5000);
+                i += 1;
             }
-            "--connect" | "-c" => {
-                if i + 1 < args.len() {
-                    connect_list.clear();
-                    connect_list.push(args[i + 1].clone());
-                    i += 1;
-                }
+            "--connect" | "-c" if i + 1 < args.len() => {
+                connect_list.clear();
+                connect_list.push(args[i + 1].clone());
+                i += 1;
             }
-            "--query" | "-q" => {
-                if i + 1 < args.len() {
-                    // 保存查询指令，在节点启动后执行
-                    let svc_type = args[i + 1].clone();
-                    // 存到环境变量中的特殊标记，稍后在 run_node 中处理
-                    let log = LogStruct {
-                        level: LogLevel::Preset,
-                        topic: "服务发现查询".to_string(),
-                        content: format!("节点启动后将查询服务: {}", svc_type),
-                    };
-                    log.logout();
-                    i += 1;
-                }
+            "--query" | "-q" if i + 1 < args.len() => {
+                // 保存查询指令，在节点启动后执行
+                let svc_type = args[i + 1].clone();
+                // 存到环境变量中的特殊标记，稍后在 run_node 中处理
+                let log = LogStruct {
+                    level: LogLevel::Preset,
+                    topic: "服务发现查询".to_string(),
+                    content: format!("节点启动后将查询服务: {}", svc_type),
+                };
+                log.logout();
+                i += 1;
             }
             _ => {}
         }
@@ -109,8 +103,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     // 提取查询目标（如果有）
     let query_service = std::env::var("NEXUS_QUERY_SERVICE").ok();
 
-    tokio::runtime::Runtime::new()?
-        .block_on(async { run_node(port, connect_list, &mut config, query_service).await });
+    tokio::runtime::Runtime::new()?.block_on(async {
+        let _ = run_node(port, connect_list, &mut config, query_service).await;
+    });
     Ok(())
 }
 /// 运行libp2p节点的核心异步函数
@@ -165,7 +160,7 @@ async fn run_node(
     // 从公钥计算Peer ID（节点的唯一标识符）
 
     // 创建网络行为组合（包含ping、identify等协议）
-    let behaviour = create_behaviour(&keypair, "/OAHD", &config)?;
+    let behaviour = create_behaviour(&keypair, "/OAHD", config)?;
 
     // 使用SwarmBuilder构建节点管理器
     let mut swarm = SwarmBuilder::with_existing_identity(keypair)
@@ -337,7 +332,7 @@ async fn run_node(
                                     .collect();
                                 let records = sd.reannounce(&announce_addrs);
                                 for record in records {
-                                    let key_str = String::from_utf8_lossy(&record.key.as_ref());
+                                    let key_str = String::from_utf8_lossy(record.key.as_ref());
                                     if let Some(svc_type) = key_str.strip_prefix(
                                         std::str::from_utf8(SD_KEY_PREFIX).unwrap_or("")
                                     ) {
@@ -450,24 +445,21 @@ async fn run_node(
                                     // 确认身份并录入信息
                                     if let Some(index) = net_peer_list.iter().position(|p| p.peer_id == peer_id) {
                                         net_peer_list[index].agent_version = Some(info.agent_version.clone());
-                                        let addr_filtered = appropriate_address_filter(&info.listen_addrs, config);
-                                        if addr_filtered.is_none() {
-                                            let log = LogStruct {
-                                                level: LogLevel::Warning,
-                                                topic: "地址不兼容".to_string(),
-                                                content: format!(
-                                                    "{} 的监听地址与本地 IP 协议栈不匹配，跳过",
-                                                    peer_id
-                                                ),
-                                            };
-                                            log.logout();
-                                        } else {
-                                            let mut addr_with_peer_id = addr_filtered.unwrap();
-                                            addr_with_peer_id.push(libp2p::multiaddr::Protocol::P2p(peer_id));
-                                            net_peer_list[index].addresses = Some(addr_with_peer_id.clone());
+                                        let mut addr_with_peer_id = appropriate_address_filter(&info.listen_addrs, config);
+                                        if let Some(ref mut addr) = addr_with_peer_id {
+                                            addr.push(libp2p::multiaddr::Protocol::P2p(peer_id));
+                                            net_peer_list[index].addresses = Some(addr.clone());
                                             net_peer_list[index].observed_addresses = Some(info.observed_addr.clone());
                                             net_peer_list[index].public_key = Some(info.public_key.clone());
                                             net_peer_list[index].supported_protocols = Some(info.protocols.clone());
+                                        } else {
+                                            let log = LogStruct {
+                                                level: LogLevel::Warning,
+                                                topic: "地址不兼容".to_string(),
+                                                content: format!("{} 的监听地址与本地 IP 协议栈不匹配，跳过", peer_id),
+                                            };
+                                            log.logout();
+                                        }
                                         // 若为我的节点则加入连接表中并开始kad协议
                                         if config.services.kademlia.enabled
                                         && format!("/OAHD/{}", env!("CARGO_PKG_VERSION")) == info.agent_version.clone()
@@ -476,7 +468,7 @@ async fn run_node(
                                             let addr_string = addr.to_string();
                                             config.insert_bootstrap_nodes(addr_string);
                                             // 加入节点列表
-                                            swarm.behaviour_mut().kademlia.add_address(&peer_id, addr_with_peer_id.clone());
+                                            swarm.behaviour_mut().kademlia.add_address(&peer_id, addr.clone());
                                             let log = LogStruct {
                                                 level: LogLevel::Preset,
                                                 topic: format!("{}已被加入路由节点", peer_id),
@@ -508,7 +500,6 @@ async fn run_node(
                                                 ),
                                             };
                                             log.logout();
-                                        }
                                         }
                                     } else {
                                         let log = LogStruct {
@@ -544,7 +535,7 @@ async fn run_node(
                                                 Ok(_) => {
                                                     // Bootstrap 成功后，宣告本地服务并查询
                                                     if sd.is_enabled() {
-                                                        if !sd_announced && sd.list_local_services().len() > 0 {
+                                                        if !sd_announced && !sd.list_local_services().is_empty() {
                                                             // 用 listeners 中已就绪的地址填充
                                                             let announce_addrs: Vec<String> = swarm
                                                                 .listeners()
@@ -553,7 +544,7 @@ async fn run_node(
                                                             sd.set_addresses(&announce_addrs);
                                                             let records = sd.get_announce_records();
                                                             for record in records {
-                                                                let key_str = String::from_utf8_lossy(&record.key.as_ref());
+                                                                let key_str = String::from_utf8_lossy(record.key.as_ref());
                                                                 if let Some(svc_type) = key_str.strip_prefix(
                                                                     std::str::from_utf8(SD_KEY_PREFIX).unwrap_or("")
                                                                 ) {
@@ -801,7 +792,7 @@ async fn run_node(
                                         if sd.is_enabled() && sd_announced {
                                             let records = sd.reannounce(&announce_addrs);
                                             for record in records {
-                                                let key_str = String::from_utf8_lossy(&record.key.as_ref());
+                                                let key_str = String::from_utf8_lossy(record.key.as_ref());
                                                 if let Some(svc_type) = key_str.strip_prefix(
                                                     std::str::from_utf8(SD_KEY_PREFIX).unwrap_or("")
                                                 ) {
