@@ -1,3 +1,6 @@
+// 公共 API 方法：供外部调用，当前未使用
+#![allow(dead_code)]
+
 use crate::config::DispatcherConfig;
 use crate::{LogStruct, LogLevel};
 use std::collections::HashMap;

@@ -1,5 +1,5 @@
 use libp2p::swarm::{
-    behaviour::{self, ToSwarm},
+    behaviour::ToSwarm,
     dummy,
     ConnectionDenied, ConnectionId, FromSwarm, THandler, THandlerInEvent, THandlerOutEvent,
 };
