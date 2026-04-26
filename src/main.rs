@@ -444,14 +444,17 @@ async fn run_node(
                                     log.logout();
                                     // 确认身份并录入信息
                                     if let Some(index) = net_peer_list.iter().position(|p| p.peer_id == peer_id) {
-                                        net_peer_list[index].agent_version = Some(info.agent_version.clone());
-                                        let mut addr_with_peer_id = appropriate_address_filter(&info.listen_addrs, config);
-                                        if let Some(ref mut addr) = addr_with_peer_id {
-                                            addr.push(libp2p::multiaddr::Protocol::P2p(peer_id));
-                                            net_peer_list[index].addresses = Some(addr.clone());
-                                            net_peer_list[index].observed_addresses = Some(info.observed_addr.clone());
-                                            net_peer_list[index].public_key = Some(info.public_key.clone());
-                                            net_peer_list[index].supported_protocols = Some(info.protocols.clone());
+                                        let entry = &mut net_peer_list[index];
+
+                                        entry.agent_version = Some(info.agent_version.clone());
+                                        entry.observed_addresses = Some(info.observed_addr.clone());
+                                        entry.public_key = Some(info.public_key.clone());
+                                        entry.supported_protocols = Some(info.protocols.clone());
+
+                                        let filtered_addrs = appropriate_address_filter(&info.listen_addrs, config);
+                                        if let Some(mut addrs) = filtered_addrs {
+                                            addrs.push(libp2p::multiaddr::Protocol::P2p(peer_id));
+                                            entry.addresses = Some(addrs);
                                         } else {
                                             let log = LogStruct {
                                                 level: LogLevel::Warning,
@@ -460,26 +463,34 @@ async fn run_node(
                                             };
                                             log.logout();
                                         }
-                                        // 若为我的节点则加入连接表中并开始kad协议
-                                        if config.services.kademlia.enabled
-                                        && format!("/OAHD/{}", env!("CARGO_PKG_VERSION")) == info.agent_version.clone()
-                                        && let Some(addr) = &net_peer_list[index].addresses
-                                        && addr.iter().any(|proto| {matches!(proto, libp2p::multiaddr::Protocol::P2p(_))}){
-                                            let addr_string = addr.to_string();
+
+                                        let has_p2p_addr = entry
+                                            .addresses
+                                            .as_ref()
+                                            .is_some_and(|addrs| addrs.iter().any(|proto| matches!(proto, libp2p::multiaddr::Protocol::P2p(_))));
+
+                                        const AGENT_VERSION_PREFIX: &str = concat!("/OAHD/", env!("CARGO_PKG_VERSION"));
+                                        let is_my_node = config.services.kademlia.enabled
+                                            && info.agent_version == AGENT_VERSION_PREFIX
+                                            && has_p2p_addr;
+
+                                        if is_my_node {
+                                            let addrs = entry.addresses.as_ref().unwrap();
+                                            let addr_string = addrs.to_string();
                                             config.insert_bootstrap_nodes(addr_string);
-                                            // 加入节点列表
-                                            swarm.behaviour_mut().kademlia.add_address(&peer_id, addr.clone());
+
+                                            let kademlia = &mut swarm.behaviour_mut().kademlia;
+                                            kademlia.add_address(&peer_id, addrs.clone());
                                             let log = LogStruct {
                                                 level: LogLevel::Preset,
                                                 topic: format!("{}已被加入路由节点", peer_id),
-                                                content: "".to_string(),
+                                                content: String::new(),
                                             };
                                             log.logout();
-                                            println!("路由表总节点数: {}", swarm.behaviour_mut().kademlia.kbuckets().count());
+                                            println!("路由表总节点数: {}", kademlia.kbuckets().count());
 
-                                            // 有同版本节点连接后，触发 bootstrap
                                             if !bootstrap_done {
-                                                let _ = swarm.behaviour_mut().kademlia.bootstrap();
+                                                let _ = kademlia.bootstrap();
                                                 bootstrap_done = true;
                                                 let log = LogStruct {
                                                     level: LogLevel::Preset,
@@ -488,16 +499,12 @@ async fn run_node(
                                                 };
                                                 log.logout();
                                             }
-
-                                        } else {
+                                        } else if has_p2p_addr {
+                                            let addrs = entry.addresses.as_ref().unwrap();
                                             let log = LogStruct {
                                                 level: LogLevel::Warning,
                                                 topic: "未知节点接入网络".to_string(),
-                                                content: format!(
-                                                    "收到 {} 后未能创建列表内容！{}",
-                                                    peer_id,
-                                                    net_peer_list[index].addresses.as_ref().unwrap()
-                                                ),
+                                                content: format!("收到 {} 后未能创建列表内容！{}", peer_id, addrs),
                                             };
                                             log.logout();
                                         }
