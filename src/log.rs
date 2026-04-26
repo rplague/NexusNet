@@ -102,7 +102,6 @@ fn rolling_check() {
                         content: e.to_string(),
                     };
                     log(&_log);
-                    return;
                 }
             }
             Err(e) => {
@@ -112,7 +111,6 @@ fn rolling_check() {
                     content: e.to_string(),
                 };
                 log(&_log);
-                return;
             }
         }
 
@@ -127,7 +125,6 @@ fn rolling_check() {
                         content: e.to_string(),
                     };
                     log(&_log);
-                    return;
                 }
                 if let Err(e) = encoder.finish() {
                     let _log = LogStruct {
@@ -136,7 +133,6 @@ fn rolling_check() {
                         content: e.to_string(),
                     };
                     log(&_log);
-                    return;
                 }
 
                 // 压缩成功后删除临时文件
@@ -147,7 +143,6 @@ fn rolling_check() {
                         content: e.to_string(),
                     };
                     log(&_log);
-                    return;
                 }
             }
             Err(e) => {
@@ -157,9 +152,8 @@ fn rolling_check() {
                     content: e.to_string(),
                 };
                 log(&_log);
-                return;
             }
-        };
+        }
     });
 }
 

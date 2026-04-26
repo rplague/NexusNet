@@ -41,7 +41,7 @@ pub struct NetworkConfig {
     pub announce_addresses: Vec<String>,
 }
 
-#[derive(Debug, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, serde::Deserialize, serde::Serialize, Default)]
 pub struct ServicesConfig {
     #[serde(default)]
     pub ping: PingService,
@@ -55,19 +55,6 @@ pub struct ServicesConfig {
     pub address_watcher: AddressWatcherConfig,
     #[serde(default)]
     pub outbound_proxy: OutboundProxyConfig,
-}
-
-impl Default for ServicesConfig {
-    fn default() -> Self {
-        ServicesConfig {
-            ping: PingService::default(),
-            kademlia: KademliaService::default(),
-            service_discovery: ServiceDiscoveryConfig::default(),
-            dispatcher: DispatcherConfig::default(),
-            address_watcher: AddressWatcherConfig::default(),
-            outbound_proxy: OutboundProxyConfig::default(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
@@ -117,22 +104,13 @@ impl Default for ServiceDiscoveryConfig {
 /// 本地服务调度器配置
 /// 每个服务是一个独立进程，监听本地回环地址的某个端口。
 /// 通信层收到外部请求后，根据 service=xxx 字段将请求转发到对应端口。
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, Default)]
 pub struct DispatcherConfig {
     #[serde(default = "default_false")]
     pub enabled: bool,
     /// 本地服务的路由表: 服务名 → 后端地址
     #[serde(default)]
     pub local_services: Vec<LocalServiceEntry>,
-}
-
-impl Default for DispatcherConfig {
-    fn default() -> Self {
-        DispatcherConfig {
-            enabled: false,
-            local_services: vec![],
-        }
-    }
 }
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]

@@ -27,6 +27,7 @@ pub struct NetBehaviour {
 
 // 定义行为事件枚举
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum NetBehaviourEvent {
     Ping(ping::Event),
     Identify(identify::Event),
