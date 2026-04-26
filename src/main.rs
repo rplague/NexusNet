@@ -384,12 +384,24 @@ async fn run_node(
                             // 确认身份并录入信息
                             if let Some(index) = net_peer_list.iter().position(|p| p.peer_id == peer_id) {
                                 net_peer_list[index].agent_version = Some(info.agent_version.clone());
-                                let mut addr_with_peer_id = appropriate_address_filter(&info.listen_addrs, config).expect("");
-                                addr_with_peer_id.push(libp2p::multiaddr::Protocol::P2p(peer_id));
-                                net_peer_list[index].addresses = Some(addr_with_peer_id.clone());
-                                net_peer_list[index].observed_addresses = Some(info.observed_addr.clone());
-                                net_peer_list[index].public_key = Some(info.public_key.clone());
-                                net_peer_list[index].supported_protocols = Some(info.protocols.clone());
+                                let addr_filtered = appropriate_address_filter(&info.listen_addrs, config);
+                                if addr_filtered.is_none() {
+                                    let log = LogStruct {
+                                        level: LogLevel::Warning,
+                                        topic: "地址不兼容".to_string(),
+                                        content: format!(
+                                            "{} 的监听地址与本地 IP 协议栈不匹配，跳过",
+                                            peer_id
+                                        ),
+                                    };
+                                    log.logout();
+                                } else {
+                                    let mut addr_with_peer_id = addr_filtered.unwrap();
+                                    addr_with_peer_id.push(libp2p::multiaddr::Protocol::P2p(peer_id));
+                                    net_peer_list[index].addresses = Some(addr_with_peer_id.clone());
+                                    net_peer_list[index].observed_addresses = Some(info.observed_addr.clone());
+                                    net_peer_list[index].public_key = Some(info.public_key.clone());
+                                    net_peer_list[index].supported_protocols = Some(info.protocols.clone());
                                 // 若为我的节点则加入连接表中并开始kad协议
                                 if config.services.kademlia.enabled
                                 && format!("/OAHD/{}", env!("CARGO_PKG_VERSION")) == info.agent_version.clone()
@@ -430,6 +442,7 @@ async fn run_node(
                                         ),
                                     };
                                     log.logout();
+                                }
                                 }
                             } else {
                                 let log = LogStruct {
