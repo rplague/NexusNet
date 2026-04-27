@@ -163,7 +163,8 @@ pub fn create_behaviour(
         format!("{}/{}", protocol_name, env!("CARGO_PKG_VERSION")),
         keypair.public(),
     )
-    .with_agent_version(format!("{}/{}", protocol_name, env!("CARGO_PKG_VERSION")));
+    .with_agent_version(format!("{}/{}", protocol_name, env!("CARGO_PKG_VERSION")))
+    .with_push_listen_addr_updates(true);
 
     // Kademlia 配置
     let store = MemoryStore::new(keypair.public().to_peer_id());
