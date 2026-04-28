@@ -122,7 +122,7 @@ impl Default for DispatcherConfig {
         DispatcherConfig {
             enabled: false,
             local_services: Vec::new(),
-            management_port: 19520,
+            management_port: 5200,
         }
     }
 }
@@ -222,7 +222,7 @@ fn default_addr_watch_interval() -> u64 {
     60
 }
 fn default_management_port() -> u16 {
-    19520
+    5200
 }
 fn default_proxy_port() -> u16 {
     5200
