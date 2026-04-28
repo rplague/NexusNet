@@ -3,6 +3,7 @@ use crate::{LogLevel, LogStruct};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::time::Duration;
 use tokio::sync::mpsc;
 
 /// 本地服务调度器
@@ -127,6 +128,11 @@ impl ServiceDispatcher {
 
     /// 转发请求到后端服务并返回响应
     ///
+    /// 协议约定：
+    ///   发送：4 字节大端长度前缀 + 请求载荷（{request_length}{request_body}）
+    ///   接收：4 字节大端长度前缀 + 响应载荷（{response_length}{response_body}）
+    ///   读取超时：10 秒
+    ///
     /// `request_body` 是已序列化的请求载荷（如 JSON）。
     /// 返回后端服务的响应字节。
     pub fn forward(&self, service_name: &str, request_body: &[u8]) -> Result<Vec<u8>, String> {
@@ -142,21 +148,48 @@ impl ServiceDispatcher {
         let mut stream =
             TcpStream::connect(backend).map_err(|e| format!("连接后端 {} 失败: {}", backend, e))?;
 
+        // 设置读超时，防止后端不关连接时永久挂起
+        let timeout = Duration::from_secs(10);
         stream
-            .write_all(request_body)
+            .set_read_timeout(Some(timeout))
+            .map_err(|e| format!("设置读超时失败: {}", e))?;
+
+        // 发送：4 字节长度前缀 + 请求体
+        let req_len = (request_body.len() as u32).to_be_bytes();
+        let mut send_buf = Vec::with_capacity(4 + request_body.len());
+        send_buf.extend_from_slice(&req_len);
+        send_buf.extend_from_slice(request_body);
+
+        stream
+            .write_all(&send_buf)
             .map_err(|e| format!("写入请求到 {} 失败: {}", backend, e))?;
         stream
             .flush()
             .map_err(|e| format!("刷新写入到 {} 失败: {}", backend, e))?;
 
-        let mut response = Vec::new();
+        // 读取：先读 4 字节长度头，再读指定长度的响应体
+        let mut len_buf = [0u8; 4];
         stream
-            .read_to_end(&mut response)
-            .map_err(|e| format!("读取 {} 响应失败: {}", backend, e))?;
+            .read_exact(&mut len_buf)
+            .map_err(|e| format!("读取 {} 响应长度前缀失败: {}", backend, e))?;
+        let resp_len = u32::from_be_bytes(len_buf) as usize;
+
+        if resp_len == 0 {
+            log_info(
+                "服务调度器".to_string(),
+                format!("收到 {} 空响应", service_name),
+            );
+            return Ok(Vec::new());
+        }
+
+        let mut response = vec![0u8; resp_len];
+        stream
+            .read_exact(&mut response)
+            .map_err(|e| format!("读取 {} 响应体 ({} 字节) 失败: {}", backend, resp_len, e))?;
 
         log_info(
             "服务调度器".to_string(),
-            format!("收到 {} 响应 ({} 字节)", service_name, response.len()),
+            format!("收到 {} 响应 ({} 字节)", service_name, resp_len),
         );
 
         Ok(response)
@@ -191,6 +224,15 @@ impl ServiceDispatcher {
 }
 
 /// 处理一条管理连接：读取 JSON 命令，执行或转发
+///
+/// 协议版本 2 (Content-Length 前缀)：
+///   客户端先发送 4 字节大端 u32 = JSON 请求体的字节长度（不含长度头自身），
+///   再发送精确长度的 JSON 内容。
+///   服务端先发送 4 字节大端 u32 = JSON 响应体的字节长度，
+///   再发送精确长度的 JSON 内容。
+///
+/// 向后兼容：如果前 4 字节不是有效的长度（> 0x100000 = 1MB），
+/// 则回退到 read_line 模式（单行 JSON 协议）。
 fn handle_management_connection(
     mut stream: TcpStream,
     config: &DispatcherConfig,
@@ -202,14 +244,45 @@ fn handle_management_connection(
         format!("新的管理连接: {:?}", peer_addr),
     );
 
-    // 读取一行 JSON
-    let mut reader = BufReader::new(&mut stream);
-    let mut line = String::new();
-    reader
-        .read_line(&mut line)
-        .map_err(|e| format!("读取管理命令失败: {}", e))?;
+    // 读取 4 字节 Content-Length 前缀
+    let mut len_buf = [0u8; 4];
+    let json_body = match stream.peek(&mut len_buf) {
+        Ok(n) if n >= 4 => {
+            let content_len = u32::from_be_bytes(len_buf) as usize;
+            if content_len > 0 && content_len <= 1_048_576 {
+                // 新协议：Content-Length 前缀
+                // 消费掉长度头（已经 peek 过了，需要用 exact_read 覆盖掉这 4 字节）
+                let mut full_buf = vec![0u8; 4 + content_len];
+                stream
+                    .read_exact(&mut full_buf)
+                    .map_err(|e| format!("读取管理命令失败: {}", e))?;
+                let body = &full_buf[4..];
+                String::from_utf8(body.to_vec())
+                    .map_err(|e| format!("UTF-8 解码失败: {}", e))?
+            } else if content_len == 0 {
+                return Ok(());
+            } else {
+                // 超过 1MB 或无效，回退到 read_line
+                let mut reader = BufReader::new(&mut stream);
+                let mut line = String::new();
+                reader
+                    .read_line(&mut line)
+                    .map_err(|e| format!("读取管理命令失败: {}", e))?;
+                line.trim().to_string()
+            }
+        }
+        _ => {
+            // 回退到 read_line
+            let mut reader = BufReader::new(&mut stream);
+            let mut line = String::new();
+            reader
+                .read_line(&mut line)
+                .map_err(|e| format!("读取管理命令失败: {}", e))?;
+            line.trim().to_string()
+        }
+    };
 
-    let line = line.trim();
+    let line = json_body.trim();
     if line.is_empty() {
         return Ok(());
     }
@@ -221,6 +294,9 @@ fn handle_management_connection(
     let action = cmd["action"]
         .as_str()
         .ok_or_else(|| "缺少 action 字段".to_string())?;
+
+    // 先保存 `reader` 的所有权（在回退路径中创建），这里不需要它了
+    // 管理口新协议直接使用 `stream` 写入 Content-Length 前缀
 
     match action {
         "call_remote" => {
@@ -262,7 +338,6 @@ fn handle_management_connection(
                         .map_err(|e| format!("接收响应失败: {}", e))?
                 });
 
-            // 写入响应
             let resp_json = match &response {
                 Ok(data) => serde_json::json!({
                     "status": "ok",
@@ -277,19 +352,7 @@ fn handle_management_connection(
                 }),
             };
 
-            let resp_line = serde_json::to_string(&resp_json)
-                .map_err(|e| format!("序列化响应失败: {}", e))?;
-
-            // stream 已被 BufReader 借用，用内部 stream 写入
-            // 由于 BufReader 持有 &mut stream，我们需要重新获取写入端
-            // 实际上 BufReader 被 drop 后 stream 恢复可写
-            drop(reader);
-            writeln!(
-                std::io::BufWriter::new(&mut stream),
-                "{}",
-                resp_line
-            )
-            .map_err(|e| format!("写入响应失败: {}", e))?;
+            write_response(&mut stream, &resp_json)?;
         }
 
         "list_services" => {
@@ -306,22 +369,12 @@ fn handle_management_connection(
                     })
                 })
                 .collect();
-            drop(reader);
-            writeln!(
-                std::io::BufWriter::new(&mut stream),
-                "{}",
-                serde_json::to_string(&services).unwrap()
-            )
-            .map_err(|e| format!("写入响应失败: {}", e))?;
+            write_raw_json(&mut stream, &serde_json::to_value(&services).unwrap())?;
         }
 
         "ping" => {
-            drop(reader);
-            writeln!(
-                std::io::BufWriter::new(&mut stream),
-                "{{\"status\":\"ok\",\"message\":\"pong\"}}"
-            )
-            .map_err(|e| format!("写入响应失败: {}", e))?;
+            let resp = serde_json::json!({"status": "ok", "message": "pong"});
+            write_response(&mut stream, &resp)?;
         }
 
         other => {
@@ -329,17 +382,39 @@ fn handle_management_connection(
                 "status": "error",
                 "message": format!("未知 action: {}", other)
             });
-            drop(reader);
-            writeln!(
-                std::io::BufWriter::new(&mut stream),
-                "{}",
-                serde_json::to_string(&resp).unwrap()
-            )
-            .map_err(|e| format!("写入响应失败: {}", e))?;
+            write_response(&mut stream, &resp)?;
         }
     }
 
     Ok(())
+}
+
+/// 向管理连接写入 Content-Length 前缀 + JSON 响应
+fn write_response(stream: &mut TcpStream, value: &serde_json::Value) -> Result<(), String> {
+    let body = serde_json::to_string(value)
+        .map_err(|e| format!("序列化响应失败: {}", e))?;
+    let len = body.len() as u32;
+    let len_bytes = len.to_be_bytes();
+    let mut buf = Vec::with_capacity(4 + body.len());
+    buf.extend_from_slice(&len_bytes);
+    buf.extend_from_slice(body.as_bytes());
+    stream
+        .write_all(&buf)
+        .map_err(|e| format!("写入响应失败: {}", e))
+}
+
+/// 写入原始 JSON（不是标准结构体，直接传已构造的 Value）
+fn write_raw_json(stream: &mut TcpStream, value: &serde_json::Value) -> Result<(), String> {
+    let body = serde_json::to_string(value)
+        .map_err(|e| format!("序列化响应失败: {}", e))?;
+    let len = body.len() as u32;
+    let len_bytes = len.to_be_bytes();
+    let mut buf = Vec::with_capacity(4 + body.len());
+    buf.extend_from_slice(&len_bytes);
+    buf.extend_from_slice(body.as_bytes());
+    stream
+        .write_all(&buf)
+        .map_err(|e| format!("写入响应失败: {}", e))
 }
 
 fn log_info(topic: String, content: String) {
