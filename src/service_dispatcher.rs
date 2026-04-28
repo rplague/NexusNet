@@ -293,21 +293,24 @@ fn handle_management_connection(
         }
 
         "list_services" => {
-            // 返回本地注册的服务列表
-            let services: Vec<String> = config
+            // 返回本地注册的服务列表（完整格式，与服务发现兼容）
+            let services: Vec<serde_json::Value> = config
                 .local_services
                 .iter()
-                .map(|s| s.name.clone())
+                .map(|s| {
+                    serde_json::json!({
+                        "service_type": s.name,
+                        "provider": "local",
+                        "addrs": [format!("{}:{}", s.host, s.port)],
+                        "ttl": 0
+                    })
+                })
                 .collect();
-            let resp = serde_json::json!({
-                "status": "ok",
-                "services": services
-            });
             drop(reader);
             writeln!(
                 std::io::BufWriter::new(&mut stream),
                 "{}",
-                serde_json::to_string(&resp).unwrap()
+                serde_json::to_string(&services).unwrap()
             )
             .map_err(|e| format!("写入响应失败: {}", e))?;
         }
