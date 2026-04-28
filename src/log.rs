@@ -1,11 +1,11 @@
-use chrono::{DateTime, Local};
-use colored::*;
-use flate2::Compression;
-use flate2::write::GzEncoder;
 use std::fs;
 use std::io::{Read, Write};
-use std::sync::Mutex;
 use std::thread::spawn;
+use std::sync::Mutex;
+use chrono::{DateTime, Local};
+use flate2::Compression;
+use flate2::write::GzEncoder;
+use colored::*;
 
 static LOG_FILE_MUTEX: Mutex<()> = Mutex::new(());
 
@@ -39,6 +39,7 @@ impl LogLevel {
             LogLevel::Critical => "[CRITICAL]".on_red().bold().blink(),
         }
     }
+    
 }
 
 pub struct LogStruct {
@@ -48,7 +49,7 @@ pub struct LogStruct {
 }
 
 impl LogStruct {
-    pub fn logout(&self) {
+    pub fn logout(&self){
         rolling_check();
         log(self)
     }
@@ -80,8 +81,7 @@ fn rolling_check() {
         }
 
         // 生成时间戳
-        let timestamp = metadata
-            .created()
+        let timestamp = metadata.created()
             .map(|created_time| {
                 let datetime: DateTime<Local> = DateTime::from(created_time);
                 datetime.format("%m%d_%H%M").to_string()
@@ -102,6 +102,7 @@ fn rolling_check() {
                         content: e.to_string(),
                     };
                     log(&_log);
+                    return;
                 }
             }
             Err(e) => {
@@ -111,7 +112,8 @@ fn rolling_check() {
                     content: e.to_string(),
                 };
                 log(&_log);
-            }
+                return;
+            },
         }
 
         // 压缩文件
@@ -125,6 +127,7 @@ fn rolling_check() {
                         content: e.to_string(),
                     };
                     log(&_log);
+                    return;
                 }
                 if let Err(e) = encoder.finish() {
                     let _log = LogStruct {
@@ -133,8 +136,9 @@ fn rolling_check() {
                         content: e.to_string(),
                     };
                     log(&_log);
+                    return;
                 }
-
+                
                 // 压缩成功后删除临时文件
                 if let Err(e) = fs::remove_file(TMP_FILE) {
                     let _log = LogStruct {
@@ -143,6 +147,7 @@ fn rolling_check() {
                         content: e.to_string(),
                     };
                     log(&_log);
+                    return;
                 }
             }
             Err(e) => {
@@ -152,18 +157,13 @@ fn rolling_check() {
                     content: e.to_string(),
                 };
                 log(&_log);
-            }
-        }
+                return;
+            },
+        };
     });
 }
 
-fn format_log_entry(
-    level: &LogLevel,
-    time: &str,
-    topic: &str,
-    content: &str,
-    color: bool,
-) -> String {
+fn format_log_entry(level: &LogLevel, time: &str, topic: &str, content: &str, color: bool) -> String {
     if color {
         let prefix = level.color();
         if content.is_empty() {
@@ -205,7 +205,10 @@ fn log(info: &LogStruct) {
 
     // 写入文件
     let _guard = LOG_FILE_MUTEX.lock().unwrap();
-    let log_open_result = fs::OpenOptions::new().append(true).create(true).open("log");
+    let log_open_result = fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open("log");
     let mut log = match log_open_result {
         Ok(file) => file,
         Err(_error) => {
