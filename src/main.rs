@@ -13,7 +13,7 @@ mod net;
 mod addr_watcher;
 
 mod service_dispatcher;
-use service_dispatcher::ServiceDispatcher;
+use service_dispatcher::{ManagerCommand, ServiceDispatcher};
 
 mod request_handler;
 use request_handler::handle_incoming_request;
@@ -241,6 +241,14 @@ async fn run_node(
         });
     }
 
+    // 调度器管理命令通道：本地服务（如 CLI）通过 dispatcher 管理口发来的 P2P 请求
+    let (dispatcher_cmd_tx, mut dispatcher_cmd_rx) = mpsc::channel::<ManagerCommand>(64);
+    if config.services.dispatcher.enabled {
+        let mgmt_config = config.services.dispatcher.clone();
+        let cmd_tx = dispatcher_cmd_tx.clone();
+        ServiceDispatcher::start_management(mgmt_config, cmd_tx);
+    }
+
     // 阶段管理：监听就绪 → bootstrap → 服务宣告+查询
     let mut listeners_ready = false;
     let mut bootstrap_done = false;
@@ -303,6 +311,36 @@ async fn run_node(
                                             message: format!("发送请求失败: {}", e),
                                             data: None,
                                         });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // 处理本地服务通过 dispatcher 管理口发来的远程调用请求
+                    Some(cmd) = dispatcher_cmd_rx.recv() => {
+                        match cmd {
+                            ManagerCommand::CallRemote { peer, service, payload, response_tx } => {
+                                let log = LogStruct {
+                                    level: LogLevel::Debug,
+                                    topic: "管理通道".to_string(),
+                                    content: format!("本地请求调用 {} 的 {} 服务", peer, service),
+                                };
+                                log.logout();
+
+                                // 解析目标 PeerId
+                                match peer.parse::<PeerId>() {
+                                    Ok(peer_id) => {
+                                        match send_service_request(&mut swarm, &peer_id, &service, payload) {
+                                            Ok(request_id) => {
+                                                let _ = response_tx.send(Ok(format!("请求已发送, request_id={}", request_id).into_bytes()));
+                                            }
+                                            Err(e) => {
+                                                let _ = response_tx.send(Err(format!("发送请求失败: {}", e)));
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        let _ = response_tx.send(Err(format!("无效的 PeerId '{}': {}", peer, e)));
                                     }
                                 }
                             }
