@@ -104,13 +104,27 @@ impl Default for ServiceDiscoveryConfig {
 /// 本地服务调度器配置
 /// 每个服务是一个独立进程，监听本地回环地址的某个端口。
 /// 通信层收到外部请求后，根据 service=xxx 字段将请求转发到对应端口。
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, Default)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct DispatcherConfig {
     #[serde(default = "default_false")]
     pub enabled: bool,
     /// 本地服务的路由表: 服务名 → 后端地址
     #[serde(default)]
     pub local_services: Vec<LocalServiceEntry>,
+    /// 管理端口：本地 CLI 通过此端口与节点交互
+    /// CLI 发送 JSON 命令，dispatcher 处理或转发到 P2P 网络
+    #[serde(default = "default_management_port")]
+    pub management_port: u16,
+}
+
+impl Default for DispatcherConfig {
+    fn default() -> Self {
+        DispatcherConfig {
+            enabled: false,
+            local_services: Vec::new(),
+            management_port: 5200,
+        }
+    }
 }
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
@@ -206,6 +220,9 @@ fn default_sd_ttl() -> u64 {
 }
 fn default_addr_watch_interval() -> u64 {
     60
+}
+fn default_management_port() -> u16 {
+    5200
 }
 fn default_proxy_port() -> u16 {
     5200

@@ -13,13 +13,13 @@ mod net;
 mod addr_watcher;
 
 mod service_dispatcher;
-use service_dispatcher::ServiceDispatcher;
+use service_dispatcher::{ManagerCommand, ServiceDispatcher};
 
 mod request_handler;
 use request_handler::handle_incoming_request;
 use request_handler::send_service_request;
 
-mod outbound_proxy;
+
 use libp2p::kad::QueryResult;
 use libp2p::{
     Multiaddr, PeerId, SwarmBuilder, futures::StreamExt, kad, noise, swarm::SwarmEvent, tcp, yamux,
@@ -28,7 +28,7 @@ use net::{
     ConnectionStatus, NetBehaviourEvent, PeerInfo, appropriate_address_filter, create_behaviour,
     get_key, get_network_addresses,
 };
-use outbound_proxy::ProxyCommand;
+
 use service_discovery::SD_KEY_PREFIX;
 use tokio::sync::mpsc;
 
@@ -231,14 +231,12 @@ async fn run_node(
     };
     log.logout();
 
-    // 出站代理通道
-    let (proxy_cmd_tx, mut proxy_cmd_rx) = mpsc::channel::<ProxyCommand>(64);
-    if config.services.outbound_proxy.enabled {
-        let proxy_cfg = config.services.outbound_proxy.clone();
-        let tx = proxy_cmd_tx.clone();
-        tokio::spawn(async move {
-            let _ = outbound_proxy::start(&proxy_cfg, tx).await;
-        });
+    // 调度器管理命令通道：本地服务（如 CLI）通过 dispatcher 管理口发来的 P2P 请求
+    let (dispatcher_cmd_tx, mut dispatcher_cmd_rx) = mpsc::channel::<ManagerCommand>(64);
+    if config.services.dispatcher.enabled {
+        let mgmt_config = config.services.dispatcher.clone();
+        let cmd_tx = dispatcher_cmd_tx.clone();
+        ServiceDispatcher::start_management(mgmt_config, cmd_tx);
     }
 
     // 阶段管理：监听就绪 → bootstrap → 服务宣告+查询
@@ -250,59 +248,31 @@ async fn run_node(
     // 主事件循环 - 持续处理Swarm产生的事件
     loop {
         tokio::select! {
-                    // 处理出站代理命令
-                    Some(cmd) = proxy_cmd_rx.recv() => {
+                    // 处理本地服务通过 dispatcher 管理口发来的远程调用请求
+                    Some(cmd) = dispatcher_cmd_rx.recv() => {
                         match cmd {
-                            ProxyCommand::DiscoverServices { service, response_tx } => {
-                                if sd.is_enabled() {
-                                    if let Some(key) = sd.query_service(&service) {
-                                        let _ = swarm.behaviour_mut().kademlia.get_record(key);
-                                        // 从缓存中查找
-                                        let providers: Vec<serde_json::Value> = sd.get_cached_providers(&service)
-                                            .iter()
-                                            .map(|info| {
-                                                serde_json::json!({
-                                                    "provider": info.provider,
-                                                    "addrs": info.addrs,
-                                                    "version": info.version,
-                                                })
-                                            })
-                                            .collect();
-                                        let _ = response_tx.send(outbound_proxy::ProxyResult {
-                                            success: true,
-                                            message: format!("找到 {} 个提供者", providers.len()),
-                                            data: Some(serde_json::json!({"providers": providers})),
-                                        });
-                                    } else {
-                                        let _ = response_tx.send(outbound_proxy::ProxyResult {
-                                            success: false,
-                                            message: format!("服务发现未启用或服务名无效: {}", service),
-                                            data: None,
-                                        });
-                                    }
-                                } else {
-                                    let _ = response_tx.send(outbound_proxy::ProxyResult {
-                                        success: false,
-                                        message: "服务发现未启用".to_string(),
-                                        data: None,
-                                    });
-                                }
-                            }
-                            ProxyCommand::SendRequest { peer, service, payload, response_tx } => {
-                                match send_service_request(&mut swarm, &peer, &service, payload) {
-                                    Ok(request_id) => {
-                                        let _ = response_tx.send(outbound_proxy::ProxyResult {
-                                            success: true,
-                                            message: "请求已发送".to_string(),
-                                            data: Some(serde_json::json!({"request_id": request_id})),
-                                        });
+                            ManagerCommand::CallRemote { peer, service, payload, response_tx } => {
+                                let log = LogStruct {
+                                    level: LogLevel::Debug,
+                                    topic: "管理通道".to_string(),
+                                    content: format!("本地请求调用 {} 的 {} 服务", peer, service),
+                                };
+                                log.logout();
+
+                                // 解析目标 PeerId
+                                match peer.parse::<PeerId>() {
+                                    Ok(peer_id) => {
+                                        match send_service_request(&mut swarm, &peer_id, &service, payload) {
+                                            Ok(request_id) => {
+                                                let _ = response_tx.send(Ok(format!("请求已发送, request_id={}", request_id).into_bytes()));
+                                            }
+                                            Err(e) => {
+                                                let _ = response_tx.send(Err(format!("发送请求失败: {}", e)));
+                                            }
+                                        }
                                     }
                                     Err(e) => {
-                                        let _ = response_tx.send(outbound_proxy::ProxyResult {
-                                            success: false,
-                                            message: format!("发送请求失败: {}", e),
-                                            data: None,
-                                        });
+                                        let _ = response_tx.send(Err(format!("无效的 PeerId '{}': {}", peer, e)));
                                     }
                                 }
                             }
