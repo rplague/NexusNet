@@ -73,6 +73,9 @@ pub fn send_service_request(
 }
 
 /// 处理接收到的远程请求：解析 ServiceRequest → dispatcher.forward → 返回 ServiceResponse
+///
+/// 支持以 `@` 开头的内置系统命令（无需经由 dispatcher.forward 转发）：
+/// - `@node_services`：返回本节点注册的所有服务列表（JSON）
 pub fn handle_incoming_request(
     request: ServiceRequest,
     dispatcher: &ServiceDispatcher,
@@ -87,6 +90,11 @@ pub fn handle_incoming_request(
     };
     log.logout();
 
+    // 检查是否为内置系统命令
+    if request.service.starts_with('@') {
+        return handle_system_command(&request, dispatcher);
+    }
+
     match dispatcher.forward(&request.service, &request.payload) {
         Ok(data) => ServiceResponse {
             status: "ok".to_string(),
@@ -96,6 +104,41 @@ pub fn handle_incoming_request(
         Err(e) => ServiceResponse {
             status: "error".to_string(),
             data: Some(e.into_bytes()),
+            request_id: request.request_id,
+        },
+    }
+}
+
+/// 处理内置系统命令（`@` 前缀）
+fn handle_system_command(request: &ServiceRequest, dispatcher: &ServiceDispatcher) -> ServiceResponse {
+    match request.service.as_str() {
+        "@node_services" => {
+            // 返回本节点 dispatcher 注册的所有服务
+            let services: Vec<serde_json::Value> = dispatcher
+                .list_services_raw()
+                .into_iter()
+                .map(|(name, host, port)| {
+                    serde_json::json!({
+                        "service_type": name,
+                        "provider": "local",
+                        "addrs": [format!("{}:{}", host, port)],
+                        "ttl": 0
+                    })
+                })
+                .collect();
+
+            let json_bytes = serde_json::to_vec(&services).unwrap_or_default();
+            ServiceResponse {
+                status: "ok".to_string(),
+                data: Some(json_bytes),
+                request_id: request.request_id,
+            }
+        }
+        other => ServiceResponse {
+            status: "error".to_string(),
+            data: Some(
+                format!("未知系统命令: {}", other).into_bytes(),
+            ),
             request_id: request.request_id,
         },
     }

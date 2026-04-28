@@ -212,14 +212,32 @@ impl ServiceDispatcher {
         unhealthy
     }
 
-    /// 获取所有已注册的服务名
+    /// 获取所有已注册的服务名（供管理口和服务发现使用）
     pub fn list_services(&self) -> Vec<&str> {
         self.routes.keys().map(|s| s.as_str()).collect()
+    }
+
+    /// 获取包含地址信息的原始服务列表
+    pub fn list_services_raw(&self) -> Vec<(String, String, u16)> {
+        self.config
+            .local_services
+            .iter()
+            .map(|s| (s.name.clone(), s.host.clone(), s.port))
+            .collect()
     }
 
     /// 调度器是否启用
     pub fn is_enabled(&self) -> bool {
         self.config.enabled
+    }
+
+    /// 获取配置中的服务列表（名称集合）
+    pub fn get_service_names(&self) -> Vec<String> {
+        self.config
+            .local_services
+            .iter()
+            .map(|s| s.name.clone())
+            .collect()
     }
 }
 

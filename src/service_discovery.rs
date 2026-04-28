@@ -238,6 +238,34 @@ impl ServiceDiscovery {
         self.get_announce_records()
     }
 
+    /// 从 Dispatcher 的服务列表同步到服务发现注册表
+    ///
+    /// 当 dispatcher 中注册了服务但 service_discovery 配置中没有时，
+    /// 自动添加。重复的服务名会跳过。
+    pub fn sync_from_dispatcher(&mut self, dispatcher_names: &[String]) {
+        for name in dispatcher_names {
+            if !self.local_services.contains_key(name.as_str()) {
+                let info = ServiceInfo {
+                    service_type: name.clone(),
+                    provider: self.local_peer_id.to_string(),
+                    addrs: Vec::new(), // 由 set_local_service_addrs 填充
+                    version: env!("CARGO_PKG_VERSION").to_string(),
+                    metadata: HashMap::new(),
+                    timestamp: SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs(),
+                    ttl: self.config.record_ttl_secs,
+                };
+                self.local_services.insert(name.clone(), info);
+                log_info(
+                    "服务注册".to_string(),
+                    format!("从 dispatcher 自动注册服务: {}", name),
+                );
+            }
+        }
+    }
+
     /// 新增本地服务（运行时动态注册）
     pub fn add_local_service(
         &mut self,

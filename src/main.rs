@@ -128,6 +128,10 @@ async fn run_node(
     // 初始化本地服务调度器（微内核+边车模式）
     let dispatcher = ServiceDispatcher::new(&config.services.dispatcher);
     if dispatcher.is_enabled() {
+        // 将 dispatcher 中注册的服务自动同步到服务发现注册表
+        let dispatcher_services = dispatcher.get_service_names();
+        sd.sync_from_dispatcher(&dispatcher_services);
+
         let unhealthy = dispatcher.health_check();
         if unhealthy.is_empty() {
             let log = LogStruct {
@@ -151,7 +155,7 @@ async fn run_node(
             topic: "服务发现".to_string(),
             content: format!(
                 "已启用，本地服务: {:?}",
-                config.services.service_discovery.services
+                sd.list_local_services()
             ),
         };
         log.logout();
