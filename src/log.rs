@@ -189,12 +189,8 @@ fn log(info: &LogStruct) {
     let text = format_log_entry(&info.level, &time, &info.topic, &info.content, false);
 
     match info.level {
-        LogLevel::Error | LogLevel::Critical => {
+        LogLevel::Error | LogLevel::Critical | LogLevel::Warning=> {
             // 错误和严重错误输出到 stderr
-            eprintln!("{}", cli_text);
-        }
-        LogLevel::Warning => {
-            // 警告也输出到 stderr（可选）
             eprintln!("{}", cli_text);
         }
         _ => {
