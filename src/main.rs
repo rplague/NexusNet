@@ -196,44 +196,42 @@ async fn run_node(
     };
     log.logout();
 
-    // // 如果有连接参数，尝试连接到指定的远程节点
+    // 如果有连接参数，尝试连接到指定的远程节点
     // [todo] 合并为统一的合并连接函数
-    // for connect_to in connect_list {{
-    //     match connect_to.parse::<Multiaddr>() {
-    //         Ok(remote_addr) => {
-    //             let log = LogStruct {
-    //                 level: LogLevel::Preset,
-    //                 topic: "尝试连接".to_string(),
-    //                 content: format!("尝试连接到: {}", remote_addr),
-    //             };
-    //             log.logout();
+    for connect_to in connect_list {{
+        match connect_to.parse::<Multiaddr>() {
+            Ok(remote_addr) => {
+                let log = LogStruct {
+                    level: LogLevel::Preset,
+                    topic: "尝试连接".to_string(),
+                    content: format!("尝试连接到: {}", remote_addr),
+                };
+                log.logout();
 
-    //             // 发起连接尝试
-    //             match swarm.dial(remote_addr) {
-    //                 Ok(_) => {} // 连接已成功发起
-    //                 Err(e) => {
-    //                     let log = LogStruct {
-    //                         level: LogLevel::Error,
-    //                         topic: "连接失败".to_string(),
-    //                         content: format!("无法连接: {:?}", e),
-    //                     };
-    //                     log.logout();
-    //                 }
-    //             }
-    //         }
-    //         Err(e) => {
-    //             // 地址解析失败
-    //             let log = LogStruct {
-    //                 level: LogLevel::Error,
-    //                 topic: "解析地址失败".to_string(),
-    //                 content: format!("无法解析连接地址 '{}': {:?}", connect_to, e),
-    //             };
-    //             log.logout();
-    //         }
-    //     }
-    // }
-
-    
+                // 发起连接尝试
+                match swarm.dial(remote_addr) {
+                    Ok(_) => {} // 连接已成功发起
+                    Err(e) => {
+                        let log = LogStruct {
+                            level: LogLevel::Error,
+                            topic: "连接失败".to_string(),
+                            content: format!("无法连接: {:?}", e),
+                        };
+                        log.logout();
+                    }
+                }
+            }
+            Err(e) => {
+                // 地址解析失败
+                let log = LogStruct {
+                    level: LogLevel::Error,
+                    topic: "解析地址失败".to_string(),
+                    content: format!("无法解析连接地址 '{}': {:?}", connect_to, e),
+                };
+                log.logout();
+            }
+        }
+    }
 
     if sd.is_enabled() {
         let log = LogStruct {
@@ -247,7 +245,7 @@ async fn run_node(
         log.logout();
     }
     
-    // 调度器管理命令通道：本地服务（如 CLI）通过 dispatcher 管理口发来的 P2P 请求
+    // // 调度器管理命令通道：本地服务（如 CLI）通过 dispatcher 管理口发来的 P2P 请求
     let (dispatcher_cmd_tx, mut dispatcher_cmd_rx) = mpsc::channel::<ManagerCommand>(64);
     if config.services.dispatcher.enabled {
         let mgmt_config = config.services.dispatcher.clone();
@@ -267,13 +265,6 @@ async fn run_node(
                     Some(cmd) = dispatcher_cmd_rx.recv() => {
                         match cmd {
                             ManagerCommand::CallRemote { peer, service, payload, response_tx } => {
-                                let log = LogStruct {
-                                    level: LogLevel::Debug,
-                                    topic: "管理通道".to_string(),
-                                    content: format!("本地请求调用 {} 的 {} 服务", peer, service),
-                                };
-                                log.logout();
-
                                 // 解析目标 PeerId
                                 match peer.parse::<PeerId>() {
                                     Ok(peer_id) => {
