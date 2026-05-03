@@ -22,7 +22,8 @@ use request_handler::send_service_request;
 
 use libp2p::kad::QueryResult;
 use libp2p::{
-    Multiaddr, PeerId, SwarmBuilder, futures::StreamExt, kad, noise, swarm::SwarmEvent, tcp, yamux,
+    Multiaddr, PeerId, SwarmBuilder, futures::StreamExt, kad, noise, request_response,
+    swarm::SwarmEvent, tcp, yamux,
 };
 use net::{
     ConnectionStatus, NetBehaviourEvent, PeerInfo, appropriate_address_filter, create_behaviour,
@@ -30,11 +31,12 @@ use net::{
 };
 
 use service_discovery::SD_KEY_PREFIX;
-use tokio::sync::mpsc;
-
 use std::env;
 use std::error::Error;
 use std::time::Duration;
+
+use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::config::NodeConfig;
 
@@ -110,15 +112,23 @@ async fn run_node(
     // 初始化服务发现
     let mut sd = ServiceDiscovery::new(&config.services.service_discovery, my_peer_id);
 
+    // 创建命令通道（用于 @call_remote 等需要主循环处理的操作）
+    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<ManagerCommand>(64);
+
     // 初始化本地服务调度器（微内核+边车模式）
-    let dispatcher = ServiceDispatcher::new(&config.services.dispatcher);
+    let dispatcher = Arc::new(ServiceDispatcher::new(&config.services.dispatcher));
     if dispatcher.is_enabled() {
-        // 将 dispatcher 中注册的服务自动同步到服务发现注册表
+        // 连接后端，启动持久连接和读线程
+        let connect_failures = dispatcher.connect_all(cmd_tx.clone());
         let all_services = dispatcher.get_service_names();
-        let unhealthy = dispatcher.health_check();
+        let unhealthy: Vec<String> = connect_failures
+            .iter()
+            .map(|(name, err)| format!("{} ({})", name, err))
+            .collect();
         let verified_services: Vec<String> = all_services
-            .into_iter()
-            .filter(|name| !unhealthy.contains(name))
+            .iter()
+            .filter(|name| !connect_failures.iter().any(|(n, _)| n == *name))
+            .cloned()
             .collect();
         sd.sync_from_dispatcher(&verified_services);
         if !unhealthy.is_empty() {
@@ -198,7 +208,7 @@ async fn run_node(
 
     // 如果有连接参数，尝试连接到指定的远程节点
     // [todo] 合并为统一的合并连接函数
-    for connect_to in connect_list {{
+    for connect_to in connect_list {
         match connect_to.parse::<Multiaddr>() {
             Ok(remote_addr) => {
                 let log = LogStruct {
@@ -245,33 +255,29 @@ async fn run_node(
         log.logout();
     }
     
-    // // 调度器管理命令通道：本地服务（如 CLI）通过 dispatcher 管理口发来的 P2P 请求
-    let (dispatcher_cmd_tx, mut dispatcher_cmd_rx) = mpsc::channel::<ManagerCommand>(64);
-    if config.services.dispatcher.enabled {
-        let mgmt_config = config.services.dispatcher.clone();
-        let cmd_tx = dispatcher_cmd_tx.clone();
-        ServiceDispatcher::start_management(mgmt_config, cmd_tx);
-    }
+    // 挂起的 P2P 出站请求（@call_remote 响应路由）
+    let mut pending_outbound: HashMap<request_response::OutboundRequestId, tokio::sync::oneshot::Sender<Result<Vec<u8>, String>>> = HashMap::new();
 
     // 阶段管理：监听就绪 → bootstrap → 服务宣告+查询
     let mut listeners_ready = false;
+    let mut dispatcher_cmd_rx = cmd_rx;
     let mut bootstrap_done = false;
     let mut sd_announced = false;
 
     // 主事件循环 - 持续处理Swarm产生的事件
     loop {
         tokio::select! {
-                    // 处理本地服务通过 dispatcher 管理口发来的远程调用请求
+                    // 处理后端通过 @call_remote 发来的 P2P 远程调用请求
                     Some(cmd) = dispatcher_cmd_rx.recv() => {
                         match cmd {
                             ManagerCommand::CallRemote { peer, service, payload, response_tx } => {
-                                // 解析目标 PeerId
                                 match peer.parse::<PeerId>() {
                                     Ok(peer_id) => {
                                         match send_service_request(&mut swarm, &peer_id, &service, payload) {
-                                            Ok(request_id) => {
-                                                let _ = response_tx.send(Ok(format!("请求已发送, request_id={}", request_id).into_bytes()));
-                                            }
+                                                            Ok(outbound_id) => {
+                                                                // 注册响应路由，P2P 响应时发回
+                                                                pending_outbound.insert(outbound_id, response_tx);
+                                                            }
                                             Err(e) => {
                                                 let _ = response_tx.send(Err(format!("发送请求失败: {}", e)));
                                             }
@@ -700,14 +706,24 @@ async fn run_node(
                                                     .send_response(channel, response);
                                             }
                                             libp2p::request_response::Message::Response {
-                                                response, ..
+                                                request_id, response, ..
                                             } => {
+                                                // 路由到挂起的 @call_remote 调用
+                                                if let Some(tx) = pending_outbound.remove(&request_id) {
+                                                    let result = if response.status == "ok" {
+                                                        Ok(response.data.unwrap_or_default())
+                                                    } else {
+                                                        Err(String::from_utf8_lossy(&response.data.unwrap_or_default()).to_string())
+                                                    };
+                                                    let _ = tx.send(result);
+                                                }
+
                                                 let log = LogStruct {
                                                     level: LogLevel::Debug,
                                                     topic: "P2P响应".to_string(),
                                                     content: format!(
-                                                        "收到来自 {} 的服务响应: status={}, request_id={}",
-                                                        peer, response.status, response.request_id
+                                                        "收到来自 {} 的服务响应: status={}",
+                                                        peer, response.status
                                                     ),
                                                 };
                                                 log.logout();
@@ -715,8 +731,13 @@ async fn run_node(
                                         }
                                     }
                                     libp2p::request_response::Event::OutboundFailure {
-                                        peer, error, ..
+                                        request_id, peer, error, ..
                                     } => {
+                                        // 通知挂起的 @call_remote 调用
+                                        if let Some(tx) = pending_outbound.remove(&request_id) {
+                                            let _ = tx.send(Err(format!("P2P 请求失败: {:?}", error)));
+                                        }
+
                                         let log = LogStruct {
                                             level: LogLevel::Warning,
                                             topic: "P2P请求失败".to_string(),

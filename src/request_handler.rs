@@ -7,6 +7,7 @@ use crate::net::NetBehaviour;
 use crate::service_dispatcher::ServiceDispatcher;
 use crate::{LogLevel, LogStruct};
 use libp2p::PeerId;
+use libp2p::request_response;
 use libp2p::swarm::Swarm;
 
 /// 请求体：向远程节点发送的服务调用请求
@@ -45,37 +46,34 @@ impl ServiceRequest {
 
 /// 向远程节点发送服务调用请求
 ///
-/// 返回 `request_id`，调用方可通过该 ID 匹配后续的 `OutboundResponse` 事件。
+/// 返回 `OutboundRequestId`，调用方可通过该 ID 匹配后续的 P2P 响应事件。
 pub fn send_service_request(
     swarm: &mut Swarm<NetBehaviour>,
     peer: &PeerId,
     service: &str,
     payload: Vec<u8>,
-) -> Result<u64, String> {
+) -> Result<request_response::OutboundRequestId, String> {
     let request = ServiceRequest::new(service, payload);
-    let request_id = request.request_id;
 
     let log = LogStruct {
         level: LogLevel::Debug,
         topic: "P2P请求".to_string(),
         content: format!(
             "向 {} 发送请求: service={}, request_id={}",
-            peer, service, request_id
+            peer, request.service, request.request_id
         ),
     };
     log.logout();
 
-    let _outbound_id = swarm
+    Ok(swarm
         .behaviour_mut()
         .request_response
-        .send_request(peer, request);
-    Ok(request_id)
+        .send_request(peer, request))
 }
 
 /// 处理接收到的远程请求：解析 ServiceRequest → dispatcher.forward → 返回 ServiceResponse
 ///
-/// 支持以 `@` 开头的内置系统命令（无需经由 dispatcher.forward 转发）：
-/// - `@node_services`：返回本节点注册的所有服务列表（JSON）
+/// 安全：P2P 来的请求不能以 `@` 开头（内部命令），拒绝之。
 pub fn handle_incoming_request(
     request: ServiceRequest,
     dispatcher: &ServiceDispatcher,
@@ -90,9 +88,15 @@ pub fn handle_incoming_request(
     };
     log.logout();
 
-    // 检查是否为内置系统命令
+    // P2P 请求禁止以 @ 开头（内部命令只能由本地后端发起）
     if request.service.starts_with('@') {
-        return handle_system_command(&request, dispatcher);
+        return ServiceResponse {
+            status: "error".to_string(),
+            data: Some(
+                format!("无效的服务名: {}", request.service).into_bytes(),
+            ),
+            request_id: request.request_id,
+        };
     }
 
     match dispatcher.forward(&request.service, &request.payload) {
@@ -104,41 +108,6 @@ pub fn handle_incoming_request(
         Err(e) => ServiceResponse {
             status: "error".to_string(),
             data: Some(e.into_bytes()),
-            request_id: request.request_id,
-        },
-    }
-}
-
-/// 处理内置系统命令（`@` 前缀）
-fn handle_system_command(request: &ServiceRequest, dispatcher: &ServiceDispatcher) -> ServiceResponse {
-    match request.service.as_str() {
-        "@node_services" => {
-            // 返回本节点 dispatcher 注册的所有服务
-            let services: Vec<serde_json::Value> = dispatcher
-                .list_services_raw()
-                .into_iter()
-                .map(|(name, host, port)| {
-                    serde_json::json!({
-                        "service_type": name,
-                        "provider": "local",
-                        "addrs": [format!("{}:{}", host, port)],
-                        "ttl": 0
-                    })
-                })
-                .collect();
-
-            let json_bytes = serde_json::to_vec(&services).unwrap_or_default();
-            ServiceResponse {
-                status: "ok".to_string(),
-                data: Some(json_bytes),
-                request_id: request.request_id,
-            }
-        }
-        other => ServiceResponse {
-            status: "error".to_string(),
-            data: Some(
-                format!("未知系统命令: {}", other).into_bytes(),
-            ),
             request_id: request.request_id,
         },
     }
