@@ -130,14 +130,6 @@ async fn run_node(
             log.logout();
         }
     }
-    
-    // 节点启动成功，输出状态信息
-    let log = LogStruct {
-        level: LogLevel::Important,
-        topic: "节点启动".to_string(),
-        content: format!("节点已启动，监听端口: {}\n\tpeer_id: {}", port, my_peer_id),
-    };
-    log.logout();
 
     // 创建网络行为组合（包含ping、identify等协议）
     let behaviour = create_behaviour(&keypair, "/OAHD", config)?;
@@ -154,21 +146,59 @@ async fn run_node(
         .with_swarm_config(|config| config.with_idle_connection_timeout(Duration::from_secs(300)))
         .build();
 
-    let (ipv4_address, ipv6_address) = get_network_addresses()?;
     // 根据配置启用IPv4或IPv6监听
-    if config.network.ipv4_enabled {
-        let listen_addr_v4: Multiaddr = format!("/ip4/{}/tcp/{}", ipv4_address, port).parse()?;
-        swarm.listen_on(listen_addr_v4)?;
+    {
+        let mut listen_success = false;
+        let (ipv4_address, ipv6_address) = get_network_addresses()?;
+        if config.network.ipv4_enabled {
+            let listen_addr_v4: Multiaddr = format!("/ip4/{}/tcp/{}", ipv4_address, port).parse()?;
+            if let Err(e) = swarm.listen_on(listen_addr_v4) {
+                let log = LogStruct {
+                    level: LogLevel::Warning,
+                    topic: "监听端口失败".to_string(),
+                    content: format!("在试图监听地址时出现错误 {}", e),
+                };
+                log.logout();
+            } else {
+                listen_success = true;
+            }
+        }
+        if config.network.ipv6_enabled {
+            let listen_addr_v6: Multiaddr = format!("/ip6/{}/tcp/{}", ipv6_address, port).parse()?;
+            if let Err(e) = swarm.listen_on(listen_addr_v6) {
+                let log = LogStruct {
+                    level: LogLevel::Warning,
+                    topic: "监听端口失败".to_string(),
+                    content: format!("在试图监听地址时出现错误 {}", e),
+                };
+                log.logout();
+            } else {
+                listen_success = true;
+            }
+        }
+        if !listen_success {
+            let log = LogStruct {
+                level: LogLevel::Critical,
+                topic: "网络监听完全失败".to_string(),
+                content: "所有要求的网络地址均无法监听，程序退出".to_string(),
+            };
+            log.logout();
+            std::process::exit(1);
+        }
     }
+    
 
-    if config.network.ipv6_enabled {
-        let listen_addr_v6: Multiaddr = format!("/ip6/{}/tcp/{}", ipv6_address, port).parse()?;
-        swarm.listen_on(listen_addr_v6)?;
-    }
+    // 节点启动成功，输出状态信息
+    let log = LogStruct {
+        level: LogLevel::Important,
+        topic: "节点启动".to_string(),
+        content: format!("节点已启动，监听端口: {}\n\tpeer_id: {}", port, my_peer_id),
+    };
+    log.logout();
 
     // // 如果有连接参数，尝试连接到指定的远程节点
     // [todo] 合并为统一的合并连接函数
-    // for connect_to in connect_list {
+    // for connect_to in connect_list {{
     //     match connect_to.parse::<Multiaddr>() {
     //         Ok(remote_addr) => {
     //             let log = LogStruct {
