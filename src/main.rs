@@ -66,18 +66,6 @@ fn main() -> Result<(), Box<dyn Error>> {
                 connect_list.push(args[i + 1].clone());
                 i += 1;
             }
-            "--query" | "-q" if i + 1 < args.len() => {
-                // 保存查询指令，在节点启动后执行
-                let svc_type = args[i + 1].clone();
-                // 存到环境变量中的特殊标记，稍后在 run_node 中处理
-                let log = LogStruct {
-                    level: LogLevel::Preset,
-                    topic: "服务发现查询".to_string(),
-                    content: format!("节点启动后将查询服务: {}", svc_type),
-                };
-                log.logout();
-                i += 1;
-            }
             _ => {}
         }
         i += 1;
@@ -87,24 +75,22 @@ fn main() -> Result<(), Box<dyn Error>> {
     if connect_list.is_empty() {
         let log = LogStruct {
             level: LogLevel::Warning,
-            topic: "没有设置连接目标".to_string(),
+            topic: "没有设置连接节点".to_string(),
             content: "节点将会被动监听……".to_string(),
         };
         log.logout();
     } else {
         let log = LogStruct {
             level: LogLevel::Preset,
-            topic: "连接目标".to_string(),
-            content: format!("将尝试连接 {} 个节点", connect_list.len()),
+            topic: format!("计划连接 {} 个节点", connect_list.len()),
+            content: "".to_string(),
         };
         log.logout();
     }
-    let connect_list = connect_list;
-    // 提取查询目标（如果有）
-    let query_service = std::env::var("NEXUS_QUERY_SERVICE").ok();
+    
 
     tokio::runtime::Runtime::new()?.block_on(async {
-        let _ = run_node(port, connect_list, &mut config, query_service).await;
+        let _ = run_node(port, connect_list, &mut config).await;
     });
     Ok(())
 }
@@ -113,14 +99,13 @@ async fn run_node(
     port: u16,
     connect_list: Vec<String>,
     config: &mut NodeConfig,
-    query_service: Option<String>,
 ) -> Result<(), Box<dyn Error>> {
-    // 生成net连接节点列表
-    let mut net_peer_list: Vec<PeerInfo> = [].to_vec();
-
     // 获取或生成节点的密钥对
     let keypair = get_key()?;
     let my_peer_id = PeerId::from(keypair.public());
+
+    // 生成net连接节点列表
+    let mut net_peer_list: Vec<PeerInfo> = [].to_vec();
 
     // 初始化服务发现
     let mut sd = ServiceDiscovery::new(&config.services.service_discovery, my_peer_id);
@@ -131,16 +116,8 @@ async fn run_node(
         // 将 dispatcher 中注册的服务自动同步到服务发现注册表
         let dispatcher_services = dispatcher.get_service_names();
         sd.sync_from_dispatcher(&dispatcher_services);
-
         let unhealthy = dispatcher.health_check();
-        if unhealthy.is_empty() {
-            let log = LogStruct {
-                level: LogLevel::Debug,
-                topic: "服务调度器".to_string(),
-                content: "所有本地后端服务均可达".to_string(),
-            };
-            log.logout();
-        } else {
+        if ! unhealthy.is_empty() {
             let log = LogStruct {
                 level: LogLevel::Warning,
                 topic: "服务调度器".to_string(),
@@ -161,8 +138,6 @@ async fn run_node(
         log.logout();
     }
 
-    // 从公钥计算Peer ID（节点的唯一标识符）
-
     // 创建网络行为组合（包含ping、identify等协议）
     let behaviour = create_behaviour(&keypair, "/OAHD", config)?;
 
@@ -179,16 +154,15 @@ async fn run_node(
         .build();
 
     let (ipv4_address, ipv6_address) = get_network_addresses()?;
-    // 根据配置启用IPv4监听
+    // 根据配置启用IPv4或IPv6监听
     if config.network.ipv4_enabled {
         let listen_addr_v4: Multiaddr = format!("/ip4/{}/tcp/{}", ipv4_address, port).parse()?;
-        swarm.listen_on(listen_addr_v4)?; // 绑定到所有IPv4接口的指定端口
+        swarm.listen_on(listen_addr_v4)?;
     }
 
-    // 根据配置启用IPv6监听
     if config.network.ipv6_enabled {
         let listen_addr_v6: Multiaddr = format!("/ip6/{}/tcp/{}", ipv6_address, port).parse()?;
-        swarm.listen_on(listen_addr_v6)?; // 绑定到所有IPv6接口的指定端口
+        swarm.listen_on(listen_addr_v6)?;
     }
 
     // 如果有连接参数，尝试连接到指定的远程节点
