@@ -114,29 +114,30 @@ async fn run_node(
     let dispatcher = ServiceDispatcher::new(&config.services.dispatcher);
     if dispatcher.is_enabled() {
         // 将 dispatcher 中注册的服务自动同步到服务发现注册表
-        let dispatcher_services = dispatcher.get_service_names();
-        sd.sync_from_dispatcher(&dispatcher_services);
+        let all_services = dispatcher.get_service_names();
         let unhealthy = dispatcher.health_check();
-        if ! unhealthy.is_empty() {
+        let verified_services: Vec<String> = all_services
+            .into_iter()
+            .filter(|name| !unhealthy.contains(name))
+            .collect();
+        sd.sync_from_dispatcher(&verified_services);
+        if !unhealthy.is_empty() {
             let log = LogStruct {
                 level: LogLevel::Warning,
                 topic: "服务调度器".to_string(),
-                content: format!("以下后端服务不可达: {}", unhealthy.join(", ")),
+                content: format!("以下注册的后端服务不可达: \n    {}", unhealthy.join("\n    ")),
             };
             log.logout();
         }
     }
-    if sd.is_enabled() {
-        let log = LogStruct {
-            level: LogLevel::Preset,
-            topic: "服务发现".to_string(),
-            content: format!(
-                "已启用，本地服务: {:?}",
-                sd.list_local_services()
-            ),
-        };
-        log.logout();
-    }
+    
+    // 节点启动成功，输出状态信息
+    let log = LogStruct {
+        level: LogLevel::Important,
+        topic: "节点启动".to_string(),
+        content: format!("节点已启动，监听端口: {}\n\tpeer_id: {}", port, my_peer_id),
+    };
+    log.logout();
 
     // 创建网络行为组合（包含ping、identify等协议）
     let behaviour = create_behaviour(&keypair, "/OAHD", config)?;
@@ -165,50 +166,57 @@ async fn run_node(
         swarm.listen_on(listen_addr_v6)?;
     }
 
-    // 如果有连接参数，尝试连接到指定的远程节点
-    for connect_to in connect_list {
-        match connect_to.parse::<Multiaddr>() {
-            Ok(remote_addr) => {
-                let log = LogStruct {
-                    level: LogLevel::Preset,
-                    topic: "尝试连接".to_string(),
-                    content: format!("尝试连接到: {}", remote_addr),
-                };
-                log.logout();
+    // // 如果有连接参数，尝试连接到指定的远程节点
+    // [todo] 合并为统一的合并连接函数
+    // for connect_to in connect_list {
+    //     match connect_to.parse::<Multiaddr>() {
+    //         Ok(remote_addr) => {
+    //             let log = LogStruct {
+    //                 level: LogLevel::Preset,
+    //                 topic: "尝试连接".to_string(),
+    //                 content: format!("尝试连接到: {}", remote_addr),
+    //             };
+    //             log.logout();
 
-                // 发起连接尝试
-                match swarm.dial(remote_addr) {
-                    Ok(_) => {} // 连接已成功发起
-                    Err(e) => {
-                        let log = LogStruct {
-                            level: LogLevel::Error,
-                            topic: "连接失败".to_string(),
-                            content: format!("无法连接: {:?}", e),
-                        };
-                        log.logout();
-                    }
-                }
-            }
-            Err(e) => {
-                // 地址解析失败
-                let log = LogStruct {
-                    level: LogLevel::Error,
-                    topic: "解析地址失败".to_string(),
-                    content: format!("无法解析连接地址 '{}': {:?}", connect_to, e),
-                };
-                log.logout();
-            }
-        }
+    //             // 发起连接尝试
+    //             match swarm.dial(remote_addr) {
+    //                 Ok(_) => {} // 连接已成功发起
+    //                 Err(e) => {
+    //                     let log = LogStruct {
+    //                         level: LogLevel::Error,
+    //                         topic: "连接失败".to_string(),
+    //                         content: format!("无法连接: {:?}", e),
+    //                     };
+    //                     log.logout();
+    //                 }
+    //             }
+    //         }
+    //         Err(e) => {
+    //             // 地址解析失败
+    //             let log = LogStruct {
+    //                 level: LogLevel::Error,
+    //                 topic: "解析地址失败".to_string(),
+    //                 content: format!("无法解析连接地址 '{}': {:?}", connect_to, e),
+    //             };
+    //             log.logout();
+    //         }
+    //     }
+    // }
+
+    
+
+    if sd.is_enabled() {
+        let log = LogStruct {
+            level: LogLevel::Preset,
+            topic: "服务发现".to_string(),
+            content: format!(
+                "已启用，本地服务: {:?}",
+                sd.list_local_services()
+            ),
+        };
+        log.logout();
     }
-
-    // 节点启动成功，输出状态信息
-    let log = LogStruct {
-        level: LogLevel::Important,
-        topic: "节点启动".to_string(),
-        content: format!("节点已启动，监听端口: {}\n\tpeer_id: {}", port, my_peer_id),
-    };
-    log.logout();
-
+    
     // 调度器管理命令通道：本地服务（如 CLI）通过 dispatcher 管理口发来的 P2P 请求
     let (dispatcher_cmd_tx, mut dispatcher_cmd_rx) = mpsc::channel::<ManagerCommand>(64);
     if config.services.dispatcher.enabled {
@@ -221,7 +229,6 @@ async fn run_node(
     let mut listeners_ready = false;
     let mut bootstrap_done = false;
     let mut sd_announced = false;
-    let mut sd_query = query_service;
 
     // 主事件循环 - 持续处理Swarm产生的事件
     loop {
@@ -489,44 +496,31 @@ async fn run_node(
                                             QueryResult::Bootstrap(result) => match result {
                                                 Ok(_) => {
                                                     // Bootstrap 成功后，宣告本地服务并查询
-                                                    if sd.is_enabled() {
-                                                        if !sd_announced && !sd.list_local_services().is_empty() {
-                                                            // 用 listeners 中已就绪的地址填充
-                                                            let announce_addrs: Vec<String> = swarm
-                                                                .listeners()
-                                                                .map(|a| format!("{}/p2p/{}", a, my_peer_id))
-                                                                .collect();
-                                                            sd.set_addresses(&announce_addrs);
-                                                            let records = sd.get_announce_records();
-                                                            for record in records {
-                                                                let key_str = String::from_utf8_lossy(record.key.as_ref());
-                                                                if let Some(svc_type) = key_str.strip_prefix(
-                                                                    std::str::from_utf8(SD_KEY_PREFIX).unwrap_or("")
-                                                                ) {
-                                                                    let log = LogStruct {
-                                                                        level: LogLevel::Preset,
-                                                                        topic: "服务发现".to_string(),
-                                                                        content: format!("宣告服务: {}", svc_type),
-                                                                    };
-                                                                    log.logout();
-                                                                }
-                                                                let _ = swarm.behaviour_mut().kademlia.put_record(record, kad::Quorum::One);
+                                                    if sd.is_enabled()
+                                                       && !sd_announced 
+                                                       && !sd.list_local_services().is_empty() {
+                                                        // 用 listeners 中已就绪的地址填充
+                                                        let announce_addrs: Vec<String> = swarm
+                                                            .listeners()
+                                                            .map(|a| format!("{}/p2p/{}", a, my_peer_id))
+                                                            .collect();
+                                                        sd.set_addresses(&announce_addrs);
+                                                        let records = sd.get_announce_records();
+                                                        for record in records {
+                                                            let key_str = String::from_utf8_lossy(record.key.as_ref());
+                                                            if let Some(svc_type) = key_str.strip_prefix(
+                                                                std::str::from_utf8(SD_KEY_PREFIX).unwrap_or("")
+                                                            ) {
+                                                                let log = LogStruct {
+                                                                    level: LogLevel::Preset,
+                                                                    topic: "服务发现".to_string(),
+                                                                    content: format!("宣告服务: {}", svc_type),
+                                                                };
+                                                                log.logout();
                                                             }
-                                                            sd_announced = true;
+                                                            let _ = swarm.behaviour_mut().kademlia.put_record(record, kad::Quorum::One);
                                                         }
-                                                        // 如果有查询请求，发起查询
-                                                        if let Some(ref svc_type) = sd_query {
-                                                            let log = LogStruct {
-                                                                level: LogLevel::Preset,
-                                                                topic: "服务发现".to_string(),
-                                                                content: format!("查询服务: {}", svc_type),
-                                                            };
-                                                            log.logout();
-                                                            if let Some(key) = sd.query_service(svc_type) {
-                                                                let _ = swarm.behaviour_mut().kademlia.get_record(key);
-                                                            }
-                                                            sd_query = None;
-                                                        }
+                                                        sd_announced = true;
                                                     }
                                                 }
                                                 Err(e) => {
