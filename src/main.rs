@@ -571,14 +571,14 @@ async fn run_node(
                                                             content: format!("发现 {} 个新服务提供者，共 {} 个", new_count - old_count, new_count),
                                                         };
                                                         log.logout();
-                                                        for svc in sd.get_all_cached() {
-                                                            let log = LogStruct {
-                                                                level: LogLevel::Debug,
-                                                                topic: "服务提供者".to_string(),
-                                                                content: format!("{} → {} (地址: {:?})", svc.service_type, svc.provider, svc.addrs),
-                                                            };
-                                                            log.logout();
-                                                        }
+                                                        // for svc in sd.get_all_cached() {
+                                                        //     let log = LogStruct {
+                                                        //         level: LogLevel::Debug,
+                                                        //         topic: "服务提供者".to_string(),
+                                                        //         content: format!("{} → {} (地址: {:?})", svc.service_type, svc.provider, svc.addrs),
+                                                        //     };
+                                                        //     log.logout();
+                                                        // }
                                                     }
                                                 }
                                                 Err(e) => {
@@ -591,14 +591,7 @@ async fn run_node(
                                                 }
                                             },
                                             QueryResult::PutRecord(result) => match result {
-                                                Ok(kad::PutRecordOk { key, .. }) => {
-                                                    let log = LogStruct {
-                                                        level: LogLevel::Debug,
-                                                        topic: "Kademlia存储记录".to_string(),
-                                                        content: format!("成功存储记录: {:?}", key),
-                                                    };
-                                                    log.logout();
-                                                }
+                                                Ok(kad::PutRecordOk { .. }) => { }
                                                 Err(e) => {
                                                     let log = LogStruct {
                                                         level: LogLevel::Warning,
@@ -639,12 +632,6 @@ async fn run_node(
                                                         }
                                                         if let Some(index) = net_peer_list.iter().position(|p| p.peer_id == peer.peer_id)
                                                         && net_peer_list[index].connection_status == ConnectionStatus::Disconnected{
-                                                            let log = LogStruct {
-                                                                level: LogLevel::Preset,
-                                                                topic: "尝试连接".to_string(),
-                                                                content: format!("尝试连接到: {}", peer.addrs.to_vec()[0].clone()),
-                                                            };
-                                                            log.logout();
                                                             let _ = swarm.dial(peer.addrs.to_vec()[0].clone());
                                                         }
                                                     }
@@ -683,7 +670,7 @@ async fn run_node(
                                                 request, channel, ..
                                             } => {
                                                 let log = LogStruct {
-                                                    level: LogLevel::Debug,
+                                                    level: LogLevel::Preset,
                                                     topic: "P2P请求".to_string(),
                                                     content: format!(
                                                         "收到来自 {} 的服务请求: service={}, request_id={}",
@@ -712,7 +699,7 @@ async fn run_node(
                                                 }
 
                                                 let log = LogStruct {
-                                                    level: LogLevel::Debug,
+                                                    level: LogLevel::Preset,
                                                     topic: "P2P响应".to_string(),
                                                     content: format!(
                                                         "收到来自 {} 的服务响应: status={}",
