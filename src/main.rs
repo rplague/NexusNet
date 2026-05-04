@@ -81,13 +81,6 @@ fn main() -> Result<(), Box<dyn Error>> {
             content: "节点将会被动监听……".to_string(),
         };
         log.logout();
-    } else {
-        let log = LogStruct {
-            level: LogLevel::Preset,
-            topic: format!("计划连接 {} 个节点", connect_list.len()),
-            content: "".to_string(),
-        };
-        log.logout();
     }
     
 
