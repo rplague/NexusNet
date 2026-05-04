@@ -7,6 +7,7 @@ use crate::net::NetBehaviour;
 use crate::service_dispatcher::ServiceDispatcher;
 use crate::{LogLevel, LogStruct};
 use libp2p::PeerId;
+use libp2p::request_response;
 use libp2p::swarm::Swarm;
 
 /// 请求体：向远程节点发送的服务调用请求
@@ -45,34 +46,34 @@ impl ServiceRequest {
 
 /// 向远程节点发送服务调用请求
 ///
-/// 返回 `request_id`，调用方可通过该 ID 匹配后续的 `OutboundResponse` 事件。
+/// 返回 `OutboundRequestId`，调用方可通过该 ID 匹配后续的 P2P 响应事件。
 pub fn send_service_request(
     swarm: &mut Swarm<NetBehaviour>,
     peer: &PeerId,
     service: &str,
     payload: Vec<u8>,
-) -> Result<u64, String> {
+) -> Result<request_response::OutboundRequestId, String> {
     let request = ServiceRequest::new(service, payload);
-    let request_id = request.request_id;
 
     let log = LogStruct {
         level: LogLevel::Debug,
         topic: "P2P请求".to_string(),
         content: format!(
             "向 {} 发送请求: service={}, request_id={}",
-            peer, service, request_id
+            peer, request.service, request.request_id
         ),
     };
     log.logout();
 
-    let _outbound_id = swarm
+    Ok(swarm
         .behaviour_mut()
         .request_response
-        .send_request(peer, request);
-    Ok(request_id)
+        .send_request(peer, request))
 }
 
 /// 处理接收到的远程请求：解析 ServiceRequest → dispatcher.forward → 返回 ServiceResponse
+///
+/// 安全：P2P 来的请求不能以 `@` 开头（内部命令），拒绝之。
 pub fn handle_incoming_request(
     request: ServiceRequest,
     dispatcher: &ServiceDispatcher,
@@ -86,6 +87,17 @@ pub fn handle_incoming_request(
         ),
     };
     log.logout();
+
+    // P2P 请求禁止以 @ 开头（内部命令只能由本地后端发起）
+    if request.service.starts_with('@') {
+        return ServiceResponse {
+            status: "error".to_string(),
+            data: Some(
+                format!("无效的服务名: {}", request.service).into_bytes(),
+            ),
+            request_id: request.request_id,
+        };
+    }
 
     match dispatcher.forward(&request.service, &request.payload) {
         Ok(data) => ServiceResponse {
