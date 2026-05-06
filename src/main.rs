@@ -2,8 +2,10 @@ mod log;
 use log::LogLevel;
 use log::LogStruct;
 
+mod boot;
+use boot::init;
+
 mod config;
-use config::read_config_file;
 
 mod service_discovery;
 use service_discovery::ServiceDiscovery;
@@ -30,7 +32,7 @@ use net::{
     get_key, get_network_addresses,
 };
 
-use service_discovery::SD_KEY_PREFIX;
+use service_discovery::PREFIX;
 use std::env;
 use std::error::Error;
 use std::time::Duration;
@@ -41,49 +43,9 @@ use std::sync::Arc;
 use crate::config::NodeConfig;
 
 fn main() -> Result<(), Box<dyn Error>> {
-    // 读取设置
-    let mut config = read_config_file().unwrap();
-
-    // 从配置中获取初始连接列表
-    let mut connect_list: Vec<String> = if config.services.kademlia.enabled {
-        config.services.kademlia.bootstrap_nodes.clone()
-    } else {
-        Vec::new()
-    };
-
-    // 获取端口配置
-    let mut port = config.network.port;
-
-    // 简单的命令行参数解析，覆盖设置内容
-    let args: Vec<String> = env::args().collect();
-    let mut i = 1;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--port" | "-p" if i + 1 < args.len() => {
-                port = args[i + 1].parse().unwrap_or(5000);
-                i += 1;
-            }
-            "--connect" | "-c" if i + 1 < args.len() => {
-                connect_list.clear();
-                connect_list.push(args[i + 1].clone());
-                i += 1;
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-
-    // 各个参数检查和报告
-    if connect_list.is_empty() {
-        let log = LogStruct {
-            level: LogLevel::Warning,
-            topic: "没有设置连接节点".to_string(),
-            content: "节点将会被动监听……".to_string(),
-        };
-        log.logout();
-    }
+    // 初始化
+    let (mut config, connect_list, port) = init();
     
-
     tokio::runtime::Runtime::new()?.block_on(async {
         let _ = run_node(port, connect_list, &mut config).await;
     });
@@ -99,17 +61,13 @@ async fn run_node(
     let keypair = get_key()?;
     let my_peer_id = PeerId::from(keypair.public());
 
-    // 生成net连接节点列表
     let mut net_peer_list: Vec<PeerInfo> = [].to_vec();
 
-    // 初始化服务发现
     let mut sd = ServiceDiscovery::new(&config.services.service_discovery, my_peer_id);
 
-    // 创建命令通道（用于 @call_remote 等需要主循环处理的操作）
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<ManagerCommand>(64);
 
-    // 初始化本地服务调度器（微内核+边车模式）
-    let dispatcher = Arc::new(ServiceDispatcher::new(&config.services.dispatcher));
+    let dispatcher = Arc::new(ServiceDispatcher::new(&config.services.dispatcher, Arc::new(tokio::sync::Mutex::new(sd))));
     if dispatcher.is_enabled() {
         // 连接后端，启动持久连接和读线程
         let connect_failures = dispatcher.connect_all(cmd_tx.clone());
@@ -189,7 +147,6 @@ async fn run_node(
             std::process::exit(1);
         }
     }
-    
 
     // 节点启动成功，输出状态信息
     let log = LogStruct {
@@ -247,7 +204,7 @@ async fn run_node(
         };
         log.logout();
     }
-    
+
     // 挂起的 P2P 出站请求（@call_remote 响应路由）
     let mut pending_outbound: HashMap<request_response::OutboundRequestId, tokio::sync::oneshot::Sender<Result<Vec<u8>, String>>> = HashMap::new();
 
@@ -309,7 +266,7 @@ async fn run_node(
                                 for record in records {
                                     let key_str = String::from_utf8_lossy(record.key.as_ref());
                                     if let Some(svc_type) = key_str.strip_prefix(
-                                        std::str::from_utf8(SD_KEY_PREFIX).unwrap_or("")
+                                        std::str::from_utf8(PREFIX).unwrap_or("")
                                     ) {
                                         let log = LogStruct {
                                             level: LogLevel::Debug,
@@ -529,7 +486,7 @@ async fn run_node(
                                                         for record in records {
                                                             let key_str = String::from_utf8_lossy(record.key.as_ref());
                                                             if let Some(svc_type) = key_str.strip_prefix(
-                                                                std::str::from_utf8(SD_KEY_PREFIX).unwrap_or("")
+                                                                std::str::from_utf8(PREFIX).unwrap_or("")
                                                             ) {
                                                                 let log = LogStruct {
                                                                     level: LogLevel::Preset,
@@ -765,7 +722,7 @@ async fn run_node(
                                             for record in records {
                                                 let key_str = String::from_utf8_lossy(record.key.as_ref());
                                                 if let Some(svc_type) = key_str.strip_prefix(
-                                                    std::str::from_utf8(SD_KEY_PREFIX).unwrap_or("")
+                                                    std::str::from_utf8(PREFIX).unwrap_or("")
                                                 ) {
                                                     let log = LogStruct {
                                                         level: LogLevel::Debug,
