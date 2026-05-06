@@ -70,7 +70,7 @@ fn parse_cli_args(args: &[String], port: &mut u16, connect_list: &mut Vec<String
                 let log = LogStruct {
                     level: LogLevel::Critical,
                     topic: "错误的参数输入".to_string(),
-                    content: format!("{}", unknown_arg),
+                    content: format!("{} 参数是无法识别的", unknown_arg),
                 };
                 log.logout();
                 std::process::exit(1);
