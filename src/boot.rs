@@ -1,78 +1,69 @@
 use std::env;
+use libp2p::Multiaddr;
 
-use crate::{
-	LogLevel,
-	LogStruct,
-	config::{
-		NodeConfig,
-		read_config_file
-	}
-};
+use crate::{LogLevel, LogStruct, config::ConfigHandle};
 
-pub fn init() -> (NodeConfig, Vec<String>, u16) {
-    let config = match read_config_file() {
-        Ok(cfg) => cfg,
-        Err(e) => {
-            let log = LogStruct {
-                level: LogLevel::Critical,
-                topic: "无法读取设置文件".to_string(),
-                content: format!("{}", e),
-            };
-            log.logout();
-            std::process::exit(1);
-        }
-    };
+pub fn init() -> ConfigHandle {
+    let config_handle = ConfigHandle::load_or_create_default();
 
-    let mut connect_list: Vec<String> = if config.services.kademlia.enabled {
-        config.services.kademlia.bootstrap_nodes.clone()
-    } else {
-        Vec::new()
-    };
-
-    let mut port = config.network.port;
+    let mut port = config_handle.listen_port() as u16;
+    let mut bootstrap_nodes = config_handle.bootstrap_nodes();
 
     let args: Vec<String> = env::args().collect();
-    parse_cli_args(&args, &mut port, &mut connect_list);
+    parse_cli_args(&args, &mut port, &mut bootstrap_nodes);
 
-    (config, connect_list, port)
+    // 如果发生了变化，写回配置并保存
+    let mut changed = false;
+    if port as u32 != config_handle.listen_port() {
+        config_handle.set_listen_port(port as u32);
+        changed = true;
+    }
+    if bootstrap_nodes != config_handle.bootstrap_nodes() {
+        config_handle.set_bootstrap_nodes(bootstrap_nodes.clone());
+        changed = true;
+    }
+    if changed {
+        config_handle.save_to_default();
+    }
+
+    config_handle
 }
 
-/// 解析命令行参数并修改 port 和 connect_list
-fn parse_cli_args(args: &[String], port: &mut u16, connect_list: &mut Vec<String>) {
+fn parse_cli_args(args: &[String], port: &mut u16, bootstrap_nodes: &mut Vec<Multiaddr>) {
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
             "-p" if i + 1 < args.len() => {
                 *port = match args[i + 1].parse() {
-                    Ok(arg) => arg,
+                    Ok(p) => p,
                     Err(_) => {
-                        let log = LogStruct {
-                            level: LogLevel::Warning,
-                            topic: "-p 参数输入错误".to_string(),
-                            content: "使用默认值 5000".to_string(),
-                        };
-                        log.logout();
+                        LogStruct::new(LogLevel::Warning, "-p 参数输入错误", "使用默认值 5000").emit();
                         5000
                     }
                 };
-                i += 1; // 跳过参数值
+                i += 1;
             }
             "-c" if i + 1 < args.len() => {
-                connect_list.push(args[i + 1].clone());
+                match args[i + 1].parse::<Multiaddr>() {
+                    Ok(addr) => bootstrap_nodes.push(addr),
+                    Err(e) => {
+                        LogStruct::new(LogLevel::Warning, "无效的 Multiaddr", format!("忽略: {}\n错误: {}", args[i + 1], e)).emit();
+                    }
+                }
                 i += 1;
             }
             "--connect-overwrite" if i + 1 < args.len() => {
-                connect_list.clear();
-                connect_list.push(args[i + 1].clone());
+                bootstrap_nodes.clear();
+                match args[i + 1].parse::<Multiaddr>() {
+                    Ok(addr) => bootstrap_nodes.push(addr),
+                    Err(e) => {
+                        LogStruct::new(LogLevel::Warning, "无效的 Multiaddr", format!("忽略: {}\n错误: {}", args[i + 1], e)).emit();
+                    }
+                }
                 i += 1;
             }
-            unknown_arg => {
-                let log = LogStruct {
-                    level: LogLevel::Critical,
-                    topic: "错误的参数输入".to_string(),
-                    content: format!("{} 参数是无法识别的", unknown_arg),
-                };
-                log.logout();
+            unknown => {
+                LogStruct::new(LogLevel::Critical, "错误的参数输入", format!("{} 参数是无法识别的", unknown)).emit();
                 std::process::exit(1);
             }
         }

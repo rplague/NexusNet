@@ -1,496 +1,408 @@
-use crate::{LogLevel, LogStruct, get_key, get_network_addresses};
+use crate::{LogLevel, LogStruct};
 use std::fs;
-use std::io::ErrorKind;
+use std::io;
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::net::IpAddr;
 use std::path::Path;
-
-use libp2p::{Multiaddr, PeerId};
-
+use libp2p::Multiaddr;
 // 定义配置结构体
-//
-// 所有服务级别的配置结构体都实现了 Default + #[serde(default)]，
-// 这样 config.toml 中只需要写用户想覆写的字段，其余自动使用默认值。
-// 只有 NodeConfig 本身是必填的根节点。
 
-#[derive(Debug, serde::Deserialize, serde::Serialize)]
+fn bool_true() -> bool {true}
+
+fn bool_false() -> bool {false}
+
+const fn hours(h: u32) -> u32 { h * 3600 }
+
+macro_rules! default_u32_fn {
+    ($name:ident, $value:expr) => {
+        fn $name() -> u32 { $value }
+    };
+}
+
+default_u32_fn!(default_port, 5000);
+default_u32_fn!(default_interval, 15);
+default_u32_fn!(default_timeout, 10);
+default_u32_fn!(default_max_failures, 2);
+default_u32_fn!(default_record_ttl_seconds, hours(1));
+default_u32_fn!(default_replication_factor, 20);
+default_u32_fn!(default_query_timeout_seconds, 60);
+
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct NodeConfig {
+    #[serde(default)]
     pub node: NodeInfo,
+    #[serde(default)]
     pub network: NetworkConfig,
     #[serde(default)]
     pub services: ServicesConfig,
 }
 
-#[derive(Debug, serde::Deserialize, serde::Serialize)]
+impl Default for NodeConfig {
+    fn default() -> Self {
+        NodeConfig {
+            node: NodeInfo::default(),
+            network: NetworkConfig::default(),
+            services: ServicesConfig::default(),
+        }
+    }
+}
+
+impl NodeConfig {
+
+    /// 返回值总是有效的 NodeConfig。
+    fn from_toml_file(path: impl AsRef<Path>, create_if_missing: bool) -> NodeConfig {
+        let path = path.as_ref();
+
+        // 如果不需要创建且文件不存在，直接返回默认配置
+        if !create_if_missing && !path.exists() {
+            LogStruct::new(LogLevel::Warning, "配置文件不存在", "配置文件不存在且未要求创建，使用默认配置").emit();
+            return NodeConfig::default();
+        }
+
+        // 尝试读取并解析文件
+        match fs::read_to_string(path) {
+            Ok(content) => {
+                match toml::from_str(&content) {
+                    Ok(config) => return config,
+                    Err(e) => {
+                        LogStruct::new(LogLevel::Error, "配置文件解析失败，将会创建新的配置文件", e.to_string()).emit();
+                        if let Err(rename_err) = rename_bad_config(path) {
+                            LogStruct::new(LogLevel::Critical, "重命名损坏的配置文件失败", rename_err.to_string()).emit();
+                            std::process::exit(1);
+                        }
+                    }
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => { }
+            Err(e) => {
+                LogStruct::new(LogLevel::Critical, "无法读取配置文件", e.to_string()).emit();
+                std::process::exit(1);
+            }
+        }
+
+        // 走到这里：文件不存在 或 解析失败后重命名完成
+        // 创建默认配置并写入文件
+        let default_config = NodeConfig::default();
+        let toml_string = match toml::to_string_pretty(&default_config) {
+            Ok(s) => s,
+            Err(e) => {
+                LogStruct::new(LogLevel::Critical, "序列化默认配置失败", e.to_string()).emit();
+                std::process::exit(1);
+            }
+        };
+        if let Err(e) = fs::write(path, toml_string) {
+            LogStruct::new(LogLevel::Critical, "写入默认配置文件失败", e.to_string()).emit();
+            std::process::exit(1);
+        }
+        default_config
+    }
+}
+
+fn rename_bad_config(path: &Path) -> io::Result<()> {
+    let mut backup_path = path.with_extension("bak");
+    let mut counter = 1;
+    while backup_path.exists() {
+        backup_path = path.with_extension(format!("bak.{}", counter));
+        counter += 1;
+    }
+    fs::rename(path, &backup_path)?;
+    Ok(())
+}
+
+fn default_name() -> String { "未设置的p2p节点".to_string() }
+
+fn default_description() -> String { "无详细描述".to_string() }
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct NodeInfo {
+    #[serde(default = "default_name")]
     pub name: String,
+    #[serde(default = "default_description")]
     pub description: String,
 }
 
-#[derive(Debug, serde::Deserialize, serde::Serialize)]
-pub struct NetworkConfig {
-    #[serde(default = "default_true")]
-    pub ipv4_enabled: bool,
-    #[serde(default = "default_ip_unavailable")]
-    pub ipv4_address: String,
-    #[serde(default = "default_false")]
-    pub ipv6_enabled: bool,
-    #[serde(default = "default_ip_unavailable")]
-    pub ipv6_address: String,
-    #[serde(default = "default_port")]
-    pub port: u16,
-    #[serde(default)]
-    pub announce_addresses: Vec<String>,
+impl Default for NodeInfo {
+    fn default() -> Self {
+        NodeInfo {
+            name: default_name(),
+            description: default_description(),
+        }
+    }
 }
 
-#[derive(Debug, serde::Deserialize, serde::Serialize, Default)]
+fn default_announce_addresses() -> Vec<Multiaddr> {vec![]}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct NetworkConfig {    
+    #[serde(default = "bool_false")]
+    pub ipv4_enabled: bool,
+    #[serde(default)]
+    pub ipv4_address: Option<IpAddr>,
+    #[serde(default = "bool_false")]
+    pub ipv6_enabled: bool,
+    #[serde(default)]
+    pub ipv6_address: Option<IpAddr>,
+    #[serde(default = "default_port")]
+    pub port: u32,
+    #[serde(default = "default_announce_addresses")]
+    pub announce_addresses: Vec<Multiaddr>,
+}
+
+impl Default for NetworkConfig {
+    fn default() -> Self {
+        NetworkConfig {
+            ipv4_enabled: bool_false(),
+            ipv4_address: None,
+            ipv6_enabled: bool_false(),
+            ipv6_address: None,
+            port: default_port(),
+            announce_addresses: default_announce_addresses(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, Default)]
 pub struct ServicesConfig {
     #[serde(default)]
     pub ping: PingService,
     #[serde(default)]
     pub kademlia: KademliaService,
     #[serde(default)]
-    pub service_discovery: ServiceDiscoveryConfig,
-    #[serde(default)]
     pub dispatcher: DispatcherConfig,
-    #[serde(default)]
-    pub address_watcher: AddressWatcherConfig,
-    #[serde(default)]
-    pub outbound_proxy: OutboundProxyConfig,
 }
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
-pub struct AddressWatcherConfig {
-    #[serde(default = "default_true")]
+pub struct PingService {
+    #[serde(default = "bool_true")]
     pub enabled: bool,
-    /// 地址检测间隔（秒）
-    #[serde(default = "default_addr_watch_interval")]
-    pub check_interval_secs: u64,
+    #[serde(default = "default_interval")]
+    pub interval_secs: u32,
+    #[serde(default = "default_timeout")]
+    pub with_timeout: u32,
+    #[serde(default = "default_max_failures")]
+    pub max_failures: u32,
 }
 
-impl Default for AddressWatcherConfig {
+impl Default for PingService {
     fn default() -> Self {
-        AddressWatcherConfig {
-            enabled: true,
-            check_interval_secs: 60,
+        PingService {
+            enabled: bool_true(),
+            interval_secs: default_interval(),
+            with_timeout: default_timeout(),
+            max_failures: default_max_failures(),
         }
     }
 }
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
-pub struct ServiceDiscoveryConfig {
-    #[serde(default = "default_true")]
+pub struct KademliaService {
+    #[serde(default = "bool_true")]
     pub enabled: bool,
-    /// 本节点提供的服务列表
-    #[serde(default)]
-    pub services: Vec<String>,
-    /// 查询超时（秒）
-    #[serde(default = "default_sd_query_timeout")]
-    pub query_timeout_secs: u64,
-    /// 宣告记录的TTL（秒）
-    #[serde(default = "default_sd_ttl")]
-    pub record_ttl_secs: u64,
+    #[serde(default = "default_record_ttl_seconds")]
+    pub record_ttl_seconds: u32,
+    #[serde(default = "default_replication_factor")]
+    pub replication_factor: u32,
+    #[serde(default = "default_query_timeout_seconds")]
+    pub query_timeout_seconds: u32,
+    #[serde(default = "default_announce_addresses")]
+    pub bootstrap_nodes: Vec<Multiaddr>,
 }
 
-impl Default for ServiceDiscoveryConfig {
+impl Default for KademliaService {
     fn default() -> Self {
-        ServiceDiscoveryConfig {
-            enabled: true,
-            services: vec![],
-            query_timeout_secs: 30,
-            record_ttl_secs: 1800,
-        }
-    }
-}
-
-/// 本地服务调度器配置
-/// 每个服务是一个独立进程，监听本地回环地址的某个端口。
-/// 通信层收到外部请求后，根据 service=xxx 字段将请求转发到对应端口。
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
-pub struct DispatcherConfig {
-    #[serde(default = "default_false")]
-    pub enabled: bool,
-    /// 本地服务的路由表: 服务名 → 后端地址
-    #[serde(default)]
-    pub local_services: Vec<LocalServiceEntry>,
-    /// 管理端口：本地 CLI 通过此端口与节点交互
-    /// CLI 发送 JSON 命令，dispatcher 处理或转发到 P2P 网络
-    #[serde(default = "default_management_port")]
-    pub management_port: u16,
-}
-
-impl Default for DispatcherConfig {
-    fn default() -> Self {
-        DispatcherConfig {
-            enabled: false,
-            local_services: Vec::new(),
-            management_port: 5200,
+        KademliaService {
+            enabled: bool_true(),
+            record_ttl_seconds: default_record_ttl_seconds(),
+            replication_factor: default_replication_factor(),
+            query_timeout_seconds: default_query_timeout_seconds(),
+            bootstrap_nodes: default_announce_addresses(),
         }
     }
 }
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct LocalServiceEntry {
-    /// 服务标识名，如 "ocr"、"cold-storage"
     pub name: String,
-    /// 后端进程监听地址
     pub host: String,
-    /// 后端进程监听端口
     pub port: u16,
-}
-
-#[derive(Debug, serde::Deserialize, serde::Serialize)]
-pub struct PingService {
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    #[serde(default = "default_ping_interval")]
-    pub interval_secs: u32,
-    #[serde(default = "default_ping_timeout")]
-    pub with_timeout: u32,
-}
-
-impl Default for PingService {
-    fn default() -> Self {
-        PingService {
-            enabled: true,
-            interval_secs: 15,
-            with_timeout: 10,
-        }
-    }
-}
-
-#[derive(Debug, serde::Deserialize, serde::Serialize)]
-pub struct KademliaService {
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    #[serde(default = "default_kad_ttl")]
-    pub record_ttl_seconds: u64,
-    #[serde(default = "default_kad_replication")]
-    pub replication_factor: usize,
-    #[serde(default = "default_kad_query_timeout")]
-    pub query_timeout_seconds: u64,
-    #[serde(default)]
-    pub bootstrap_nodes: Vec<String>,
-}
-
-impl Default for KademliaService {
-    fn default() -> Self {
-        KademliaService {
-            enabled: true,
-            record_ttl_seconds: 3600,
-            replication_factor: 20,
-            query_timeout_seconds: 60,
-            bootstrap_nodes: vec![],
-        }
-    }
-}
-
-// ─── 默认值辅助函数 ─────────────────────────────────────────
-
-fn default_true() -> bool {
-    true
-}
-fn default_false() -> bool {
-    false
-}
-fn default_port() -> u16 {
-    5000
-}
-fn default_ip_unavailable() -> String {
-    "不可用".to_string()
-}
-fn default_ping_interval() -> u32 {
-    15
-}
-fn default_ping_timeout() -> u32 {
-    10
-}
-fn default_kad_ttl() -> u64 {
-    3600
-}
-fn default_kad_replication() -> usize {
-    20
-}
-fn default_kad_query_timeout() -> u64 {
-    60
-}
-fn default_sd_query_timeout() -> u64 {
-    30
-}
-fn default_sd_ttl() -> u64 {
-    1800
-}
-fn default_addr_watch_interval() -> u64 {
-    60
-}
-fn default_management_port() -> u16 {
-    5200
-}
-fn default_proxy_port() -> u16 {
-    5200
-}
-fn default_proxy_bind() -> String {
-    "127.0.0.1".to_string()
 }
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
-pub struct OutboundProxyConfig {
-    #[serde(default = "default_false")]
+pub struct DispatcherConfig {
+    #[serde(default = "bool_true")]
     pub enabled: bool,
-    #[serde(default = "default_proxy_bind")]
-    pub bind: String,
-    #[serde(default = "default_proxy_port")]
-    pub port: u16,
+    #[serde(default = "default_query_timeout_seconds")]
+    pub query_timeout_secs: u32,
+    #[serde(default = "default_record_ttl_seconds")]
+    pub record_ttl_secs: u32,
+    #[serde(default = "Vec::new")]
+    pub local_services: Vec<LocalServiceEntry>,
 }
 
-impl Default for OutboundProxyConfig {
+impl Default for DispatcherConfig {
     fn default() -> Self {
-        OutboundProxyConfig {
-            enabled: false,
-            bind: "127.0.0.1".to_string(),
-            port: 5200,
+        DispatcherConfig {
+            enabled: bool_true(),
+            query_timeout_secs: default_query_timeout_seconds(),
+            record_ttl_secs: default_record_ttl_seconds(),
+            local_services: vec![],
         }
     }
 }
 
-// ─── 节点管理 ───────────────────────────────────────────────
-
-impl NodeConfig {
-    pub fn insert_bootstrap_nodes(&mut self, info: String) {
-        // 从info中提取peer_id
-        let new_peer_id = extract_peer_id_from_multiaddr(&info);
-
-        if let Some(new_peer_id) = new_peer_id {
-            // 查找是否已存在相同peer_id的节点
-            let existing_index = self
-                .services
-                .kademlia
-                .bootstrap_nodes
-                .iter()
-                .position(|node| {
-                    if let Some(existing_peer_id) = extract_peer_id_from_multiaddr(node) {
-                        existing_peer_id == new_peer_id
-                    } else {
-                        false
-                    }
-                });
-
-            match existing_index {
-                Some(index) => {
-                    // 替换现有节点的地址
-                    self.services.kademlia.bootstrap_nodes[index] = info;
-                }
-                None => {
-                    // 添加新节点
-                    self.services.kademlia.bootstrap_nodes.push(info);
-                }
-            }
-        } else {
-            return;
-        }
-
-        // 保存到配置文件
-        let toml_string = toml::to_string_pretty(self).unwrap();
-        fs::write("./config.toml", toml_string).unwrap();
-    }
+#[derive(Clone)]
+pub struct ConfigHandle {
+    inner: Arc<RwLock<NodeConfig>>,
 }
 
-// 辅助函数：从Multiaddr中提取PeerId
-fn extract_peer_id_from_multiaddr(addr: &str) -> Option<String> {
-    // 尝试解析为Multiaddr
-    if let Ok(multiaddr) = addr.parse::<Multiaddr>() {
-        // 遍历协议组件，查找p2p部分
-        for protocol in multiaddr.iter() {
-            if let libp2p::multiaddr::Protocol::P2p(peer_id) = protocol {
-                return Some(peer_id.to_string());
-            }
+
+impl ConfigHandle {
+    pub fn new(config: NodeConfig) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(config)),
         }
     }
-    None
-}
 
-// ─── 配置文件创建与读取 ────────────────────────────────────
-
-pub fn create_new_config_file() -> Result<NodeConfig, Box<dyn std::error::Error>> {
-    let config_path = Path::new("./config.toml");
-
-    let (ipv4_address, ipv6_address) = get_network_addresses()?;
-    let keypair = get_key()?;
-    let peer_id = PeerId::from(keypair.public());
-    let has_v4 = !ipv4_address.is_empty();
-    let has_v6 = !ipv6_address.is_empty();
-
-    let mut announce = Vec::new();
-    if has_v4 {
-        announce.push(format!("/ip4/{}/tcp/5000/p2p/{}", ipv4_address, peer_id));
-    }
-    if has_v6 {
-        announce.push(format!("/ip6/{}/tcp/5000/p2p/{}", ipv6_address, peer_id));
+    pub fn from_toml_file(path: impl AsRef<Path>, create_if_missing: bool) -> Self {
+        let config = NodeConfig::from_toml_file(path, create_if_missing);
+        Self::new(config)
     }
 
-    let config = NodeConfig {
-        node: NodeInfo {
-            name: "未设置的p2p节点".to_string(),
-            description: "无详细描述".to_string(),
-        },
-        network: NetworkConfig {
-            ipv4_enabled: has_v4,
-            ipv4_address: if has_v4 {
-                ipv4_address.clone()
-            } else {
-                "不可用".to_string()
-            },
-            ipv6_enabled: has_v6,
-            ipv6_address: if has_v6 {
-                ipv6_address
-            } else {
-                "不可用".to_string()
-            },
-            port: 5000,
-            announce_addresses: announce,
-        },
-        services: ServicesConfig::default(),
-    };
+    pub fn load_or_create_default() -> Self {
+        Self::from_toml_file("./config.toml", true)
+    }
 
-    let toml_string = toml::to_string_pretty(&config)?;
-    fs::write(config_path, toml_string)?;
-
-    Ok(config)
-}
-
-pub fn read_config_file() -> Result<NodeConfig, Box<dyn std::error::Error>> {
-    let path = Path::new("./config.toml");
-
-    match fs::read_to_string(path) {
-        Ok(content) => {
-            if content.trim().is_empty() {
-                let log = LogStruct {
-                    level: LogLevel::Warning,
-                    topic: "设置文件异常".to_string(),
-                    content: "配置文件为空，自动创建新的设置文件".to_string(),
-                };
-                log.logout();
-
-                match create_new_config_file() {
-                    Ok(config) => Ok(config),
-                    Err(e) => {
-                        let log = LogStruct {
-                            level: LogLevel::Critical,
-                            topic: "创建配置文件失败".to_string(),
-                            content: e.to_string(),
-                        };
-                        log.logout();
-                        Err(e)
-                    }
-                }
-            } else {
-                // 解析配置文件
-                match toml::from_str::<NodeConfig>(&content) {
-                    Ok(mut config) => {
-                        // 成功解析后，更新网络地址信息
-                        init_update_config(&mut config);
-
-                        let toml_string = toml::to_string_pretty(&config)?;
-                        fs::write("./config.toml", toml_string)?;
-
-                        Ok(config)
-                    }
-                    Err(e) => {
-                        let log = LogStruct {
-                            level: LogLevel::Warning,
-                            topic: "配置文件格式错误".to_string(),
-                            content: format!("解析失败: {}，尝试创建新配置", e),
-                        };
-                        log.logout();
-
-                        // 格式错误，尝试创建新配置
-                        create_new_config_file()
-                    }
-                }
+    /// 将当前配置保存到 TOML 文件
+    /// 如果文件已存在，会覆盖写入
+    /// 如果写入失败（如权限不足、磁盘满），会记录 Critical 日志并退出程序
+    fn save_to_file(&self, path: impl AsRef<Path>) {
+        let path = path.as_ref();
+        let snapshot = self.snapshot();
+        let toml_string = match toml::to_string_pretty(&snapshot){
+            Ok(s) => s,
+            Err(e) => {
+                LogStruct::new(LogLevel::Critical, "序列化配置失败", e.to_string()).emit();
+                std::process::exit(1);
             }
+        };
+
+        let temp_path = path.with_extension("tmp");
+
+        if let Err(e) = fs::write(&temp_path, toml_string) {
+            LogStruct::new(LogLevel::Critical, "写入临时配置文件失败", format!("路径: {}, 错误: {}", temp_path.display(), e)).emit();
+            std::process::exit(1);
         }
 
-        Err(error) => match error.kind() {
-            ErrorKind::NotFound => {
-                let log = LogStruct {
-                    level: LogLevel::Warning,
-                    topic: "设置文件不存在".to_string(),
-                    content: "自动创建新的设置文件".to_string(),
-                };
-                log.logout();
-
-                match create_new_config_file() {
-                    Ok(config) => Ok(config),
-                    Err(e) => {
-                        let log = LogStruct {
-                            level: LogLevel::Critical,
-                            topic: "创建配置文件失败".to_string(),
-                            content: e.to_string(),
-                        };
-                        log.logout();
-                        Err(e)
-                    }
-                }
-            }
-            ErrorKind::PermissionDenied => {
-                let log = LogStruct {
-                    level: LogLevel::Critical,
-                    topic: "权限不足".to_string(),
-                    content: "无法读取设置文件！".to_string(),
-                };
-                log.logout();
-                Err(Box::new(std::io::Error::new(
-                    ErrorKind::PermissionDenied,
-                    "权限不足，无法读取配置文件",
-                )))?
-            }
-            _ => {
-                let log = LogStruct {
-                    level: LogLevel::Critical,
-                    topic: "读取配置文件失败".to_string(),
-                    content: error.to_string(),
-                };
-                log.logout();
-                Err(Box::new(error))?
-            }
-        },
-    }
-}
-
-fn init_update_config(config: &mut NodeConfig) {
-    let keypair = get_key().unwrap();
-    let (ipv4_address, ipv6_address) = get_network_addresses().unwrap();
-
-    let peer_id = PeerId::from(keypair.public());
-    let has_ipv4 = !ipv4_address.is_empty();
-    let has_ipv6 = !ipv6_address.is_empty();
-
-    config.network.ipv4_enabled = has_ipv4;
-    config.network.ipv4_address = if has_ipv4 {
-        ipv4_address.clone()
-    } else {
-        "不可用".to_string()
-    };
-
-    config.network.ipv6_enabled = has_ipv6;
-    config.network.ipv6_address = if has_ipv6 {
-        ipv6_address.clone()
-    } else {
-        "不可用".to_string()
-    };
-
-    let mut announce_addresses = Vec::new();
-
-    if has_ipv4 {
-        announce_addresses.push(format!(
-            "/ip4/{}/tcp/{}/p2p/{}",
-            ipv4_address, config.network.port, peer_id
-        ));
-    }
-    if has_ipv6 {
-        announce_addresses.push(format!(
-            "/ip6/{}/tcp/{}/p2p/{}",
-            ipv6_address, config.network.port, peer_id
-        ));
+        if let Err(e) = fs::rename(&temp_path, path) {
+            let _ = fs::remove_file(&temp_path);
+            LogStruct::new(LogLevel::Critical, "重命名配置文件失败", format!("从 {} 到 {}, 错误: {}", temp_path.display(), path.display(), e)).emit();
+            std::process::exit(1);
+        }
     }
 
-    config.network.announce_addresses = announce_addresses;
+    /// 便捷方法：保存到默认路径 `./config.toml`
+    pub fn save_to_default(&self) {
+        self.save_to_file("./config.toml");
+    }
+
+    /// 获取只读锁
+    pub fn read(&self) -> RwLockReadGuard<'_, NodeConfig> {
+        self.inner.read().expect("RwLock 被污染")
+    }
+
+    /// 获取写锁
+    pub fn write(&self) -> RwLockWriteGuard<'_, NodeConfig> {
+        self.inner.write().expect("RwLock 被污染")
+    }
+
+    // ========== 便捷只读方法 ==========
+    pub fn ping_enabled(&self) -> bool {
+        self.read().services.ping.enabled
+    }
+
+    pub fn ping_interval(&self) -> u32 {
+        self.read().services.ping.interval_secs
+    }
+
+    pub fn ping_timeout(&self) -> u32 {
+        self.read().services.ping.with_timeout
+    }
+
+    pub fn kademlia_enabled(&self) -> bool {
+        self.read().services.kademlia.enabled
+    }
+
+    pub fn kademlia_record_ttl(&self) -> u32 {
+        self.read().services.kademlia.record_ttl_seconds
+    }
+
+    pub fn kademlia_replication_factor(&self) -> u32 {
+        self.read().services.kademlia.replication_factor
+    }
+
+    pub fn kademlia_query_timeout(&self) -> u32 {
+        self.read().services.kademlia.query_timeout_seconds
+    }
+
+    pub fn bootstrap_nodes(&self) -> Vec<Multiaddr> {
+        self.read().services.kademlia.bootstrap_nodes.clone()
+    }
+
+    pub fn listen_port(&self) -> u32 {
+        self.read().network.port
+    }
+
+    pub fn ipv4_enabled(&self) -> bool {
+        self.read().network.ipv4_enabled
+    }
+
+    // ========== 便捷修改方法 ==========
+    pub fn set_ping_enabled(&self, enabled: bool) {
+        self.write().services.ping.enabled = enabled;
+    }
+
+    pub fn set_ping_interval(&self, secs: u32) {
+        self.write().services.ping.interval_secs = secs;
+    }
+
+    pub fn set_kademlia_enabled(&self, enabled: bool) {
+        self.write().services.kademlia.enabled = enabled;
+    }
+
+    pub fn set_kademlia_record_ttl(&self, ttl_secs: u32) {
+        self.write().services.kademlia.record_ttl_seconds = ttl_secs;
+    }
+
+    pub fn set_kademlia_replication_factor(&self, factor: u32) {
+        self.write().services.kademlia.replication_factor = factor;
+    }
+
+    pub fn set_kademlia_query_timeout(&self, timeout_secs: u32) {
+        self.write().services.kademlia.query_timeout_seconds = timeout_secs;
+    }
+
+    pub fn set_bootstrap_nodes(&self, nodes: Vec<Multiaddr>) {
+        self.write().services.kademlia.bootstrap_nodes = nodes;
+    }
+
+    pub fn set_listen_port(&self, port: u32) {
+        self.write().network.port = port;
+    }
+
+    pub fn set_ipv4(&self, enabled: bool, address: Option<IpAddr>) {
+        let mut cfg = self.write();
+        cfg.network.ipv4_enabled = enabled;
+        cfg.network.ipv4_address = address;
+    }
+
+    /// 替换整个 NodeConfig
+    pub fn replace_config(&self, new_config: NodeConfig) {
+        *self.write() = new_config;
+    }
+
+    /// 获取配置的快照
+    pub fn snapshot(&self) -> NodeConfig {
+        self.read().clone()
+    }
 }
