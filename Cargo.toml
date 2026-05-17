@@ -17,3 +17,4 @@ reqwest = { version = "0.11", default-features = false, features = ["blocking", 
 get_if_addrs = "0.5.3"
 base64 = "0.22"
 scopeguard = "1"
+uuid = "1.23.1"
