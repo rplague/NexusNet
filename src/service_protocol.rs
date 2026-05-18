@@ -1,6 +1,6 @@
-use libp2p::request_response::{self, cbor, Config};
 use libp2p::StreamProtocol;
-use serde::{Serialize, Deserialize};
+use libp2p::request_response::{self, Config, cbor};
+use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 /// 协议 ID
@@ -22,12 +22,11 @@ pub struct Response {
 
 /// 创建默认配置的请求响应行为
 pub fn new_service_req_behaviour() -> cbor::Behaviour<Request, Response> {
-    let cfg = Config::default()
-        .with_request_timeout(Duration::from_secs(30));
-    
+    let cfg = Config::default().with_request_timeout(Duration::from_secs(30));
+
     // 将 &str 转换为 StreamProtocol
     let protocol = StreamProtocol::new(SERVICE_REQ_PROTOCOL);
-    
+
     cbor::Behaviour::new(
         vec![(protocol, request_response::ProtocolSupport::Full)],
         cfg,

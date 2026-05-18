@@ -1,5 +1,5 @@
-use std::env;
 use libp2p::Multiaddr;
+use std::env;
 
 use crate::{LogLevel, LogStruct, config::ConfigHandle};
 
@@ -37,7 +37,8 @@ fn parse_cli_args(args: &[String], port: &mut u16, bootstrap_nodes: &mut Vec<Mul
                 *port = match args[i + 1].parse() {
                     Ok(p) => p,
                     Err(_) => {
-                        LogStruct::new(LogLevel::Warning, "-p 参数输入错误", "使用默认值 5000").emit();
+                        LogStruct::new(LogLevel::Warning, "-p 参数输入错误", "使用默认值 5000")
+                            .emit();
                         5000
                     }
                 };
@@ -47,7 +48,12 @@ fn parse_cli_args(args: &[String], port: &mut u16, bootstrap_nodes: &mut Vec<Mul
                 match args[i + 1].parse::<Multiaddr>() {
                     Ok(addr) => bootstrap_nodes.push(addr),
                     Err(e) => {
-                        LogStruct::new(LogLevel::Warning, "无效的 Multiaddr", format!("忽略: {}\n错误: {}", args[i + 1], e)).emit();
+                        LogStruct::new(
+                            LogLevel::Warning,
+                            "无效的 Multiaddr",
+                            format!("忽略: {}\n错误: {}", args[i + 1], e),
+                        )
+                        .emit();
                     }
                 }
                 i += 1;
@@ -57,13 +63,23 @@ fn parse_cli_args(args: &[String], port: &mut u16, bootstrap_nodes: &mut Vec<Mul
                 match args[i + 1].parse::<Multiaddr>() {
                     Ok(addr) => bootstrap_nodes.push(addr),
                     Err(e) => {
-                        LogStruct::new(LogLevel::Warning, "无效的 Multiaddr", format!("忽略: {}\n错误: {}", args[i + 1], e)).emit();
+                        LogStruct::new(
+                            LogLevel::Warning,
+                            "无效的 Multiaddr",
+                            format!("忽略: {}\n错误: {}", args[i + 1], e),
+                        )
+                        .emit();
                     }
                 }
                 i += 1;
             }
             unknown => {
-                LogStruct::new(LogLevel::Critical, "错误的参数输入", format!("{} 参数是无法识别的", unknown)).emit();
+                LogStruct::new(
+                    LogLevel::Critical,
+                    "错误的参数输入",
+                    format!("{} 参数是无法识别的", unknown),
+                )
+                .emit();
                 std::process::exit(1);
             }
         }

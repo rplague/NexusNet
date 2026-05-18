@@ -1,21 +1,29 @@
 use crate::{LogLevel, LogStruct};
+use libp2p::Multiaddr;
 use std::fs;
 use std::io;
-use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::net::IpAddr;
 use std::path::Path;
-use libp2p::Multiaddr;
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 // 定义配置结构体
 
-fn bool_true() -> bool {true}
+fn bool_true() -> bool {
+    true
+}
 
-fn bool_false() -> bool {false}
+fn bool_false() -> bool {
+    false
+}
 
-const fn hours(h: u32) -> u32 { h * 3600 }
+const fn hours(h: u32) -> u32 {
+    h * 3600
+}
 
 macro_rules! default_u32_fn {
     ($name:ident, $value:expr) => {
-        fn $name() -> u32 { $value }
+        fn $name() -> u32 {
+            $value
+        }
     };
 }
 
@@ -26,7 +34,6 @@ default_u32_fn!(default_max_failures, 2);
 default_u32_fn!(default_record_ttl_seconds, hours(1));
 default_u32_fn!(default_replication_factor, 20);
 default_u32_fn!(default_query_timeout_seconds, 60);
-
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct NodeConfig {
@@ -49,32 +56,44 @@ impl Default for NodeConfig {
 }
 
 impl NodeConfig {
-
     /// 返回值总是有效的 NodeConfig。
     fn from_toml_file(path: impl AsRef<Path>, create_if_missing: bool) -> NodeConfig {
         let path = path.as_ref();
 
         // 如果不需要创建且文件不存在，直接返回默认配置
         if !create_if_missing && !path.exists() {
-            LogStruct::new(LogLevel::Warning, "配置文件不存在", "配置文件不存在且未要求创建，使用默认配置").emit();
+            LogStruct::new(
+                LogLevel::Warning,
+                "配置文件不存在",
+                "配置文件不存在且未要求创建，使用默认配置",
+            )
+            .emit();
             return NodeConfig::default();
         }
 
         // 尝试读取并解析文件
         match fs::read_to_string(path) {
-            Ok(content) => {
-                match toml::from_str(&content) {
-                    Ok(config) => return config,
-                    Err(e) => {
-                        LogStruct::new(LogLevel::Error, "配置文件解析失败，将会创建新的配置文件", e.to_string()).emit();
-                        if let Err(rename_err) = rename_bad_config(path) {
-                            LogStruct::new(LogLevel::Critical, "重命名损坏的配置文件失败", rename_err.to_string()).emit();
-                            std::process::exit(1);
-                        }
+            Ok(content) => match toml::from_str(&content) {
+                Ok(config) => return config,
+                Err(e) => {
+                    LogStruct::new(
+                        LogLevel::Error,
+                        "配置文件解析失败，将会创建新的配置文件",
+                        e.to_string(),
+                    )
+                    .emit();
+                    if let Err(rename_err) = rename_bad_config(path) {
+                        LogStruct::new(
+                            LogLevel::Critical,
+                            "重命名损坏的配置文件失败",
+                            rename_err.to_string(),
+                        )
+                        .emit();
+                        std::process::exit(1);
                     }
                 }
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => { }
+            },
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => {
                 LogStruct::new(LogLevel::Critical, "无法读取配置文件", e.to_string()).emit();
                 std::process::exit(1);
@@ -110,9 +129,13 @@ fn rename_bad_config(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn default_name() -> String { "未设置的p2p节点".to_string() }
+fn default_name() -> String {
+    "未设置的p2p节点".to_string()
+}
 
-fn default_description() -> String { "无详细描述".to_string() }
+fn default_description() -> String {
+    "无详细描述".to_string()
+}
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct NodeInfo {
@@ -131,10 +154,12 @@ impl Default for NodeInfo {
     }
 }
 
-fn default_announce_addresses() -> Vec<Multiaddr> {vec![]}
+fn default_announce_addresses() -> Vec<Multiaddr> {
+    vec![]
+}
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
-pub struct NetworkConfig {    
+pub struct NetworkConfig {
     #[serde(default = "bool_false")]
     pub ipv4_enabled: bool,
     #[serde(default)]
@@ -256,7 +281,6 @@ pub struct ConfigHandle {
     inner: Arc<RwLock<NodeConfig>>,
 }
 
-
 impl ConfigHandle {
     pub fn new(config: NodeConfig) -> Self {
         Self {
@@ -279,7 +303,7 @@ impl ConfigHandle {
     fn save_to_file(&self, path: impl AsRef<Path>) {
         let path = path.as_ref();
         let snapshot = self.snapshot();
-        let toml_string = match toml::to_string_pretty(&snapshot){
+        let toml_string = match toml::to_string_pretty(&snapshot) {
             Ok(s) => s,
             Err(e) => {
                 LogStruct::new(LogLevel::Critical, "序列化配置失败", e.to_string()).emit();
@@ -290,13 +314,28 @@ impl ConfigHandle {
         let temp_path = path.with_extension("tmp");
 
         if let Err(e) = fs::write(&temp_path, toml_string) {
-            LogStruct::new(LogLevel::Critical, "写入临时配置文件失败", format!("路径: {}, 错误: {}", temp_path.display(), e)).emit();
+            LogStruct::new(
+                LogLevel::Critical,
+                "写入临时配置文件失败",
+                format!("路径: {}, 错误: {}", temp_path.display(), e),
+            )
+            .emit();
             std::process::exit(1);
         }
 
         if let Err(e) = fs::rename(&temp_path, path) {
             let _ = fs::remove_file(&temp_path);
-            LogStruct::new(LogLevel::Critical, "重命名配置文件失败", format!("从 {} 到 {}, 错误: {}", temp_path.display(), path.display(), e)).emit();
+            LogStruct::new(
+                LogLevel::Critical,
+                "重命名配置文件失败",
+                format!(
+                    "从 {} 到 {}, 错误: {}",
+                    temp_path.display(),
+                    path.display(),
+                    e
+                ),
+            )
+            .emit();
             std::process::exit(1);
         }
     }
