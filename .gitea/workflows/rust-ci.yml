@@ -1,0 +1,37 @@
+name: Rust CI
+on: [push]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    # 直接使用官方 Rust 镜像作为构建环境
+    container: rust:latest
+
+    steps:
+      # 检出代码：从仓库拉取最新代码
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 缓存 Cargo 依赖：加速后续构建
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      # 代码格式化检查：确保代码风格统一
+      - name: 代码格式化检查 | Check code format
+        run: cargo fmt -- --check
+
+      # 运行测试：保障代码功能正确
+      - name: 运行测试 | Run tests
+        run: cargo test --verbose
+
+      # 生产构建：验证项目最终可以成功编译
+      - name: 生产构建 | Build in release mode
+        run: cargo build --release
