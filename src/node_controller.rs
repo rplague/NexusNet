@@ -235,7 +235,11 @@ impl NodeController {
                         }
                         // 等待 ServiceDispatcher 的处理结果
                         let result = match rx.await {
-                            Ok(res) => res,
+                            Ok(Ok(resp)) => resp,                 // 正常响应
+                            Ok(Err(e)) => service_protocol::Response {
+                                success: false,
+                                data: e.into_bytes(),
+                            },
                             Err(_) => service_protocol::Response {
                                 success: false,
                                 data: b"service closed".to_vec(),

@@ -10,8 +10,13 @@ use std::error::Error;
 use log::{LogLevel, LogStruct};
 use net::{KeyManager, NetHandle};
 use node_controller::NodeController;
+use tokio::sync::mpsc;
 
-fn main() -> Result<(), Box<dyn Error>> {
+use crate::service_dispatcher::ServiceDispatcher;
+
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
     let config_handle = boot::init();
     if let Err(e) = net::update_config_with_public_ip(&config_handle) {
         LogStruct::new(LogLevel::Warning, "更新公网IP失败", e.to_string()).emit();
@@ -30,13 +35,27 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     }
 
-        let controller = NodeController::new(config_handle, net_handle, peer_id);
-    tokio::runtime::Runtime::new()?.block_on(async {
-        if let Err(e) = controller.run().await {
-            LogStruct::new(LogLevel::Critical, "节点运行错误", e.to_string()).emit();
-        }
-        Ok::<_, Box<dyn Error>>(())
-    })?;
+    //    cmd_tx -> ServiceDispatcher 发送命令给 NodeController
+    //    cmd_rx -> NodeController 接收命令
+    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+    //    inbound_req_tx -> NodeController 发送入站请求给 ServiceDispatcher
+    //    inbound_req_rx -> ServiceDispatcher 接收入站请求
+    let (inbound_req_tx, inbound_req_rx) = mpsc::unbounded_channel();
 
+    let dispatcher = ServiceDispatcher::new(inbound_req_rx, cmd_tx, config_handle.clone());
+    tokio::spawn(async move {
+        dispatcher.run().await;
+    });
+
+    let controller = NodeController::new(
+        config_handle,
+        net_handle,
+        peer_id,
+        cmd_rx,
+        inbound_req_tx,
+    );
+    if let Err(e) = controller.run().await {
+        LogStruct::new(LogLevel::Critical, "节点运行错误", e.to_string()).emit();
+    }
     Ok(())
 }
