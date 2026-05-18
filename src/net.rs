@@ -1,13 +1,17 @@
-use crate::{LogLevel, LogStruct, config::ConfigHandle};
 use crate::service_protocol;
+use crate::{LogLevel, LogStruct, config::ConfigHandle};
 use libp2p::request_response::{self, cbor};
 use libp2p::{
-    Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder, futures::StreamExt, identify, identity, kad, noise, ping, swarm::{NetworkBehaviour, SwarmEvent}, tcp, yamux
+    Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder,
+    futures::StreamExt,
+    identify, identity, kad, noise, ping,
+    swarm::{NetworkBehaviour, SwarmEvent},
+    tcp, yamux,
 };
 use std::{
     fs, io,
-    path::{Path, PathBuf},
     net::IpAddr,
+    path::{Path, PathBuf},
     sync::{Arc, RwLock},
     time::Duration,
 };
@@ -24,23 +28,31 @@ impl KeyManager {
 
         // 尝试读取并解析现有密钥文件
         match fs::read(path) {
-            Ok(bytes) => {
-                match identity::Keypair::from_protobuf_encoding(&bytes) {
-                    Ok(keypair) => {
-                        LogStruct::new(LogLevel::Important, "密钥加载成功", path.display().to_string()).emit();
-                        return Ok(KeyManager {
-                            keypair,
-                            path: path.to_path_buf(),
-                        });
-                    }
-                    Err(e) => {
-                        LogStruct::new(LogLevel::Error, "密钥文件解析失败", e.to_string()).emit();
-                        return Err(e.into());
-                    }
+            Ok(bytes) => match identity::Keypair::from_protobuf_encoding(&bytes) {
+                Ok(keypair) => {
+                    LogStruct::new(
+                        LogLevel::Important,
+                        "密钥加载成功",
+                        path.display().to_string(),
+                    )
+                    .emit();
+                    return Ok(KeyManager {
+                        keypair,
+                        path: path.to_path_buf(),
+                    });
                 }
-            }
+                Err(e) => {
+                    LogStruct::new(LogLevel::Error, "密钥文件解析失败", e.to_string()).emit();
+                    return Err(e.into());
+                }
+            },
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                LogStruct::new(LogLevel::Warning, "密钥文件不存在，将生成新密钥", path.display().to_string()).emit();
+                LogStruct::new(
+                    LogLevel::Warning,
+                    "密钥文件不存在，将生成新密钥",
+                    path.display().to_string(),
+                )
+                .emit();
             }
             Err(e) => {
                 LogStruct::new(LogLevel::Error, "无法读取密钥文件", e.to_string()).emit();
@@ -55,25 +67,49 @@ impl KeyManager {
         // 原子写入：先写临时文件，再重命名
         let temp_path = path.with_extension("tmp");
         if let Err(e) = fs::write(&temp_path, &encoded) {
-            LogStruct::new(LogLevel::Critical, "写入临时密钥文件失败", format!("路径: {}, 错误: {}", temp_path.display(), e)).emit();
+            LogStruct::new(
+                LogLevel::Critical,
+                "写入临时密钥文件失败",
+                format!("路径: {}, 错误: {}", temp_path.display(), e),
+            )
+            .emit();
             return Err(e.into());
         }
         if let Err(e) = fs::rename(&temp_path, path) {
             let _ = fs::remove_file(&temp_path);
-            LogStruct::new(LogLevel::Critical, "重命名密钥文件失败", format!("从 {} 到 {}, 错误: {}", temp_path.display(), path.display(), e)).emit();
+            LogStruct::new(
+                LogLevel::Critical,
+                "重命名密钥文件失败",
+                format!(
+                    "从 {} 到 {}, 错误: {}",
+                    temp_path.display(),
+                    path.display(),
+                    e
+                ),
+            )
+            .emit();
             return Err(e.into());
         }
 
-        LogStruct::new(LogLevel::Important, "新密钥生成并保存成功", path.display().to_string()).emit();
+        LogStruct::new(
+            LogLevel::Important,
+            "新密钥生成并保存成功",
+            path.display().to_string(),
+        )
+        .emit();
 
         Ok(KeyManager {
             keypair,
             path: path.to_path_buf(),
         })
     }
-    pub fn keypair(&self) -> &identity::Keypair { &self.keypair }
+    pub fn keypair(&self) -> &identity::Keypair {
+        &self.keypair
+    }
     /// 获取 peer id
-    pub fn peer_id(&self) -> PeerId { self.keypair.public().to_peer_id() }
+    pub fn peer_id(&self) -> PeerId {
+        self.keypair.public().to_peer_id()
+    }
 }
 
 /// 获取本机所有公网 IP
@@ -122,10 +158,20 @@ pub fn to_multiaddr(ip: IpAddr, port: u16) -> Multiaddr {
     addr
 }
 
-pub fn update_config_with_public_ip(config: &ConfigHandle) -> Result<(), Box<dyn std::error::Error>> {
+pub fn update_config_with_public_ip(
+    config: &ConfigHandle,
+) -> Result<(), Box<dyn std::error::Error>> {
     let public_ips = get_public_ips();
-    let ipv4_addrs: Vec<IpAddr> = public_ips.iter().filter(|ip| ip.is_ipv4()).copied().collect();
-    let ipv6_addrs: Vec<IpAddr> = public_ips.iter().filter(|ip| ip.is_ipv6()).copied().collect();
+    let ipv4_addrs: Vec<IpAddr> = public_ips
+        .iter()
+        .filter(|ip| ip.is_ipv4())
+        .copied()
+        .collect();
+    let ipv6_addrs: Vec<IpAddr> = public_ips
+        .iter()
+        .filter(|ip| ip.is_ipv6())
+        .copied()
+        .collect();
 
     if ipv4_addrs.is_empty() && ipv6_addrs.is_empty() {
         LogStruct::new(LogLevel::Warning, "未发现公网IP", "无法自动更新网络配置").emit();
@@ -176,7 +222,15 @@ pub fn update_config_with_public_ip(config: &ConfigHandle) -> Result<(), Box<dyn
 
     // 原子保存到文件
     config.save_to_default();
-    LogStruct::new(LogLevel::Preset, "网络配置已自动更新", format!("IPv4: {:?}, IPv6: {:?}, 公告地址: {:?}", ipv4_addrs, ipv6_addrs, announce_addrs)).emit();
+    LogStruct::new(
+        LogLevel::Preset,
+        "网络配置已自动更新",
+        format!(
+            "IPv4: {:?}, IPv6: {:?}, 公告地址: {:?}",
+            ipv4_addrs, ipv6_addrs, announce_addrs
+        ),
+    )
+    .emit();
     Ok(())
 }
 
@@ -198,16 +252,26 @@ pub enum NetBehaviourEvent {
 }
 
 impl From<ping::Event> for NetBehaviourEvent {
-    fn from(event: ping::Event) -> Self { NetBehaviourEvent::Ping(event) }
+    fn from(event: ping::Event) -> Self {
+        NetBehaviourEvent::Ping(event)
+    }
 }
 impl From<identify::Event> for NetBehaviourEvent {
-    fn from(event: identify::Event) -> Self { NetBehaviourEvent::Identify(event) }
+    fn from(event: identify::Event) -> Self {
+        NetBehaviourEvent::Identify(event)
+    }
 }
 impl From<kad::Event> for NetBehaviourEvent {
-    fn from(event: kad::Event) -> Self { NetBehaviourEvent::Kademlia(event) }
+    fn from(event: kad::Event) -> Self {
+        NetBehaviourEvent::Kademlia(event)
+    }
 }
-impl From<request_response::Event<service_protocol::Request, service_protocol::Response>> for NetBehaviourEvent {
-    fn from(event: request_response::Event<service_protocol::Request, service_protocol::Response>) -> Self {
+impl From<request_response::Event<service_protocol::Request, service_protocol::Response>>
+    for NetBehaviourEvent
+{
+    fn from(
+        event: request_response::Event<service_protocol::Request, service_protocol::Response>,
+    ) -> Self {
         NetBehaviourEvent::ServiceReq(event)
     }
 }
@@ -233,13 +297,21 @@ impl NetBehaviour {
         // Kademlia 配置
         let store = kad::store::MemoryStore::new(keypair.public().to_peer_id());
         let mut kad_config = kad::Config::new(StreamProtocol::new("/ipfs/kad/1.0.0"));
-        kad_config.set_record_ttl(Some(Duration::from_secs(config.kademlia_record_ttl().into())));
+        kad_config.set_record_ttl(Some(Duration::from_secs(
+            config.kademlia_record_ttl().into(),
+        )));
         kad_config.set_query_timeout(Duration::from_secs(config.kademlia_query_timeout().into()));
-        let mut kademlia = kad::Behaviour::with_config(keypair.public().to_peer_id(), store, kad_config);
+        let mut kademlia =
+            kad::Behaviour::with_config(keypair.public().to_peer_id(), store, kad_config);
         kademlia.set_mode(Some(kad::Mode::Server));
 
         let service_req = service_protocol::new_service_req_behaviour();
-        Self { ping, identify, kademlia, service_req }
+        Self {
+            ping,
+            identify,
+            kademlia,
+            service_req,
+        }
     }
 }
 
@@ -270,14 +342,20 @@ pub fn build_swarm(
                 addrs.push(to_multiaddr(ip, cfg.network.port as u16));
             } else {
                 // 监听所有接口
-                addrs.push(to_multiaddr(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), cfg.network.port as u16));
+                addrs.push(to_multiaddr(
+                    IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                    cfg.network.port as u16,
+                ));
             }
         }
         if cfg.network.ipv6_enabled {
             if let Some(ip) = cfg.network.ipv6_address {
                 addrs.push(to_multiaddr(ip, cfg.network.port as u16));
             } else {
-                addrs.push(to_multiaddr(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), cfg.network.port as u16));
+                addrs.push(to_multiaddr(
+                    IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+                    cfg.network.port as u16,
+                ));
             }
         }
         addrs
@@ -342,9 +420,8 @@ impl NetHandle {
 
     /// 拨号到指定地址
     pub fn dial(&self, addr: Multiaddr) -> Result<(), String> {
-        self.with_swarm_mut(|swarm| {
-            swarm.dial(addr).map_err(|e| e.to_string())
-        }).unwrap_or(Err("Swarm 未初始化".into()))
+        self.with_swarm_mut(|swarm| swarm.dial(addr).map_err(|e| e.to_string()))
+            .unwrap_or(Err("Swarm 未初始化".into()))
     }
 
     /// 运行事件循环，返回一个接收网络行为事件的通道

@@ -1,13 +1,13 @@
-use std::fs;
-use std::io::{Read, Write};
-use std::thread::spawn;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
 use chrono::{DateTime, Local};
+use colored::*;
 use flate2::Compression;
 use flate2::write::GzEncoder;
-use colored::*;
 use scopeguard::defer;
+use std::fs;
+use std::io::{Read, Write};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::spawn;
 
 static LOG_MUTEX: Mutex<()> = Mutex::new(());
 static ROLLING: AtomicBool = AtomicBool::new(false);
@@ -123,7 +123,8 @@ fn repair_tmp_file() {
         Err(_) => return,
     };
 
-    let tmp_time = tmp_metadata.created()
+    let tmp_time = tmp_metadata
+        .created()
         .map(|t| {
             let dt: DateTime<Local> = DateTime::from(t);
             dt.format("%m%d_%H%M").to_string()
@@ -148,21 +149,24 @@ fn perform_roll(file_metadata: fs::Metadata) {
                 // 清理后重试
                 let _guard = LOG_MUTEX.lock().unwrap();
                 if let Err(e) = fs::rename(LOG_PATH, TMP_LOG_PATH) {
-                    let critical = LogStruct::new(LogLevel::Critical, "无法重命名log文件", e.to_string());
+                    let critical =
+                        LogStruct::new(LogLevel::Critical, "无法重命名log文件", e.to_string());
                     log_onlycli(&critical);
                     return;
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
             Err(e) => {
-                let critical = LogStruct::new(LogLevel::Critical, "无法重命名log文件", e.to_string());
+                let critical =
+                    LogStruct::new(LogLevel::Critical, "无法重命名log文件", e.to_string());
                 log_onlycli(&critical);
                 return;
             }
             _ => {}
         }
     }
-    let timestamp = file_metadata.created()
+    let timestamp = file_metadata
+        .created()
         .map(|t| {
             let dt: DateTime<Local> = DateTime::from(t);
             dt.format("%m%d_%H%M").to_string()

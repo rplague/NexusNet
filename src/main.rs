@@ -1,19 +1,18 @@
 mod boot;
 mod config;
-mod net;
 mod log;
+mod net;
 mod node_controller;
-mod service_protocol;
 mod service_dispatcher;
+mod service_protocol;
 
-use std::error::Error;
 use log::{LogLevel, LogStruct};
 use net::{KeyManager, NetHandle};
 use node_controller::NodeController;
+use std::error::Error;
 use tokio::sync::mpsc;
 
 use crate::service_dispatcher::ServiceDispatcher;
-
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -23,7 +22,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
     let key_manager = KeyManager::load_or_create("keypair.bin")?;
     let peer_id = key_manager.peer_id();
-    LogStruct::new(LogLevel::Important, "节点身份", format!("PeerId: {}", peer_id)).emit();
+    LogStruct::new(
+        LogLevel::Important,
+        "节点身份",
+        format!("PeerId: {}", peer_id),
+    )
+    .emit();
 
     let net_handle = NetHandle::new(config_handle.clone());
     net_handle.start(&key_manager)?;
@@ -47,13 +51,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         dispatcher.run().await;
     });
 
-    let controller = NodeController::new(
-        config_handle,
-        net_handle,
-        peer_id,
-        cmd_rx,
-        inbound_req_tx,
-    );
+    let controller =
+        NodeController::new(config_handle, net_handle, peer_id, cmd_rx, inbound_req_tx);
     if let Err(e) = controller.run().await {
         LogStruct::new(LogLevel::Critical, "节点运行错误", e.to_string()).emit();
     }
