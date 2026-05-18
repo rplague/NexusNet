@@ -1,227 +1,370 @@
-use crate::config::NodeConfig;
-use libp2p::multiaddr::Protocol;
+use crate::{LogLevel, LogStruct, config::ConfigHandle};
+use crate::service_protocol;
+use libp2p::request_response::{self, cbor};
 use libp2p::{
-    Multiaddr, PeerId, StreamProtocol, identify, identity, kad, ping, swarm::NetworkBehaviour,
+    Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder, futures::StreamExt, identify, identity, kad, noise, ping, swarm::{NetworkBehaviour, SwarmEvent}, tcp, yamux
 };
-use std::fs;
-use std::net::IpAddr;
-use std::time::Duration;
+use std::{
+    fs, io,
+    path::{Path, PathBuf},
+    net::IpAddr,
+    sync::{Arc, RwLock},
+    time::Duration,
+};
+use tokio::sync::mpsc;
+pub struct KeyManager {
+    keypair: identity::Keypair,
+    path: PathBuf,
+}
 
-// 导入Kademlia相关类型
-use libp2p::kad::store::MemoryStore;
+impl KeyManager {
+    /// 从指定路径加载密钥，若不存在则生成并原子保存
+    pub fn load_or_create(path: impl AsRef<Path>) -> Result<Self, Box<dyn std::error::Error>> {
+        let path = path.as_ref();
 
-use crate::addr_watcher;
-use crate::request_handler::{ServiceRequest, ServiceResponse};
-use libp2p::request_response;
+        // 尝试读取并解析现有密钥文件
+        match fs::read(path) {
+            Ok(bytes) => {
+                match identity::Keypair::from_protobuf_encoding(&bytes) {
+                    Ok(keypair) => {
+                        LogStruct::new(LogLevel::Important, "密钥加载成功", path.display().to_string()).emit();
+                        return Ok(KeyManager {
+                            keypair,
+                            path: path.to_path_buf(),
+                        });
+                    }
+                    Err(e) => {
+                        LogStruct::new(LogLevel::Error, "密钥文件解析失败", e.to_string()).emit();
+                        return Err(e.into());
+                    }
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                LogStruct::new(LogLevel::Warning, "密钥文件不存在，将生成新密钥", path.display().to_string()).emit();
+            }
+            Err(e) => {
+                LogStruct::new(LogLevel::Error, "无法读取密钥文件", e.to_string()).emit();
+                return Err(e.into());
+            }
+        }
 
-// 定义组合行为
+        // 生成新密钥对
+        let keypair = identity::Keypair::generate_ed25519();
+        let encoded = keypair.to_protobuf_encoding()?;
+
+        // 原子写入：先写临时文件，再重命名
+        let temp_path = path.with_extension("tmp");
+        if let Err(e) = fs::write(&temp_path, &encoded) {
+            LogStruct::new(LogLevel::Critical, "写入临时密钥文件失败", format!("路径: {}, 错误: {}", temp_path.display(), e)).emit();
+            return Err(e.into());
+        }
+        if let Err(e) = fs::rename(&temp_path, path) {
+            let _ = fs::remove_file(&temp_path);
+            LogStruct::new(LogLevel::Critical, "重命名密钥文件失败", format!("从 {} 到 {}, 错误: {}", temp_path.display(), path.display(), e)).emit();
+            return Err(e.into());
+        }
+
+        LogStruct::new(LogLevel::Important, "新密钥生成并保存成功", path.display().to_string()).emit();
+
+        Ok(KeyManager {
+            keypair,
+            path: path.to_path_buf(),
+        })
+    }
+    pub fn keypair(&self) -> &identity::Keypair { &self.keypair }
+    /// 获取 peer id
+    pub fn peer_id(&self) -> PeerId { self.keypair.public().to_peer_id() }
+}
+
+/// 获取本机所有公网 IP
+pub fn get_public_ips() -> Vec<IpAddr> {
+    let mut ips = Vec::new();
+    if let Ok(ifaces) = get_if_addrs::get_if_addrs() {
+        for iface in ifaces {
+            let ip = iface.addr.ip();
+            match ip {
+                IpAddr::V4(v4) => {
+                    if !v4.is_loopback() && !v4.is_private() && !v4.is_link_local() {
+                        ips.push(IpAddr::V4(v4));
+                    }
+                }
+                IpAddr::V6(v6) => {
+                    if v6.is_loopback() || v6.is_unspecified() || v6.is_multicast() {
+                        continue;
+                    }
+                    let octets = v6.octets();
+                    if octets[0] == 0xfe && (octets[1] & 0xc0) == 0x80 {
+                        continue;
+                    }
+                    if octets[0] == 0xfc || octets[0] == 0xfd {
+                        continue;
+                    }
+                    ips.push(IpAddr::V6(v6));
+                }
+            }
+        }
+    }
+    ips
+}
+
+/// 将 IP + 端口转换为 Multiaddr
+pub fn to_multiaddr(ip: IpAddr, port: u16) -> Multiaddr {
+    let mut addr = Multiaddr::empty();
+    match ip {
+        IpAddr::V4(v4) => {
+            addr.push(libp2p::multiaddr::Protocol::Ip4(v4));
+        }
+        IpAddr::V6(v6) => {
+            addr.push(libp2p::multiaddr::Protocol::Ip6(v6));
+        }
+    }
+    addr.push(libp2p::multiaddr::Protocol::Tcp(port));
+    addr
+}
+
+pub fn update_config_with_public_ip(config: &ConfigHandle) -> Result<(), Box<dyn std::error::Error>> {
+    let public_ips = get_public_ips();
+    let ipv4_addrs: Vec<IpAddr> = public_ips.iter().filter(|ip| ip.is_ipv4()).copied().collect();
+    let ipv6_addrs: Vec<IpAddr> = public_ips.iter().filter(|ip| ip.is_ipv6()).copied().collect();
+
+    if ipv4_addrs.is_empty() && ipv6_addrs.is_empty() {
+        LogStruct::new(LogLevel::Warning, "未发现公网IP", "无法自动更新网络配置").emit();
+        return Ok(());
+    }
+
+    let port = config.listen_port();
+    let mut announce_addrs = Vec::new();
+    for ip in &ipv4_addrs {
+        announce_addrs.push(to_multiaddr(*ip, port as u16));
+    }
+    for ip in &ipv6_addrs {
+        announce_addrs.push(to_multiaddr(*ip, port as u16));
+    }
+
+    {
+        let cfg = config.read();
+        let current_ipv4 = cfg.network.ipv4_address;
+        let current_ipv6 = cfg.network.ipv6_address;
+        let current_announce = &cfg.network.announce_addresses;
+
+        if current_ipv4 == ipv4_addrs.first().copied()
+            && current_ipv6 == ipv6_addrs.first().copied()
+            && current_announce == &announce_addrs
+        {
+            return Ok(());
+        }
+    }
+
+    {
+        let mut cfg = config.write();
+        if !ipv4_addrs.is_empty() {
+            cfg.network.ipv4_enabled = true;
+            cfg.network.ipv4_address = ipv4_addrs.first().copied();
+        } else {
+            cfg.network.ipv4_enabled = false;
+            cfg.network.ipv4_address = None;
+        }
+        if !ipv6_addrs.is_empty() {
+            cfg.network.ipv6_enabled = true;
+            cfg.network.ipv6_address = ipv6_addrs.first().copied();
+        } else {
+            cfg.network.ipv6_enabled = false;
+            cfg.network.ipv6_address = None;
+        }
+        cfg.network.announce_addresses = announce_addrs.clone();
+    }
+
+    // 原子保存到文件
+    config.save_to_default();
+    LogStruct::new(LogLevel::Preset, "网络配置已自动更新", format!("IPv4: {:?}, IPv6: {:?}, 公告地址: {:?}", ipv4_addrs, ipv6_addrs, announce_addrs)).emit();
+    Ok(())
+}
+
 #[derive(NetworkBehaviour)]
 #[behaviour(out_event = "NetBehaviourEvent")]
 pub struct NetBehaviour {
     pub ping: ping::Behaviour,
     pub identify: identify::Behaviour,
-    pub kademlia: kad::Behaviour<MemoryStore>,
-    pub addr_watcher: addr_watcher::Behaviour,
-    pub request_response: request_response::cbor::Behaviour<ServiceRequest, ServiceResponse>,
+    pub kademlia: kad::Behaviour<kad::store::MemoryStore>,
+    pub service_req: cbor::Behaviour<service_protocol::Request, service_protocol::Response>,
 }
 
-// 定义行为事件枚举
 #[derive(Debug)]
-#[allow(clippy::large_enum_variant)]
 pub enum NetBehaviourEvent {
     Ping(ping::Event),
     Identify(identify::Event),
     Kademlia(kad::Event),
-    AddrWatcher(addr_watcher::AddrWatcherEvent),
-    RequestResponse(request_response::Event<ServiceRequest, ServiceResponse>),
+    ServiceReq(request_response::Event<service_protocol::Request, service_protocol::Response>),
 }
 
-// 实现 From trait 用于事件转换
 impl From<ping::Event> for NetBehaviourEvent {
-    fn from(event: ping::Event) -> Self {
-        NetBehaviourEvent::Ping(event)
-    }
+    fn from(event: ping::Event) -> Self { NetBehaviourEvent::Ping(event) }
 }
-
 impl From<identify::Event> for NetBehaviourEvent {
-    fn from(event: identify::Event) -> Self {
-        NetBehaviourEvent::Identify(event)
-    }
+    fn from(event: identify::Event) -> Self { NetBehaviourEvent::Identify(event) }
 }
-
 impl From<kad::Event> for NetBehaviourEvent {
-    fn from(event: kad::Event) -> Self {
-        NetBehaviourEvent::Kademlia(event)
+    fn from(event: kad::Event) -> Self { NetBehaviourEvent::Kademlia(event) }
+}
+impl From<request_response::Event<service_protocol::Request, service_protocol::Response>> for NetBehaviourEvent {
+    fn from(event: request_response::Event<service_protocol::Request, service_protocol::Response>) -> Self {
+        NetBehaviourEvent::ServiceReq(event)
     }
 }
 
-impl From<addr_watcher::AddrWatcherEvent> for NetBehaviourEvent {
-    fn from(event: addr_watcher::AddrWatcherEvent) -> Self {
-        NetBehaviourEvent::AddrWatcher(event)
+impl NetBehaviour {
+    pub fn new(config: &ConfigHandle, keypair: &identity::Keypair) -> Self {
+        // Ping 配置
+        let ping_config = ping::Config::new()
+            .with_interval(Duration::from_secs(config.ping_interval().into()))
+            .with_timeout(Duration::from_secs(config.ping_timeout().into()));
+        let ping = ping::Behaviour::new(ping_config);
+
+        // Identify 配置
+        let protocol_name = "/oahd";
+        let identify_config = identify::Config::new(
+            format!("{}/{}", protocol_name, env!("CARGO_PKG_VERSION")),
+            keypair.public(),
+        )
+        .with_agent_version(format!("{}/{}", protocol_name, env!("CARGO_PKG_VERSION")))
+        .with_push_listen_addr_updates(true);
+        let identify = identify::Behaviour::new(identify_config);
+
+        // Kademlia 配置
+        let store = kad::store::MemoryStore::new(keypair.public().to_peer_id());
+        let mut kad_config = kad::Config::new(StreamProtocol::new("/ipfs/kad/1.0.0"));
+        kad_config.set_record_ttl(Some(Duration::from_secs(config.kademlia_record_ttl().into())));
+        kad_config.set_query_timeout(Duration::from_secs(config.kademlia_query_timeout().into()));
+        let mut kademlia = kad::Behaviour::with_config(keypair.public().to_peer_id(), store, kad_config);
+        kademlia.set_mode(Some(kad::Mode::Server));
+
+        let service_req = service_protocol::new_service_req_behaviour();
+        Self { ping, identify, kademlia, service_req }
     }
 }
 
-impl From<request_response::Event<ServiceRequest, ServiceResponse>> for NetBehaviourEvent {
-    fn from(event: request_response::Event<ServiceRequest, ServiceResponse>) -> Self {
-        NetBehaviourEvent::RequestResponse(event)
-    }
-}
+// let mut swarm = SwarmBuilder::with_existing_identity(keypair)
+//         .with_tokio()
+//         .with_tcp(
+//             tcp::Config::default(),
+//             noise::Config::new,
+//             yamux::Config::default,
+//         )?
+//         .with_behaviour(|_| behaviour)?
+//         .with_swarm_config(|config| config.with_idle_connection_timeout(Duration::from_secs(300)))
+//         .build();
 
-pub fn get_network_addresses() -> Result<(String, String), Box<dyn std::error::Error>> {
-    let mut ipv4_addresses = String::new();
-    let mut ipv6_addresses = String::new();
+pub fn build_swarm(
+    config: &ConfigHandle,
+    keymanager: &KeyManager,
+) -> Result<Swarm<NetBehaviour>, Box<dyn std::error::Error>> {
+    let keypair = keymanager.keypair();
+    let behaviour = NetBehaviour::new(config, keypair);
 
-    // 获取所有网络接口的IP地址
-    for iface in get_if_addrs::get_if_addrs()? {
-        let addr = iface.addr;
-
-        match addr.ip() {
-            IpAddr::V4(ipv4) => {
-                // 过滤掉本地回环和私有地址
-                if !ipv4.is_loopback() && !ipv4.is_private() && !ipv4.is_link_local() {
-                    ipv4_addresses = ipv4.to_string();
-                }
+    // 获取监听地址（从配置中读取）
+    let listen_addrs: Vec<Multiaddr> = {
+        let cfg = config.read();
+        let mut addrs = Vec::new();
+        if cfg.network.ipv4_enabled {
+            if let Some(ip) = cfg.network.ipv4_address {
+                addrs.push(to_multiaddr(ip, cfg.network.port as u16));
+            } else {
+                // 监听所有接口
+                addrs.push(to_multiaddr(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), cfg.network.port as u16));
             }
-            IpAddr::V6(ipv6) => {
-                // 过滤掉本地回环、本地链路和唯一本地地址
-                if !(ipv6.is_loopback()
-                  || ipv6.is_unspecified()
-                  || ipv6.is_multicast()
-                  || ipv6.octets()[0] == 0xfe || (ipv6.octets()[1] & 0xc0) == 0x80 // 本地链路地址 fe80::/10
-                  || (ipv6.octets()[0] == 0xfc || ipv6.octets()[0] == 0xfd))
-                // 唯一本地地址 fc00::/7
-                {
-                    ipv6_addresses = ipv6.to_string();
-                }
+        }
+        if cfg.network.ipv6_enabled {
+            if let Some(ip) = cfg.network.ipv6_address {
+                addrs.push(to_multiaddr(ip, cfg.network.port as u16));
+            } else {
+                addrs.push(to_multiaddr(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), cfg.network.port as u16));
             }
+        }
+        addrs
+    };
+
+    let mut swarm = SwarmBuilder::with_existing_identity(keypair.clone())
+        .with_tokio()
+        .with_tcp(
+            tcp::Config::default(),
+            noise::Config::new,
+            yamux::Config::default,
+        )?
+        .with_behaviour(|_| behaviour)?
+        .with_swarm_config(|config| config.with_idle_connection_timeout(Duration::from_secs(300)))
+        .build();
+
+    for addr in listen_addrs {
+        swarm.listen_on(addr)?;
+    }
+
+    Ok(swarm)
+}
+
+#[derive(Clone)]
+pub struct NetHandle {
+    config: ConfigHandle,
+    swarm: Arc<RwLock<Option<Swarm<NetBehaviour>>>>,
+}
+
+impl NetHandle {
+    pub fn new(config: ConfigHandle) -> Self {
+        Self {
+            config,
+            swarm: Arc::new(RwLock::new(None)),
         }
     }
 
-    Ok((ipv4_addresses, ipv6_addresses))
-}
-
-pub fn appropriate_address_filter(
-    listen_addrs: &[Multiaddr],
-    config: &NodeConfig,
-) -> Option<Multiaddr> {
-    // 定义优先级：如果两者都启用，IPv4优先
-    let preferred_order = if config.network.ipv4_enabled && config.network.ipv6_enabled {
-        vec![
-            Protocol::Ip4([0, 0, 0, 0].into()),
-            Protocol::Ip6([0, 0, 0, 0, 0, 0, 0, 0].into()),
-        ]
-    } else if config.network.ipv4_enabled {
-        vec![Protocol::Ip4([0, 0, 0, 0].into())]
-    } else if config.network.ipv6_enabled {
-        vec![Protocol::Ip6([0, 0, 0, 0, 0, 0, 0, 0].into())]
-    } else {
-        return None; // 两者都禁用
-    };
-
-    // 按优先级查找地址
-    for protocol_type in preferred_order {
-        for addr in listen_addrs {
-            if addr.iter().any(|proto| {
-                matches!(proto, Protocol::Ip4(_)) && matches!(protocol_type, Protocol::Ip4(_))
-                    || matches!(proto, Protocol::Ip6(_))
-                        && matches!(protocol_type, Protocol::Ip6(_))
-            }) {
-                return Some(addr.clone());
-            }
-        }
+    /// 启动网络（必须调用一次以初始化 Swarm）
+    pub fn start(&self, keymanager: &KeyManager) -> Result<(), Box<dyn std::error::Error>> {
+        let swarm = build_swarm(&self.config, keymanager)?;
+        *self.swarm.write().unwrap() = Some(swarm);
+        Ok(())
     }
 
-    None
-}
+    /// 访问 Swarm（只读）
+    pub fn with_swarm<F, R>(&self, f: F) -> Option<R>
+    where
+        F: FnOnce(&Swarm<NetBehaviour>) -> R,
+    {
+        let guard = self.swarm.read().unwrap();
+        guard.as_ref().map(f)
+    }
 
-pub fn get_key() -> Result<identity::Keypair, Box<dyn std::error::Error>> {
-    let keypair = if std::path::Path::new("keypair.bin").exists() {
-        let bytes = fs::read("keypair.bin")?;
-        identity::Keypair::from_protobuf_encoding(&bytes)?
-    } else {
-        let keypair = identity::Keypair::generate_ed25519();
-        let encoded = keypair.to_protobuf_encoding()?;
-        fs::write("keypair.bin", &encoded)?;
-        keypair
-    };
+    /// 修改 Swarm（写）
+    pub fn with_swarm_mut<F, R>(&self, f: F) -> Option<R>
+    where
+        F: FnOnce(&mut Swarm<NetBehaviour>) -> R,
+    {
+        let mut guard = self.swarm.write().unwrap();
+        guard.as_mut().map(f)
+    }
 
-    Ok(keypair)
-}
+    /// 拨号到指定地址
+    pub fn dial(&self, addr: Multiaddr) -> Result<(), String> {
+        self.with_swarm_mut(|swarm| {
+            swarm.dial(addr).map_err(|e| e.to_string())
+        }).unwrap_or(Err("Swarm 未初始化".into()))
+    }
 
-pub fn create_behaviour(
-    keypair: &identity::Keypair,
-    protocol_name: &str,
-    config: &NodeConfig,
-) -> Result<NetBehaviour, Box<dyn std::error::Error>> {
-    // Ping 配置
-    let ping_config = ping::Config::new()
-        .with_interval(std::time::Duration::from_secs(15))
-        .with_timeout(std::time::Duration::from_secs(10));
+    /// 运行事件循环，返回一个接收网络行为事件的通道
+    pub async fn run(&mut self) -> mpsc::UnboundedReceiver<NetBehaviourEvent> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let swarm_opt = {
+            let mut w = self.swarm.write().unwrap();
+            w.take()
+        };
+        let swarm = swarm_opt.expect("swarm not started");
+        tokio::spawn(async move {
+            let mut swarm = swarm;
+            loop {
+                let event = swarm.select_next_some().await;
+                if let SwarmEvent::Behaviour(bev) = event {
+                    let _ = tx.send(bev);
+                }
+            }
+        });
 
-    // Identify 配置
-    let identify_config = identify::Config::new(
-        format!("{}/{}", protocol_name, env!("CARGO_PKG_VERSION")),
-        keypair.public(),
-    )
-    .with_agent_version(format!("{}/{}", protocol_name, env!("CARGO_PKG_VERSION")))
-    .with_push_listen_addr_updates(true);
-
-    // Kademlia 配置
-    let store = MemoryStore::new(keypair.public().to_peer_id());
-    let mut kademlia_config = kad::Config::new(libp2p::StreamProtocol::new("/ipfs/kad/1.0.0"));
-    kademlia_config.set_record_ttl(Some(std::time::Duration::from_secs(3600)));
-    kademlia_config.set_periodic_bootstrap_interval(Some(std::time::Duration::from_secs(20)));
-    let mut kademlia =
-        kad::Behaviour::with_config(keypair.public().to_peer_id(), store, kademlia_config);
-    kademlia.set_mode(Some(kad::Mode::Server));
-    // 请求/响应 behaviour（边车通信协议）
-    let req_res_config =
-        request_response::Config::default().with_request_timeout(Duration::from_secs(60));
-    let request_response = request_response::cbor::Behaviour::new(
-        vec![(
-            StreamProtocol::new("/oahd/req/1.0.0"),
-            request_response::ProtocolSupport::Full,
-        )],
-        req_res_config,
-    );
-
-    // 创建组合行为
-    let behaviour = NetBehaviour {
-        ping: ping::Behaviour::new(ping_config),
-        identify: identify::Behaviour::new(identify_config),
-        kademlia,
-        addr_watcher: addr_watcher::Behaviour::new(&config.services.address_watcher),
-        request_response,
-    };
-
-    Ok(behaviour)
-}
-
-// 节点连接列表构建
-
-// 节点连接状态
-#[derive(Debug, Clone, PartialEq)]
-pub enum ConnectionStatus {
-    Connected,    // 已连接
-    Disconnected, // 未连接
-}
-
-#[derive(Debug, Clone)]
-pub struct PeerInfo {
-    // 基础信息
-    pub peer_id: PeerId,
-    // 本机实际观测到的地址
-    pub observed_addresses: Option<Multiaddr>,
-    // 连接的对方地址
-    pub addresses: Option<Multiaddr>,
-    // 公钥
-    pub public_key: Option<identity::PublicKey>,
-    // 延迟
-    pub rtt: Option<std::time::Duration>,
-    // 连接状态
-    pub connection_status: ConnectionStatus,
-    // 节点支持的协议
-    pub supported_protocols: Option<Vec<StreamProtocol>>,
-    // 版本
-    pub agent_version: Option<String>,
+        rx
+    }
 }

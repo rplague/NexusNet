@@ -1,400 +1,292 @@
-#![allow(dead_code)]
-
-use crate::config::DispatcherConfig;
-use crate::{LogLevel, LogStruct};
-use serde::Deserialize;
 use std::collections::HashMap;
-use std::io::{Read, Write};
-use std::net::TcpStream;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::Duration;
-use tokio::sync::mpsc;
-use tokio::sync::oneshot;
+use std::sync::Arc;
 
-// ─── 命令通道 ──────────────────────────────────────────────
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio::time::{timeout, Duration};
+use uuid::Uuid;
 
-/// 后端通过 @call_remote 请求节点发送 P2P 远程调用
-#[derive(Debug)]
-pub enum ManagerCommand {
-    CallRemote {
-        peer: String,
-        service: String,
-        payload: Vec<u8>,
-        response_tx: oneshot::Sender<Result<Vec<u8>, String>>,
-    },
+use crate::config::{ConfigHandle, LocalServiceEntry};
+use crate::log::{LogStruct, LogLevel};
+use crate::service_protocol;
+
+pub struct Command {
+    pub prefix: String,
+    pub content: String,
+    pub payload: Vec<u8>,
+    pub resp_tx: oneshot::Sender<Result<Vec<u8>, String>>,
 }
 
-// ─── JSON 请求格式 ─────────────────────────────────────────
-
-/// 后端主动请求的 JSON：{"service": "xxx", "payload": "base64..."}
-#[derive(Debug, Deserialize)]
-struct BackendServiceReq {
-    service: String,
-    #[serde(with = "base64_bytes")]
-    payload: Vec<u8>,
+pub struct InboundServiceRequest {
+    pub service: String,
+    pub payload: Vec<u8>,
+    pub response_tx: oneshot::Sender<Result<service_protocol::Response, String>>,
 }
-
-/// @call_remote 的参数 JSON：{"peer": "...", "service": "...", "data": "base64..."}
-#[derive(Debug, Deserialize)]
-struct CallRemoteReq {
-    peer: String,
-    service: String,
-    #[serde(with = "base64_bytes")]
-    data: Vec<u8>,
-}
-
-/// base64 编解码模块
-mod base64_bytes {
-    use serde::{Deserialize, Deserializer, Serializer};
-
-    pub fn serialize<S>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes);
-        serializer.serialize_str(&encoded)
-    }
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let s = String::deserialize(deserializer)?;
-        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &s)
-            .map_err(serde::de::Error::custom)
-    }
-}
-
-// ─── 帧协议 ──────────────────────────────────────────────
-//
-// [4-byte total_len][4-byte req_id][payload]
-//   total_len       = req_id(4) + payload 的总字节数
-//   req_id (偶数)   = 节点→后端（转发请求）
-//   req_id (奇数)   = 后端→节点（后端主动请求）
-//   读端通过奇偶区分：偶数 = 对转发请求的响应，奇数 = 后端发来的请求
-
-// ─── 后端持久连接 ──────────────────────────────────────────
-
-struct BackendConn {
-    writer: Mutex<TcpStream>,
-    /// 挂起的转发请求：req_id → 响应接收通道
-    pending: Mutex<HashMap<u32, std::sync::mpsc::Sender<Result<Vec<u8>, String>>>>,
-    /// 转发请求 ID（节点→后端，偶数）
-    next_fwd_id: AtomicU32,
-    name: String,
-}
-
-impl BackendConn {
-    fn connect(name: &str, addr: &str) -> Result<(Arc<Self>, TcpStream), String> {
-        let stream = TcpStream::connect(addr)
-            .map_err(|e| format!("连接后端 {} ({}): {}", name, addr, e))?;
-        let reader = stream
-            .try_clone()
-            .map_err(|e| format!("克隆连接 {}: {}", name, e))?;
-
-        let conn = Arc::new(BackendConn {
-            writer: Mutex::new(stream),
-            pending: Mutex::new(HashMap::new()),
-            next_fwd_id: AtomicU32::new(0),
-            name: name.to_string(),
-        });
-
-        Ok((conn, reader))
-    }
-
-    /// 发送转发请求（偶数 req_id），阻塞等待响应
-    fn forward(&self, payload: &[u8]) -> Result<Vec<u8>, String> {
-        let req_id = self.next_fwd_id.fetch_add(2, Ordering::Relaxed);
-        let (tx, rx) = std::sync::mpsc::channel();
-
-        {
-            let mut pending = self.pending.lock().map_err(|e| e.to_string())?;
-            pending.insert(req_id, tx);
-        }
-
-        let total_len = 4u32 + payload.len() as u32;
-        let mut buf = Vec::with_capacity(8 + payload.len());
-        buf.extend_from_slice(&total_len.to_be_bytes());
-        buf.extend_from_slice(&req_id.to_be_bytes());
-        buf.extend_from_slice(payload);
-
-        {
-            let mut writer = self.writer.lock().map_err(|e| e.to_string())?;
-            writer
-                .write_all(&buf)
-                .map_err(|e| format!("写入后端 {} 失败: {}", self.name, e))?;
-            writer.flush().map_err(|e| format!("刷新失败: {}", e))?;
-        }
-
-        rx.recv_timeout(Duration::from_secs(10))
-            .map_err(|_| format!("等待后端 {} 响应超时", self.name))?
-    }
-}
-
-// ─── 读线程 ────────────────────────────────────────────────
-
-fn reader_loop(
-    mut reader: TcpStream,
-    conn: Arc<BackendConn>,
-    name: &str,
-    cmd_tx: mpsc::Sender<ManagerCommand>,
-    dispatcher: Arc<ServiceDispatcher>,
-) {
-    let name = name.to_string();
-    loop {
-        // 读帧头：4 字节 total_len
-        let mut len_buf = [0u8; 4];
-        if let Err(e) = reader.read_exact(&mut len_buf) {
-            log_info(
-                "服务调度器".to_string(),
-                format!("后端 {} 连接断开: {}", name, e),
-            );
-            break;
-        }
-        let total_len = u32::from_be_bytes(len_buf) as usize;
-        if total_len < 4 {
-            log_info(
-                "服务调度器".to_string(),
-                format!("后端 {} 帧格式错误 (total_len={})", name, total_len),
-            );
-            break;
-        }
-
-        // 读 req_id + payload
-        let mut body = vec![0u8; total_len];
-        if let Err(e) = reader.read_exact(&mut body) {
-            log_info(
-                "服务调度器".to_string(),
-                format!("后端 {} 读帧体失败: {}", name, e),
-            );
-            break;
-        }
-
-        let req_id = u32::from_be_bytes(body[..4].try_into().unwrap());
-        let payload = &body[4..];
-
-        // 偶数 req_id = 转发请求的响应，奇数 = 后端请求
-        if req_id % 2 == 0 {
-            // 响应：交付给挂起的转发请求
-            let sender = {
-                let mut pending = match conn.pending.lock() {
-                    Ok(g) => g,
-                    Err(_) => break,
-                };
-                pending.remove(&req_id)
-            };
-            if let Some(sender) = sender {
-                let _ = sender.send(Ok(payload.to_vec()));
-            } else {
-                log_info(
-                    "服务调度器".to_string(),
-                    format!("后端 {} 收到未预期的响应 req_id={}", name, req_id),
-                );
-            }
-        } else {
-            // 请求：后端主动发起，需要处理并回复
-            let result = handle_backend_request(payload, &dispatcher, &cmd_tx);
-
-            // 写响应帧回后端
-            let resp_payload = match &result {
-                Ok(data) => data.clone(),
-                Err(e) => e.as_bytes().to_vec(),
-            };
-            let resp_len = 4u32 + resp_payload.len() as u32;
-            let mut resp_buf = Vec::with_capacity(8 + resp_payload.len());
-            resp_buf.extend_from_slice(&resp_len.to_be_bytes());
-            resp_buf.extend_from_slice(&req_id.to_be_bytes());
-            resp_buf.extend_from_slice(&resp_payload);
-
-            if let Ok(mut writer) = conn.writer.lock() {
-                let _ = writer.write_all(&resp_buf);
-                let _ = writer.flush();
-            }
-        }
-    }
-}
-
-/// 处理后端发起的请求（在读线程中调用）
-fn handle_backend_request(
-    payload: &[u8],
-    dispatcher: &ServiceDispatcher,
-    cmd_tx: &mpsc::Sender<ManagerCommand>,
-) -> Result<Vec<u8>, String> {
-    let req: BackendServiceReq =
-        serde_json::from_slice(payload).map_err(|e| format!("解析后端请求: {}", e))?;
-
-    if let Some(cmd) = req.service.strip_prefix('@') {
-        handle_internal_command(cmd, &req.payload, dispatcher, cmd_tx)
-    } else {
-        // 后端可以请求其他服务（后端间互调）
-        dispatcher.forward(&req.service, &req.payload)
-    }
-}
-
-// ─── 内置命令处理 ──────────────────────────────────────────
-
-fn handle_internal_command(
-    cmd: &str,
-    payload: &[u8],
-    dispatcher: &ServiceDispatcher,
-    cmd_tx: &mpsc::Sender<ManagerCommand>,
-) -> Result<Vec<u8>, String> {
-    match cmd {
-        "ping" => Ok(b"pong".to_vec()),
-
-        "list_services" => {
-            let names = dispatcher.get_service_names();
-            serde_json::to_vec(&names).map_err(|e| e.to_string())
-        }
-
-        "call_remote" => {
-            let req: CallRemoteReq = serde_json::from_slice(payload)
-                .map_err(|e| format!("解析 call_remote 参数: {}", e))?;
-
-            let (tx, rx) = oneshot::channel();
-
-            // 用临时 tokio runtime 发送 async 消息到主循环
-            let rt =
-                tokio::runtime::Runtime::new().map_err(|e| format!("创建 runtime: {}", e))?;
-            rt.block_on(async {
-                cmd_tx
-                    .send(ManagerCommand::CallRemote {
-                        peer: req.peer,
-                        service: req.service,
-                        payload: req.data,
-                        response_tx: tx,
-                    })
-                    .await
-                    .map_err(|e| format!("发送到主循环: {}", e))
-            })?;
-
-            // 阻塞等待远程调用结果
-            rx.blocking_recv()
-                .map_err(|_| "远程调用未收到响应".to_string())?
-        }
-
-        other => Err(format!("未知内部命令: @{}", other)),
-    }
-}
-
-// ─── ServiceDispatcher ─────────────────────────────────────
 
 pub struct ServiceDispatcher {
-    config: DispatcherConfig,
-    backends: Mutex<HashMap<String, Arc<BackendConn>>>,
+    inbound_rx: mpsc::UnboundedReceiver<InboundServiceRequest>,
+    cmd_tx: mpsc::UnboundedSender<Command>,
+    config: ConfigHandle,
+    local_services: Vec<LocalServiceEntry>,
+    pending_requests: HashMap<String, Arc<Mutex<HashMap<String, oneshot::Sender<Result<Vec<u8>, String>>>>>>,
+    backend_writers: HashMap<String, Arc<Mutex<OwnedWriteHalf>>>,
 }
 
 impl ServiceDispatcher {
-    pub fn new(config: &DispatcherConfig) -> Self {
-        if config.enabled {
-            let count = config.local_services.len();
-            log_info(
-                "服务调度器".to_string(),
-                format!("已加载 {} 个本地服务路由", count),
-            );
-            for entry in &config.local_services {
-                log_info(
-                    "服务调度器".to_string(),
-                    format!("  {} -> {}:{}", entry.name, entry.host, entry.port),
-                );
-            }
-        }
 
-        ServiceDispatcher {
-            config: config.clone(),
-            backends: Mutex::new(HashMap::new()),
+    pub fn new(
+        inbound_rx: mpsc::UnboundedReceiver<InboundServiceRequest>,
+        cmd_tx: mpsc::UnboundedSender<Command>,
+        config: ConfigHandle,
+    ) -> Self {
+        let local_services = config.read().services.dispatcher.local_services.clone();
+        let mut pending_requests = HashMap::new();
+        for svc in &local_services {
+            pending_requests.insert(svc.name.clone(), Arc::new(Mutex::new(HashMap::new())));
+        }
+        Self {
+            inbound_rx,
+            cmd_tx,
+            config,
+            local_services,
+            pending_requests,
+            backend_writers: HashMap::new(),
         }
     }
 
-    /// 连接所有后端并启动读线程
-    ///
-    /// 需要 self 已被 Arc 包装（读线程需要 Arc<ServiceDispatcher>）。
-    /// 返回连接失败的服务名列表。
-    pub fn connect_all(
-        self: &Arc<Self>,
-        cmd_tx: mpsc::Sender<ManagerCommand>,
-    ) -> Vec<(String, String)> {
-        let mut failures = Vec::new();
 
-        for entry in &self.config.local_services {
-            let addr = format!("{}:{}", entry.host, entry.port);
-            match BackendConn::connect(&entry.name, &addr) {
-                Ok((conn, reader)) => {
-                    let conn_for_reader = conn.clone();
-                    let dispatcher = self.clone();
-                    let cmd_tx = cmd_tx.clone();
-                    let name = entry.name.clone();
-                    thread::spawn(move || {
-                        reader_loop(reader, conn_for_reader, &name, cmd_tx, dispatcher);
-                    });
-                    self.backends.lock().unwrap().insert(entry.name.clone(), conn);
-                    log_info(
-                        "服务调度器".to_string(),
-                        format!("后端已连接: {} (读线程启动)", entry.name),
-                    );
+    pub async fn run(mut self) {
+        self.init_backend_connections().await;
+
+        while let Some(req) = self.inbound_rx.recv().await {
+            let pending_map = self.pending_requests.get(&req.service).cloned(); // 获取该服务的等待表
+            let writer = self.backend_writers.get(&req.service).cloned();
+
+            if let (Some(pending_map), Some(writer)) = (pending_map, writer) {
+                tokio::spawn(async move {
+                    let response = Self::handle_request_with_backend(
+                        req.payload, pending_map, writer
+                    ).await;
+                    let _ = req.response_tx.send(response);
+                });
+            } else {
+                // 没有对应的后端连接，直接返回错误
+                let _ = req.response_tx.send(Err(format!("No backend for service {}", req.service)));
+            }
+        }
+    }
+
+    async fn init_backend_connections(&mut self) {
+        for service in &self.local_services {
+            let addr = format!("127.0.0.1:{}", service.port);
+            // 重试机制：最多尝试 3 次，每次间隔 1 秒
+            let mut retries = 3;
+            let stream = loop {
+                match TcpStream::connect(&addr).await {
+                    Ok(stream) => break stream,
+                    Err(e) => {
+                        retries -= 1;
+                        if retries == 0 {
+                            panic!("无法连接到后端服务 {}: {}", service.name, e);
+                        }
+                        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                    }
                 }
-                Err(e) => {
-                    failures.push((entry.name.clone(), e));
+            };
+            
+            // 分割读写半句柄
+            let (read_half, write_half) = stream.into_split();
+            
+            // 启动读任务
+            let service_name = service.name.clone();
+            let pending_map = self.pending_requests.get(&service_name).cloned().unwrap();
+            let cmd_tx = self.cmd_tx.clone();
+            let writer = Arc::new(Mutex::new(write_half));
+
+            tokio::spawn(Self::backend_read_loop(
+                read_half,
+                service_name,
+                pending_map,
+                cmd_tx,
+                writer.clone(),
+            ));
+            
+            // 存储写半句柄
+            self.backend_writers.insert(service.name.clone(), writer);
+            
+            LogStruct::new(LogLevel::Preset, "后端连接建立", &format!("{} -> {}", service.name, addr)).emit();
+        }
+    }
+    
+    async fn backend_read_loop(
+        mut read_half: OwnedReadHalf,
+        service_name: String,
+        pending_map: Arc<Mutex<HashMap<String, oneshot::Sender<Result<Vec<u8>, String>>>>>,
+        cmd_tx: mpsc::UnboundedSender<Command>,
+        writer: Arc<Mutex<OwnedWriteHalf>>,
+    ) {
+        loop {
+            let mut len_buf = [0u8; 4];
+            if let Err(e) = read_half.read_exact(&mut len_buf).await {
+                LogStruct::new(LogLevel::Error, "后端读错误", &format!("{} 读取 uuid_len 失败: {}", service_name, e)).emit();
+                break;
+            }
+            let uuid_len = u32::from_be_bytes(len_buf);
+
+            if uuid_len == 0 {
+                // 主动控制指令：没有 UUID，直接读取 payload_len + payload
+                let mut payload_len_buf = [0u8; 4];
+                if let Err(e) = read_half.read_exact(&mut payload_len_buf).await {
+                    LogStruct::new(LogLevel::Error, "后端读错误", &format!("{} 读取控制指令 payload_len 失败: {}", service_name, e)).emit();
+                    break;
+                }
+                let payload_len = u32::from_be_bytes(payload_len_buf) as usize;
+                let mut payload = vec![0u8; payload_len];
+                if let Err(e) = read_half.read_exact(&mut payload).await {
+                    LogStruct::new(LogLevel::Error, "后端读错误", &format!("{} 读取控制指令 payload 失败: {}", service_name, e)).emit();
+                    break;
+                }
+                if let Ok(cmd_str) = String::from_utf8(payload) {
+                    let parts: Vec<&str> = cmd_str.splitn(3, '|').collect();
+                    if parts.len() == 3 {
+                        let prefix = parts[0].to_string();
+                        let content = parts[1].to_string();
+                        let payload = parts[2].as_bytes().to_vec();
+                        // 构造 Command
+                        let (resp_tx, resp_rx) = oneshot::channel();
+                        let command = Command {
+                            prefix,
+                            content,
+                            payload,
+                            resp_tx,
+                        };
+                        // 发送给 NodeController
+                        if let Err(e) = cmd_tx.send(command) {
+                            LogStruct::new(LogLevel::Error, "发送命令失败", &format!("{}: {}", service_name, e)).emit();
+                        } else {
+                            // 等待执行结果
+                            match timeout(Duration::from_secs(30), resp_rx).await {
+                                Ok(Ok(Ok(result_data))) => {
+                                    let mut response = Vec::new();
+                                    response.extend_from_slice(&0u32.to_be_bytes());
+                                    response.extend_from_slice(&(result_data.len() as u32).to_be_bytes());
+                                    response.extend_from_slice(&result_data);
+
+                                    let mut writer_guard = writer.lock().await;
+                                    if let Err(e) = writer_guard.write_all(&response).await {
+                                        LogStruct::new(LogLevel::Error, "发送命令响应失败", &format!("{}: {}", service_name, e)).emit();
+                                    } else {
+                                        let _ = writer_guard.flush().await;
+                                    }
+                                }
+                                Ok(Ok(Err(e))) => {
+                                    LogStruct::new(LogLevel::Warning, "命令执行失败", &format!("{}: {}", service_name, e)).emit();
+                                }
+                                Ok(Err(_)) => {
+                                    LogStruct::new(LogLevel::Error, "命令响应通道关闭", &service_name).emit();
+                                }
+                                Err(_) => {}
+                            }
+                        }
+                    } else {
+                        LogStruct::new(LogLevel::Warning, "控制指令格式错误", &format!("{} 期望 'prefix|content', 实际: {}", service_name, cmd_str)).emit();
+                    }
+                } else {
+                    LogStruct::new(LogLevel::Warning, "控制指令非 UTF-8", &service_name).emit();
+                }
+
+
+            } else {
+                let uuid_len_usize = uuid_len as usize;
+                let mut uuid_bytes = vec![0u8; uuid_len_usize];
+                if let Err(e) = read_half.read_exact(&mut uuid_bytes).await {
+                    LogStruct::new(LogLevel::Error, "后端读错误", &format!("{} 读取 UUID 失败: {}", service_name, e)).emit();
+                    break;
+                }
+                let uuid = match String::from_utf8(uuid_bytes) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        LogStruct::new(LogLevel::Error, "后端协议错误", &format!("{} UUID 非 UTF-8: {}", service_name, e)).emit();
+                        break;
+                    }
+                };
+
+                // 读取 payload_len
+                let mut payload_len_buf = [0u8; 4];
+                if let Err(e) = read_half.read_exact(&mut payload_len_buf).await {
+                    LogStruct::new(LogLevel::Error, "后端读错误", &format!("{} 读取响应 payload_len 失败: {}", service_name, e)).emit();
+                    break;
+                }
+                let payload_len = u32::from_be_bytes(payload_len_buf) as usize;
+                let mut payload = vec![0u8; payload_len];
+                if let Err(e) = read_half.read_exact(&mut payload).await {
+                    LogStruct::new(LogLevel::Error, "后端读错误", &format!("{} 读取响应 payload 失败: {}", service_name, e)).emit();
+                    break;
+                }
+
+                // 从等待表中查找并唤醒等待者
+                let sender = {
+                    let mut map = pending_map.lock().await;
+                    map.remove(&uuid)
+                };
+                if let Some(tx) = sender {
+                    let _ = tx.send(Ok(payload));
                 }
             }
         }
-
-        failures
+        LogStruct::new(LogLevel::Warning, "后端连接断开", &format!("{} 读循环退出", service_name)).emit();
     }
 
-    /// 转发请求到后端（阻塞，通过持久连接）
-    pub fn forward(&self, service: &str, payload: &[u8]) -> Result<Vec<u8>, String> {
-        let backends = self.backends.lock().map_err(|e| e.to_string())?;
-        let conn = backends
-            .get(service)
-            .ok_or_else(|| format!("未知服务: {}", service))?;
-        conn.forward(payload)
+    fn encode_request(uuid: &str, payload: &[u8]) -> Vec<u8> {
+        let uuid_bytes = uuid.as_bytes();
+        let mut out = Vec::with_capacity(4 + uuid_bytes.len() + 4 + payload.len());
+        out.extend_from_slice(&(uuid_bytes.len() as u32).to_be_bytes());
+        out.extend_from_slice(uuid_bytes);
+        out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        out.extend_from_slice(payload);
+        out
     }
 
-    /// 获取配置中定义的服务名列表
-    pub fn get_service_names(&self) -> Vec<String> {
-        self.config
-            .local_services
-            .iter()
-            .map(|s| s.name.clone())
-            .collect()
-    }
+    async fn handle_request_with_backend(
+        payload: Vec<u8>,
+        pending_map: Arc<Mutex<HashMap<String, oneshot::Sender<Result<Vec<u8>, String>>>>>,
+        writer: Arc<Mutex<OwnedWriteHalf>>,
+    ) -> Result<service_protocol::Response, String> {
+        let uuid = Uuid::new_v4().to_string();
+        let (resp_tx, resp_rx) = oneshot::channel();
 
-    /// 获取包含地址信息的原始服务列表
-    pub fn list_services_raw(&self) -> Vec<(String, String, u16)> {
-        self.config
-            .local_services
-            .iter()
-            .map(|s| (s.name.clone(), s.host.clone(), s.port))
-            .collect()
-    }
+        {
+            let mut map = pending_map.lock().await;
+            map.insert(uuid.clone(), resp_tx);
+        }
 
-    /// 调度器是否启用
-    pub fn is_enabled(&self) -> bool {
-        self.config.enabled
-    }
+        let data = Self::encode_request(&uuid, &payload);
+        {
+            let mut writer = writer.lock().await;   // 获取 MutexGuard
+            if let Err(e) = writer.write_all(&data).await {
+                let mut map = pending_map.lock().await;
+                map.remove(&uuid);
+                return Err(format!("Write to backend failed: {}", e));
+            }
+            let _ = writer.flush().await;
+        } // MutexGuard 在此释放
 
-    /// 健康检查：返回已连接但不在 backends 中的服务
-    /// （connect_all 失败的不会在 backends 里）
-    pub fn health_check(&self) -> Vec<String> {
-        let backends = self.backends.lock().unwrap();
-        let mut unhealthy = Vec::new();
-        for entry in &self.config.local_services {
-            if !backends.contains_key(&entry.name) {
-                unhealthy.push(format!("{} ({}:{})", entry.name, entry.host, entry.port));
+        match timeout(Duration::from_secs(30), resp_rx).await {
+            Ok(Ok(Ok(resp_data))) => {
+                Ok(service_protocol::Response { success: true, data: resp_data })
+            }
+            Ok(Ok(Err(e))) => Err(e),
+            Ok(Err(_)) => Err("Backend response channel closed".to_string()),
+            Err(_) => {
+                // 超时，清理 pending 条目
+                let mut map = pending_map.lock().await;
+                map.remove(&uuid);
+                Err("Backend request timeout".to_string())
             }
         }
-        unhealthy
     }
+
 }
 
-fn log_info(topic: String, content: String) {
-    let log = LogStruct {
-        level: LogLevel::Debug,
-        topic,
-        content,
-    };
-    log.logout();
-}

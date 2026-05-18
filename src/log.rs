@@ -2,12 +2,19 @@ use std::fs;
 use std::io::{Read, Write};
 use std::thread::spawn;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use chrono::{DateTime, Local};
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use colored::*;
+use scopeguard::defer;
 
-static LOG_FILE_MUTEX: Mutex<()> = Mutex::new(());
+static LOG_MUTEX: Mutex<()> = Mutex::new(());
+static ROLLING: AtomicBool = AtomicBool::new(false);
+
+const LOG_PATH: &str = "log";
+const TMP_LOG_PATH: &str = "log.tmp";
+const MAX_SIZE_BYTES: u64 = 10 * 1024 * 1024; // 10MB
 
 pub enum LogLevel {
     Important,
@@ -29,216 +36,227 @@ impl LogLevel {
             LogLevel::Critical => "[CRITICAL]",
         }
     }
+
     fn color(&self) -> ColoredString {
         match self {
             LogLevel::Important => "[IMPORTANT]".on_green().bold(),
             LogLevel::Debug => "[+]".cyan(),
-            LogLevel::Preset => "[-]".into(),
+            LogLevel::Preset => "[-]".normal(),
             LogLevel::Warning => "[*]".yellow(),
             LogLevel::Error => "[!]".red(),
             LogLevel::Critical => "[CRITICAL]".on_red().bold().blink(),
         }
     }
-    
 }
 
 pub struct LogStruct {
-    pub level: LogLevel,
-    pub topic: String,
-    pub content: String,
+    level: LogLevel,
+    topic: String,
+    content: String,
 }
 
 impl LogStruct {
-    pub fn logout(&self){
-        rolling_check();
+    pub fn new(level: LogLevel, topic: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            level,
+            topic: topic.into(),
+            content: content.into(),
+        }
+    }
+}
+
+impl LogStruct {
+    pub fn emit(&self) {
+        if !ROLLING.swap(true, Ordering::AcqRel) {
+            check_and_roll();
+        }
         log(self)
     }
 }
 
-fn rolling_check() {
-    const LOG_FILE: &str = "log";
-    const MAX_SIZE: u64 = 10 * 1024 * 1024; // 10MB
-    // 检查文件是否存在并获取大小
-    let metadata = match fs::metadata(LOG_FILE) {
-        Ok(metadata) => metadata,
-        Err(_) => return, // 文件不存在，直接返回
+// 内部错误日志助手，直接输出到终端，不绕路文件
+fn error_entry(topic: &str, content: &str) {
+    let entry = LogStruct::new(LogLevel::Error, topic, content);
+    log_onlycli(&entry);
+}
+
+fn archive_and_cleanup(tmp_file: String, output_file_name: String) {
+    let mut buffer = Vec::new();
+    match fs::File::open(&tmp_file) {
+        Ok(mut input_file) => {
+            if let Err(e) = input_file.read_to_end(&mut buffer) {
+                error_entry("无法读取log.tmp文件", &e.to_string());
+                return;
+            }
+        }
+        Err(e) => {
+            error_entry("无法读取log.tmp文件", &e.to_string());
+            return;
+        }
+    }
+
+    match fs::File::create(&output_file_name) {
+        Ok(output_file) => {
+            let mut encoder = GzEncoder::new(output_file, Compression::best());
+            if let Err(e) = encoder.write_all(&buffer) {
+                error_entry("无法压缩log.tmp数据", &e.to_string());
+                return;
+            }
+            if let Err(e) = encoder.finish() {
+                error_entry("无法压缩log.tmp数据", &e.to_string());
+                return;
+            }
+
+            if let Err(e) = fs::remove_file(&tmp_file) {
+                error_entry("无法删除log.tmp文件", &e.to_string());
+            }
+        }
+        Err(e) => {
+            error_entry("无法创建日志轮转文件", &e.to_string());
+        }
+    }
+}
+
+fn repair_tmp_file() {
+    let tmp_metadata = match fs::metadata(TMP_LOG_PATH) {
+        Ok(meta) => meta,
+        Err(_) => return,
     };
-    // 检查文件大小
-    if metadata.len() <= MAX_SIZE {
+
+    let tmp_time = tmp_metadata.created()
+        .map(|t| {
+            let dt: DateTime<Local> = DateTime::from(t);
+            dt.format("%m%d_%H%M").to_string()
+        })
+        .unwrap_or_else(|_| "XXXX_XXXX".to_string());
+
+    let fine_now = Local::now().timestamp_nanos_opt().unwrap_or(0);
+    let output_filename = format!("REPAIR-{}-{}.gz", tmp_time, fine_now);
+    archive_and_cleanup(TMP_LOG_PATH.to_owned(), output_filename);
+}
+
+fn perform_roll(file_metadata: fs::Metadata) {
+    {
+        let _guard = LOG_MUTEX.lock().unwrap();
+        // 重命名
+        match fs::rename(LOG_PATH, TMP_LOG_PATH) {
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                drop(_guard);
+                let warning = LogStruct::new(LogLevel::Warning, "修复错误tmp文件", "");
+                log_onlycli(&warning);
+                repair_tmp_file();
+                // 清理后重试
+                let _guard = LOG_MUTEX.lock().unwrap();
+                if let Err(e) = fs::rename(LOG_PATH, TMP_LOG_PATH) {
+                    let critical = LogStruct::new(LogLevel::Critical, "无法重命名log文件", e.to_string());
+                    log_onlycli(&critical);
+                    return;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e) => {
+                let critical = LogStruct::new(LogLevel::Critical, "无法重命名log文件", e.to_string());
+                log_onlycli(&critical);
+                return;
+            }
+            _ => {}
+        }
+    }
+    let timestamp = file_metadata.created()
+        .map(|t| {
+            let dt: DateTime<Local> = DateTime::from(t);
+            dt.format("%m%d_%H%M").to_string()
+        })
+        .unwrap_or_else(|_| "XXXX_XXXX".to_string());
+    let current_time = Local::now().format("%m%d_%H%M").to_string();
+    let fine_now = Local::now().timestamp_nanos_opt().unwrap_or(0);
+    let output_filename = format!("{}-{}-{}.gz", timestamp, current_time, fine_now);
+
+    archive_and_cleanup(TMP_LOG_PATH.to_owned(), output_filename);
+}
+
+fn check_and_roll() {
+    let metadata = match fs::metadata(LOG_PATH) {
+        Ok(m) => m,
+        Err(_) => {
+            ROLLING.store(false, Ordering::Release);
+            return;
+        }
+    };
+
+    if metadata.len() <= MAX_SIZE_BYTES {
+        ROLLING.store(false, Ordering::Release);
         return;
     }
+
     spawn(|| {
-        const LOG_FILE: &str = "log";
-        const TMP_FILE: &str = "log.tmp";
-        // 检查文件是否存在并获取元数据
-        let metadata = match fs::metadata(LOG_FILE) {
-            Ok(metadata) => metadata,
-            Err(_) => return, // 文件不存在，直接返回
+        defer! { ROLLING.store(false, Ordering::Release); }
+        let metadata = match fs::metadata(LOG_PATH) {
+            Ok(m) => m,
+            Err(_) => return,
         };
-        // 重命名文件
-        if let Err(e) = fs::rename(LOG_FILE, TMP_FILE) {
-            panic!("[CRITICAL] 无法重命名log文件: {}", e);
-        }
-
-        // 生成时间戳
-        let timestamp = metadata.created()
-            .map(|created_time| {
-                let datetime: DateTime<Local> = DateTime::from(created_time);
-                datetime.format("%m%d_%H%M").to_string()
-            })
-            .unwrap_or_else(|_| "XXXX_XXXX".to_string());
-
-        let current_time = Local::now().format("%m%d_%H%M").to_string();
-        let output_filename = format!("{}-{}.gz", timestamp, current_time);
-
-        // 读取文件内容
-        let mut buffer = Vec::new();
-        match fs::File::open(TMP_FILE) {
-            Ok(mut input_file) => {
-                if let Err(e) = input_file.read_to_end(&mut buffer) {
-                    let _log = LogStruct {
-                        level: LogLevel::Error,
-                        topic: "无法读取log.tmp文件".to_string(),
-                        content: e.to_string(),
-                    };
-                    log(&_log);
-                    return;
-                }
-            }
-            Err(e) => {
-                let _log = LogStruct {
-                    level: LogLevel::Error,
-                    topic: "无法读取log.tmp文件".to_string(),
-                    content: e.to_string(),
-                };
-                log(&_log);
-                return;
-            },
-        }
-
-        // 压缩文件
-        match fs::File::create(&output_filename) {
-            Ok(output_file) => {
-                let mut encoder = GzEncoder::new(output_file, Compression::best());
-                if let Err(e) = encoder.write_all(&buffer) {
-                    let _log = LogStruct {
-                        level: LogLevel::Error,
-                        topic: "无法压缩log.tmp数据".to_string(),
-                        content: e.to_string(),
-                    };
-                    log(&_log);
-                    return;
-                }
-                if let Err(e) = encoder.finish() {
-                    let _log = LogStruct {
-                        level: LogLevel::Error,
-                        topic: "无法压缩log.tmp数据".to_string(),
-                        content: e.to_string(),
-                    };
-                    log(&_log);
-                    return;
-                }
-                
-                // 压缩成功后删除临时文件
-                if let Err(e) = fs::remove_file(TMP_FILE) {
-                    let _log = LogStruct {
-                        level: LogLevel::Error,
-                        topic: "无法删除log.tmp文件".to_string(),
-                        content: e.to_string(),
-                    };
-                    log(&_log);
-                    return;
-                }
-            }
-            Err(e) => {
-                let _log = LogStruct {
-                    level: LogLevel::Error,
-                    topic: "无法创建日志轮转文件".to_string(),
-                    content: e.to_string(),
-                };
-                log(&_log);
-                return;
-            },
-        };
+        perform_roll(metadata);
     });
 }
 
-fn format_log_entry(level: &LogLevel, time: &str, topic: &str, content: &str, color: bool) -> String {
-    if color {
-        let prefix = level.color();
-        if content.is_empty() {
-            format!("{} {}\n    {}", prefix, time, topic)
-        } else {
-            format!("{} {}\n    {}\n    {}", prefix, time, topic, content)
-        }
+fn format_colored(level: &LogLevel, time: &str, topic: &str, content: &str) -> String {
+    let prefix = level.color();
+    if content.is_empty() {
+        format!("{} {}\n    {}", prefix, time, topic)
     } else {
-        let prefix = level.as_str();
-        if content.is_empty() {
-            format!("{} {}\n    {}", prefix, time, topic)
-        } else {
-            format!("{} {}\n    {}\n    {}", prefix, time, topic, content)
-        }
+        format!("{} {}\n    {}\n    {}", prefix, time, topic, content)
+    }
+}
+
+fn format_plain(level: &LogLevel, time: &str, topic: &str, content: &str) -> String {
+    let prefix = level.as_str();
+    if content.is_empty() {
+        format!("{} {}\n    {}", prefix, time, topic)
+    } else {
+        format!("{} {}\n    {}\n    {}", prefix, time, topic, content)
     }
 }
 
 fn log(info: &LogStruct) {
     let time = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
 
-    // 生成带颜色的 CLI 输出和不带颜色的文件输出
-    let cli_text = format_log_entry(&info.level, &time, &info.topic, &info.content, true);
-    let text = format_log_entry(&info.level, &time, &info.topic, &info.content, false);
+    let cli_text = format_colored(&info.level, &time, &info.topic, &info.content);
+    let file_text = format_plain(&info.level, &time, &info.topic, &info.content);
 
     match info.level {
-        LogLevel::Error | LogLevel::Critical | LogLevel::Warning=> {
-            // 错误和严重错误输出到 stderr
+        LogLevel::Error | LogLevel::Critical | LogLevel::Warning => {
             eprintln!("{}", cli_text);
         }
         _ => {
-            // 普通信息输出到 stdout
             println!("{}", cli_text);
         }
     }
 
-    // 写入文件
-    let _guard = LOG_FILE_MUTEX.lock().unwrap();
-    let log_open_result = fs::OpenOptions::new()
+    let _guard = LOG_MUTEX.lock().unwrap();
+    let mut log_file = match fs::OpenOptions::new()
         .append(true)
         .create(true)
-        .open("log");
-    let mut log = match log_open_result {
+        .open(LOG_PATH)
+    {
         Ok(file) => file,
-        Err(_error) => {
-            let err_log = LogStruct {
-                level: LogLevel::Error,
-                topic: "无法录入日志".to_string(),
-                content: "log文件无法被追加写入".to_string(),
-            };
-            log_onlycli(&err_log);
+        Err(_) => {
+            let err = LogStruct::new(LogLevel::Error, "无法录入日志", "log文件无法被追加写入");
+            log_onlycli(&err);
             return;
         }
     };
-    let write_result = writeln!(log, "{}", text);
-    match write_result {
-        Ok(_) => (),
-        Err(_error) => {
-            let err_log = LogStruct {
-                level: LogLevel::Error,
-                topic: "无法录入日志".to_string(),
-                content: "log文件无法被追加写入".to_string(),
-            };
-            log_onlycli(&err_log);
-        }
+
+    if writeln!(log_file, "{}", file_text).is_err() {
+        let err = LogStruct::new(LogLevel::Error, "无法录入日志", "log文件无法被追加写入");
+        log_onlycli(&err);
     }
 }
 
 fn log_onlycli(info: &LogStruct) {
     let time = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-    let text = format_log_entry(&info.level, &time, &info.topic, &info.content, true);
+    let text = format_colored(&info.level, &time, &info.topic, &info.content);
     match info.level {
-        LogLevel::Error | LogLevel::Critical => {
-            eprintln!("{}", text);
-        }
-        LogLevel::Warning => {
+        LogLevel::Error | LogLevel::Critical | LogLevel::Warning => {
             eprintln!("{}", text);
         }
         _ => {
