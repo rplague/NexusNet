@@ -1,333 +1,227 @@
 # NexusNet
 
-**OAHD 计划的核心网络层** — 基于 libp2p 的 P2P 节点网络。
+**OAHD 计划的核心网络层** — 基于 libp2p 的去中心化 P2P 节点网络。
 
-NexusNet 将一个对等节点接入到去中心化 P2P 网络，通过 Kademlia DHT 实现节点自动发现、服务注册与查询，通过 TCP 边车代理将远程请求转发到本地业务进程。
+NexusNet 将一台机器接入 P2P 覆盖网络，通过 Kademlia DHT 实现节点自动发现与服务注册查询；利用边车（sidecar）模式，将远程服务请求经 TCP 转发到本地业务进程，业务端语言无关。
 
-## 架构
+## 架构总览
 
 ```
-                   ┌──────────────────────────────────────┐
-                   │           NexusNet 节点                 │
-                   │                                        │
-                   │  ┌─ P2P 通信层 ──────────────────────┐ │
-                   │  │  Ping（保活检测，15s 间隔）       │ │
-                   │  │  Identify（协议/版本握手）         │ │
-                   │  │  Kademlia（DHT 路由表存储）        │ │
-                   │  │    ├ 路由表（kbuckets）            │ │
-                   │  │    ├ 服务宣告的 DHT 记录           │ │
-                   │  │    └ 周期性 bootstrap（20s 间隔）  │ │
-                   │  │  Request-Response（消息/服务请求） │ │
-                   │  │  AddrWatcher（IP 变化检测，60s）   │ │
-                   │  └─────────────────────────────────┘   │
-                   │                                        │
-                   │  ┌─ 边车调度与发现 ──────────────────┐ │
-                   │  │  ServiceDiscovery（DHT 宣告/查询） │ │
-                   │  │  ServiceDispatcher（TCP 本地转发） │ │
-                   │  │  OutboundProxy（本地 TCP 控制口） │ │
-                   │  └─────────────────────────────────┘   │
-                   └──────────┬──────────────────────────┘
-                              │
-        ┌─────────────────────┼─────────────────────────────┐
-        ▼                     ▼                              ▼
- ┌──────────────┐     ┌──────────────┐            ┌──────────────┐
- │ OCR 服务     │     │ 冷存储服务    │            │ 其他业务进程  │
- │ 本地进程     │     │ 本地进程      │            │ 任何语言      │
- └──────────────┘     └──────────────┘            └──────────────┘
+                   ┌──────────────────────────────────────────┐
+                   │             NexusNet 节点                  │
+                   │                                          │
+                   │  ┌─ 网络层（Swarm）─────────────────────┐ │
+                   │  │  Ping（保活检测，可配间隔/超时/重试）│ │
+                   │  │  Identify（协议/版本握手）            │ │
+                   │  │  Kademlia（DHT 路由与存储）           │ │
+                   │  │    ├ 路由表（kbuckets）               │ │
+                   │  │    ├ 服务宣告（start_providing）      │ │
+                   │  │    └ Bootstrap / 周期性扩散           │ │
+                   │  │  Request-Response（CBOR 服务调用）     │ │
+                   │  └───────────────────────────────────┘ │
+                   │                                          │
+                   │  ┌─ NodeController（主事件循环）───────┐ │
+                   │  │  tokio::select! 驱动：               │ │
+                   │  │    ├ 网络事件 → 路由/发现/响应       │ │
+                   │  │    └ 后端命令 → 内部命令/远程调用     │ │
+                   │  └──────────┬───────────────────────┘ │
+                   │             │ cmd_tx (后端→节点命令)     │
+                   │             │ inbound_req_tx (节点→后端) │
+                   │  ┌──────────▼───────────────────────┐ │
+                   │  │ ServiceDispatcher（后台任务）      │ │
+                   │  │  持久 TCP 连接后端进程             │ │
+                   │  │  UUID 帧协议：[uuid][payload]      │ │
+                   │  │  控制命令：uuid_len=0 触发内部命令  │ │
+                   │  │  超时处理：30s，自动清理 pending    │ │
+                   │  └──────────────────────────────────┘ │
+                   └──────┬──────────────────────────────┘
+                          │ 持久 TCP（UUID 帧协议）
+             ┌────────────┼────────────────────────────┐
+             ▼            ▼                             ▼
+      ┌───────────┐ ┌───────────┐               ┌───────────┐
+      │ CLI 边车   │ │ OCR 服务  │      ...      │ 其他进程   │
+      │ 端口 5014  │ │ 端口 5013 │               │ 任意语言   │
+      └───────────┘ └───────────┘               └───────────┘
 ```
 
-### 设计原则：微内核 + 边车
+### 微内核 + 边车
 
-- **P2P 通信层**（主循环）— 连接管理、路由维护、协议处理
-- **ServiceDispatcher** — 收到远程请求后通过 TCP 转发到本地 `127.0.0.1:port`，业务进程语言无关
-- **OutboundProxy** — 本地进程可通过 JSON 行协议对控制端口发命令，经 event loop 操作 P2P 网络
-- **ServiceDiscovery** — 基于 Kademlia DHT 的 `put_record`/`get_record` 实现去中心化服务注册与查询
+- **NodeController** — 单一异步事件循环，集成所有 libp2p 事件处理（Ping/Identify/Kademlia/Request-Response）和后端命令路由。
+- **ServiceDispatcher** — 独立后台任务。节点启动时主动连接所有配置的本地后端（重试 3 次），维持持久 TCP 连接。P2P 入站请求经 `inbound_req_tx` 转发到此处，由 `handle_request_with_backend()` 通过 UUID 帧协议发送给后端进程，等待响应后返回。
+- **后端透明** — 后端只需要理解 UUID 帧协议即可接入，语言/框架无关。后端也可主动发起控制指令。
+- **CBOR 协议** — P2P 层使用 libp2p CBOR 协议，`Request { service, payload }` / `Response { success, data }`。
 
-## 启动与配置
+## 快速开始
 
-### 首次运行
+### 编译与运行
 
 ```bash
 cargo run
 ```
 
-自动生成 `config.toml`（TOML 格式，支持注释）和 `keypair.bin`（节点身份，不可丢失）。
+首次运行自动生成 `config.toml` 和 `keypair.bin`。
 
-### 配置参考
+### 命令行参数
+
+```bash
+# 指定监听端口
+cargo run -- -p 5001
+
+# 添加 bootstrap 节点
+cargo run -- -c /ip4/192.168.1.100/tcp/5000/p2p/12D3KooW...
+
+# 覆盖 bootstrap 列表（清空已有，仅连此节点）
+cargo run -- --connect-overwrite /ip4/192.168.1.100/tcp/5000/p2p/12D3KooW...
+```
+
+所有 CLI 变更自动写回 `config.toml`。
+
+## 配置（config.toml）
 
 ```toml
 [node]
-name = "节点名称"
-description = "节点描述"
+name = "未设置的p2p节点"
+description = "无详细描述"
 
 [network]
-port = 5000                        # 监听端口（默认）
-ipv4_enabled = true                # 默认自动检测
-ipv6_enabled = false               # 默认关闭
+ipv4_enabled = false
+ipv4_address = "x.x.x.x"       # 可选，不设则自动检测
+ipv6_enabled = false
+ipv6_address = "x:x::x"        # 可选
+port = 5000
+announce_addresses = []         # 手动指定宣告地址
 
 [services.ping]
 enabled = true
 interval_secs = 15
 with_timeout = 10
+max_failures = 2
 
 [services.kademlia]
 enabled = true
-bootstrap_nodes = []               # 启动时尝试连接这些节点
-
-[services.service_discovery]
-enabled = true
-services = ["ocr"]                 # 本节点宣告的服务
-record_ttl_secs = 1800
+record_ttl_seconds = 3600
+replication_factor = 20
+query_timeout_seconds = 60
+bootstrap_nodes = []
 
 [services.dispatcher]
-enabled = false                    # 默认关闭，需手动启用
-[[services.dispatcher.local_services]]
-name = "ocr"
-host = "127.0.0.1"
-port = 5013
-
-[services.address_watcher]
 enabled = true
-check_interval_secs = 60           # 每 60s 检测 IP 是否变化
+query_timeout_secs = 60
+record_ttl_secs = 3600
 
-[services.outbound_proxy]
-enabled = false                    # 默认关闭
-bind = "127.0.0.1"
-port = 5200
+[[services.dispatcher.local_services]]
+name = "cmd"
+host = "127.0.0.1"
+port = 5014
 ```
 
-所有非根配置段均有 `#[serde(default)]`，可省略——省略时使用默认值。
+所有字段均有 `#[serde(default)]`，省略即默认值。
 
-### 命令行参数
-
-```bash
-# 指定端口（覆盖 config.toml 中的配置）
-cargo run -- -p 5001
-
-# 连接指定节点（清空 bootstrap_nodes，只连接此地址）
-cargo run -- -c /ip4/192.168.1.100/tcp/5000/p2p/12D3KooW...
-
-# 启动后查询指定服务
-cargo run -- -q ocr
-```
-
-## 节点行为
-
-### 启动阶段
-
-1. **配置加载** — 读取 `config.toml`，文件不存在/空/格式错误时自动创建新配置，更新本机 IP 地址后写回
-2. **密钥加载** — 读取或生成 `keypair.bin`（ED25519），作为节点的永久身份
-3. **初始化** — 创建 Kademlia MemoryStore、ServiceDiscovery（从配置加载待宣告服务列表）、ServiceDispatcher（健康检查所有后端）、Ping/Identify/RequestResponse/AddrWatcher 各 behaviour
-4. **监听** — 按配置在 IPv4/IPv6 地址上绑定 TCP 端口
-5. **连接 bootstrap** — 遍历 `bootstrap_nodes`，逐条 dial
-6. **出站代理** — 如果配置启用，在 `127.0.0.1:5200` 启动 TCP 命令监听（tokio::spawn 独立任务），通过 `mpsc` 通道向 event loop 发送命令
-
-### 事件循环
-
-event loop 使用 `tokio::select!` 同时处理：
-
-- **Swarm 事件** — 来自 libp2p 网络层的各种事件
-- **Proxy 命令** — 来自出站代理 TCP 控制端口的请求
-
-### Swarm 事件处理
-
-| 事件 | 处理逻辑 |
-|------|----------|
-| **NewListenAddr** | 标记 listeners 就绪。如果服务已宣告完毕，更新地址后重新 `put_record` 宣告 |
-| **IncomingConnectionError** | 记录错误到日志 |
-| **ConnectionEstablished** | 在 `net_peer_list` 中记录或更新节点为 Connected 状态 |
-| **ConnectionClosed** | 同版本节点标记为 Disconnected（保留）；不同版本节点从列表中移除 |
-| **Identify::Received** | **核心路由逻辑**（见下方详细说明） |
-| **Identify::Error** | 记录警告 |
-| **Kademlia::Bootstrap Ok** | 向 DHT 宣告本地服务（`put_record`），如有 `--query` 则发起 `get_record` 查询 |
-| **Kademlia::GetRecord Ok** | 解码 `ServiceInfo` 存入 ServiceDiscovery 缓存，记录发现的提供者 |
-| **Kademlia::PutRecord Ok** | 记录确认 |
-| **Kademlia::GetClosestPeers** | 将发现的节点加入 `net_peer_list`，对未连接的节点发起 dial |
-| **Kademlia::UnroutablePeer** | 记录警告 |
-| **RequestResponse::Message** | 收到请求 → `dispatcher.forward()` 转发到本地业务进程；收到响应 → 记录到日志 |
-| **AddrWatcher::Changed** | IP 变化后：重新宣告服务，更新 `announce_addresses` 到配置，重连所有 bootstrap 节点 |
-
-#### Identify::Received 详细说明
-
-收到对端身份信息后按以下步骤处理：
+## 启动流程
 
 ```
-收到 Identify::Received
-  │
-  ├─ 在 net_peer_list 中查找对应 peer_id
-  │    └─ 找到 → 填充 agent_version、observed_addresses、public_key、supported_protocols
-  │
-  ├─ appropriate_address_filter()
-  │    └─ 按本地 IP 协议栈优先级过滤对端 listen_addrs
-  │         ├─ IPv4 v6 都启用 → IPv4 优先，再 IPv6
-  │         ├─ 仅 IPv4 → 只保留 IPv4 地址
-  │         ├─ 仅 IPv6 → 只保留 IPv6 地址
-  │         └─ 都禁用 → None
-  │
-  ├─ 有兼容地址？
-  │    ├─ Yes → 填充 entry.addresses（追加 /p2p/<peer_id>）
-  │    └─ No  → 记录 "地址不兼容" 警告，跳过
-  │
-  ├─ 判断 is_my_node：
-  │    ├─ Kademlia 已启用
-  │    ├─ agent_version == /OAHD/<当前版本>
-  │    └─ entry.addresses 包含 P2P 协议
-  │
-  ├─ is_my_node = true？
-  │    ├─ Yes → add_address 到 Kademlia 路由表
-  │    │         insert_bootstrap_nodes（写入 config.toml）
-  │    │         如果 bootstrap_done == false，执行 bootstrap()
-  │    └─ No  → 记录 "未知节点" 信息（仅地址兼容的情况下）
+boot::init()
+  ├─ 读取 config.toml（损坏/不存在 → 创建默认）
+  ├─ CLI 参数覆盖 & 写回
+  ├─ 更新公网 IP 到配置
+  ├─ 加载/生成 keypair.bin（ED25519）
+  ├─ NetHandle::start() → 绑定端口，组建 Swarm
+  ├─ 拨号所有 bootstrap 节点
+  ├─ 启动 ServiceDispatcher（后台 tokio::spawn）
+  └─ NodeController::run()（主协程）
+       tokio::select! {
+           event_rx → 网络事件
+           cmd_rx  → 后端命令
+       }
 ```
-
-关键行为：
-- **同版本 OAHD 节点**自动加入 Kademlia 路由表并被记录为 bootstrap 节点
-- **地址不兼容的对端**（如纯 IPv4 节点接入了仅 IPv6 的节点）不会加入路由表，但节点信息仍被记录在 `net_peer_list` 中
-- **不同版本的 OAHD 节点**保持基础连接（Ping 保活），但不加入路由表
-
-### 服务宣告的生命周期
-
-```
-节点启动
-  │
-  ├─ 加载配置中 [services.service_discovery.services] 列表
-  │    └─ 每个服务名对应创建一个 ServiceInfo（地址为空）
-  │
-  └─ Bootstrap 成功
-       │
-       ├─ set_addresses(listeners) 填充真实地址
-       │
-       ├─ get_announce_records() 序列化为 Kademlia Record
-       │    ├─ key = /oahd/sd/<service_type>
-       │    └─ value = JSON(ServiceInfo{ service_type, provider, addrs, version, metadata, timestamp, ttl })
-       │
-       └─ 对每个 record 执行 kademlia.put_record(Quorum::One)
-            │
-            ├─ 地址变化时 → reannounce() 重新 put_record
-            └─ 记录 TTL 过期后自然从 DHT 消失
-```
-
-服务记录键前缀：`/oahd/sd/`（定义在 `SD_KEY_PREFIX`）。
-
-### 服务查询
-
-两种查询方式：
-
-**1. 命令行 `--query`（启动时执行）**
-
-```
-cargo run -- -q ocr
-```
-
-启动后在 Bootstrap 成功时发起 `kademlia.get_record`，结果通过 `GetRecord` 事件处理——解码 `ServiceInfo` 后存入 ServiceDiscovery 缓存。
-
-**2. OutboundProxy 控制端口（运行时查询）**
-
-```bash
-echo '{"type": "discover", "service": "ocr"}' | nc 127.0.0.1 5200
-```
-
-响应：
-
-```json
-{"success":true,"message":"找到 2 个提供者","data":{"providers":[{...}]}}
-```
-
-### 地址变化处理（AddrWatcher）
-
-`addr_watcher::Behaviour` 是一个自定义 libp2p `NetworkBehaviour`，实现方式为：
-
-- 每 `check_interval_secs`（默认 60s）触发一次
-- 调用 `get_network_addresses()` 获取当前公共网络地址
-- 与内部保存的 `last_addrs` 比较
-- 变化时通过 `ToSwarm::GenerateEvent(AddrWatcherEvent::Changed(...))` 上报
-
-收到 `Changed` 事件后，event loop：
-
-1. 重新宣告所有已宣告的服务（`reannounce()` → `put_record`）
-2. 更新 `config.announce_addresses`
-3. 对已知 bootstrap 节点全部发起 dial 重连
-
-### 出站代理（OutboundProxy）
-
-通过本地 TCP 端口（默认 `127.0.0.1:5200`）提供了一个 JSON 行协议接口。连接打开后可发送以下命令：
-
-```json
-{"type": "discover", "service": "ocr"}
-{"type": "request", "peer": "12D3KooW...", "service": "ocr", "payload": "<base64>"}
-{"type": "ping"}
-```
-
-命令通过 `mpsc` 通道发送到 event loop，在 `tokio::select!` 中与 Swarm 事件并行处理。`discover` 会先查本地缓存再发起 DHT 查询；`request` 使用 libp2p RequestResponse 协议发送 `ServiceRequest`。
 
 ## 模块清单
 
-| 模块 | 文件 | 职责 |
+| 模块 | 行数 | 职责 |
 |------|------|------|
-| **main** | `src/main.rs` | 入口，cli 解析，event loop，所有事件路由 |
-| **config** | `src/config.rs` | TOML 配置定义、加载、写入、节点管理（insert_bootstrap_nodes） |
-| **net** | `src/net.rs` | libp2p behaviour 组合（NetBehaviour）、IP 地址获取、地址兼容性过滤、密钥管理 |
-| **log** | `src/log.rs` | 彩色终端输出 + 文件日志，10MB 自动轮转压缩 |
-| **addr_watcher** | `src/addr_watcher.rs` | 自定义 NetworkBehaviour：周期性检测本机 IP 变化并上报事件 |
-| **service_discovery** | `src/service_discovery.rs` | DHT 服务注册、查询、缓存管理（ServiceInfo 定义） |
-| **service_dispatcher** | `src/service_dispatcher.rs` | 边车模式 TCP 转发：收到远程请求后连接本地业务进程 |
-| **request_handler** | `src/request_handler.rs` | ServiceRequest/ServiceResponse 消息定义、发送、接收处理 |
-| **outbound_proxy** | `src/outbound_proxy.rs` | 本地 TCP JSON 命令监听，通过 mpsc 通道操作 event loop |
+| **boot** | 71 | 初始化：加载配置、CLI 解析、持-久化 |
+| **main** | 60 | 入口：`#[tokio::main]`，编排全流程 |
+| **node_controller** | 421 | 事件循环：Ping/Identify/Kademlia/ReqResp 统一处理；服务自动宣告（start_providing），远程查询，内部命令 |
+| **service_dispatcher** | 292 | 后端连接管理：连接/重试/帧读写；UUID 请求跟踪；控制指令路由 |
+| **net** | 369 | KeyManager（原子写入）、Swarm 构建、地址检测 |
+| **config** | 407 | ConfigHandle（RwLock）、TOML 持久化（.tmp → rename） |
+| **service_protocol** | 34 | P2P CBOR 协议：`Request { service, payload }` / `Response { success, data }` |
+| **log** | 265 | 彩色终端 + 文件输出，10MB 自动轮转 gzip |
+| **合计** | 1919 | |
 
-## 协议与版本
+## 后端帧协议（TCP）
 
-- **协议标识**: `/OAHD`
-- **Agent 版本**: `/OAHD/<CARGO_PKG_VERSION>`（编译时注入）
-- **Kademlia**: `/ipfs/kad/1.0.0`
-- **Request-Response**: `/oahd/req/1.0.0`
-- 同版本节点通过 Identify 识别后自动加入 Kademlia 路由表；不同版本保持连接但不加入路由
+NexusNet 与后端进程之间使用**持久 TCP 连接**，由节点主动发起连接。
 
-## 网络地址发现
+### 普通响应帧
 
-`get_network_addresses()` 通过 `get_if_addrs` 库扫描所有网络接口：
+```text
+[4B uuid_len: u32 BE][uuid_str: N bytes][4B payload_len: u32 BE][payload: N bytes]
+```
 
-- IPv4: 过滤 loopback（127.x）、private（10.x/192.168.x/172.16-31.x）、link-local（169.254.x）
-- IPv6: 过滤 loopback（::1）、unspecified（::）、multicast、link-local（fe80::/10）、ULA（fc00::/7）
+- `uuid_len = 0` 时表示控制指令（见下节）
+- `uuid_len > 0` 时：读取 UUID 字符串，在 pending_map 中匹配并唤醒等待者
+- 响应以 UUID 关联回原始请求
 
-取第一个符合条件的非空地址。
+### 控制指令帧（uuid_len = 0）
 
-## 日志系统
+```text
+[4B 0x00000000][4B payload_len: u32 BE][payload: "prefix|content|rest"]
+```
 
-- 所有日志同时输出到终端（带颜色）和 `log` 文件（纯文本）
-- 日志格式：`[LEVEL] 时间\n    主题\n    内容`
-- 错误和警告输出到 stderr，其余到 stdout
-- 日志文件达到 10MB 时自动轮转压缩：后台线程将 `log` 重命名为 `log.tmp`，用 gzip 压缩为 `MMDD_HHMM-MMDD_HHMM.gz`，删除临时文件
-- 文件写入使用 `Mutex` 保证单线程写入安全
+节点收到后解析为 `Command { prefix, content, payload }`，经 `cmd_tx` 发送给 NodeController，结果写回后端。
+
+### 节点→后端请求帧
+
+```text
+[4B uuid_len: u32 BE][uuid_str: N bytes][4B payload_len: u32 BE][payload: N bytes]
+```
+
+- UUID 由 `Uuid::new_v4()` 生成
+- 发送前将 `(uuid, oneshot::Sender)` 存入 `pending_map`
+- 默认超时 30 秒，超时自动清理 pending 条目
+
+## P2P 服务调用流程
+
+```text
+后端进程 → 控制指令(uuid_len=0, "prefix|content|payload")
+  → ServiceDispatcher.backend_read_loop
+  → Command(cmd_tx) → NodeController.handle_command()
+  → discover_providers(service) → DHT get_providers
+  → RTT 排序选最优点
+  → send_request_to_peer(peer, service, payload)
+  → CBOR Request-Response (libp2p)
+  → 远程 NodeController → InboundServiceRequest(inbound_req_tx)
+  → 远程 ServiceDispatcher.handle_request_with_backend()
+  → UUID 帧 → 远程后端进程
+  → 响应沿原路返回
+```
+
+## 服务注册与发现
+
+- 本地服务列表由 `config.services.dispatcher.local_services` 定义
+- Bootstrap 成功（首次 DHT 查询完成）后自动调用 `start_providing`，key 为 `/oahd/service/<name>`
+- 同步 `/oahd/service/types` 全局服务类型记录（put_record/get_record）
+- `@list_services` → 查询全局服务类型
+- `@discover_providers` → DHT get_providers 获取提供者列表
+- `call_service()` → 查询提供者，RTT 排序选优，P2P 调用
+
+## 日志
+
+- 双输出：终端（彩色）+ 纯文本文件
+- 格式：`[LEVEL] 时间\n    主题\n    内容`
+- 等级：`Critical | Error | Warning | Important | Preset | Debug | Log`
+- 文件 10MB 自动轮转：gzip 压缩为 `MMDD_HHMM-MMDD_HHMM.gz`
 
 ## 节点身份
 
-- 使用 ED25519 密钥对，序列化为 protobuf 格式存储在 `keypair.bin`
-- 首次运行自动生成，已存在则读取
-- **keypair.bin 不可丢失**——丢失后节点身份改变，网络中的路由关系丢失
+- ED25519 密钥对，Protobuf 编码，`keypair.bin`
+- 首次运行自动生成，已有则加载
+- **keypair.bin 不可丢失** — 丢失后节点身份变更
 
-## 网络拓扑维护
+## 开发状态
 
-| 机制 | 实现 | 效果 |
-|------|------|------|
-| **Identify 自动发现** | 连接建立后 libp2p 自动触发 | 同版本节点自动入路由表 |
-| **Kademlia GetClosestPeers** | Bootstrap 后周期性扩散 | 发现网络中的其他节点并 dial |
-| **Ping 保活** | 每 15s 检测 | 心跳超时自动标记为 Disconnected |
-| **ConnectionClosed 处理** | 同版本保留、不同版本移除 | 避免残留节点影响路由 |
-| **AddrWatcher 重连** | 60s 检测 IP 变化 | 地址变化后自动重连所有已知 bootstrap 节点 |
-| **insert_bootstrap_nodes** | Identify 发现同版本节点后自动写入 config.toml | 重启后自动连接已知节点 |
-
-## 预备知识
-
-当前版本：**0.1.2**
-
-- [x] P2P 基础网络（Ping / Identify / Kademlia）
-- [x] 服务注册与发现（DHT 宣告/查询）
-- [x] 本地服务调度（边车代理 TCP 转发）
-- [x] IP 地址变化自动检测与重连
-- [x] 出站代理（本地 TCP 控制端口）
-- [ ] 冷存储服务接口
-- [ ] OCR 服务接口
-- [ ] Web API 管理界面
+当前版本：**0.2.0** — 完成度 **5/10**
 
 ## 许可
 
