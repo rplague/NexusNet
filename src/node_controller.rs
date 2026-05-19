@@ -489,19 +489,10 @@ impl NodeController {
                     .map_err(|e| e.to_string()),
                 "query_public_ip" => {
                     let network = &self.config.read().network;
-                    let mut ip_info = serde_json::Map::new();
-                    if let Some(ipv4) = network.ipv4_address {
-                        ip_info.insert(
-                            "ipv4".to_string(),
-                            serde_json::Value::String(ipv4.to_string()),
-                        );
-                    }
-                    if let Some(ipv6) = network.ipv6_address {
-                        ip_info.insert(
-                            "ipv6".to_string(),
-                            serde_json::Value::String(ipv6.to_string()),
-                        );
-                    }
+                    let ip_info = serde_json::json!({
+                        "ipv4": network.ipv4_address.map(|a| a.to_string()),
+                        "ipv6": network.ipv6_address.map(|a| a.to_string()),
+                    });
                     Ok(serde_json::to_vec(&ip_info).unwrap())
                 }
                 _ => Err("Unknown command".to_string()),
