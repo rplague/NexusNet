@@ -495,6 +495,19 @@ impl NodeController {
                     });
                     Ok(serde_json::to_vec(&ip_info).unwrap())
                 }
+                "reconnect_bootstrap" => {
+                    let nodes = self.config.bootstrap_nodes();
+                    let mut any_success = false;
+                    for addr in &nodes {
+                        if self.net.dial(addr.clone()).is_ok() {
+                            any_success = true;
+                        }
+                    }
+                    let result = serde_json::json!({
+                        "success": any_success
+                    });
+                    Ok(serde_json::to_vec(&result).unwrap())
+                }
                 _ => Err("Unknown command".to_string()),
             },
             "service_request" => {
