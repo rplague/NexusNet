@@ -495,6 +495,25 @@ impl NodeController {
                     });
                     Ok(serde_json::to_vec(&ip_info).unwrap())
                 }
+                "reconnect_bootstrap" => {
+                    let nodes = self.config.bootstrap_nodes();
+                    let mut succeeded: Vec<String> = Vec::new();
+                    let mut failed: Vec<(String, String)> = Vec::new();
+                    for addr in nodes {
+                        let addr_str = addr.to_string();
+                        match self.net.dial(addr) {
+                            Ok(_) => succeeded.push(addr_str),
+                            Err(e) => failed.push((addr_str, e)),
+                        }
+                    }
+                    let result = serde_json::json!({
+                        "succeeded": succeeded,
+                        "failed": failed.into_iter().map(|(a, e)| {
+                            serde_json::json!({"addr": a, "error": e})
+                        }).collect::<Vec<_>>()
+                    });
+                    Ok(serde_json::to_vec(&result).unwrap())
+                }
                 _ => Err("Unknown command".to_string()),
             },
             "service_request" => {
