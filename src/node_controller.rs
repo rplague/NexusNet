@@ -508,6 +508,13 @@ impl NodeController {
                     });
                     Ok(serde_json::to_vec(&result).unwrap())
                 }
+                "reannounce_services" => {
+                    let result = match self.announce_local_services().await {
+                        Ok(_) => serde_json::json!({"success": true}),
+                        Err(e) => serde_json::json!({"success": false, "error": e.to_string()}),
+                    };
+                    Ok(serde_json::to_vec(&result).unwrap())
+                }
                 _ => Err("Unknown command".to_string()),
             },
             "service_request" => {
