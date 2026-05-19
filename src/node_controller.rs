@@ -497,20 +497,14 @@ impl NodeController {
                 }
                 "reconnect_bootstrap" => {
                     let nodes = self.config.bootstrap_nodes();
-                    let mut succeeded: Vec<String> = Vec::new();
-                    let mut failed: Vec<(String, String)> = Vec::new();
-                    for addr in nodes {
-                        let addr_str = addr.to_string();
-                        match self.net.dial(addr) {
-                            Ok(_) => succeeded.push(addr_str),
-                            Err(e) => failed.push((addr_str, e)),
+                    let mut any_success = false;
+                    for addr in &nodes {
+                        if self.net.dial(addr.clone()).is_ok() {
+                            any_success = true;
                         }
                     }
                     let result = serde_json::json!({
-                        "succeeded": succeeded,
-                        "failed": failed.into_iter().map(|(a, e)| {
-                            serde_json::json!({"addr": a, "error": e})
-                        }).collect::<Vec<_>>()
+                        "success": any_success
                     });
                     Ok(serde_json::to_vec(&result).unwrap())
                 }
