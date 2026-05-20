@@ -2,20 +2,15 @@ use crate::service_protocol;
 use crate::{LogLevel, LogStruct, config::ConfigHandle};
 use libp2p::request_response::{self, cbor};
 use libp2p::{
-    Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder,
-    futures::StreamExt,
-    identify, identity, kad, noise, ping,
-    swarm::{NetworkBehaviour, SwarmEvent},
-    tcp, yamux,
+    Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder, identify, identity, kad, noise, ping,
+    swarm::NetworkBehaviour, tcp, yamux,
 };
 use std::{
     fs, io,
     net::IpAddr,
     path::{Path, PathBuf},
-    sync::{Arc, RwLock},
     time::Duration,
 };
-use tokio::sync::mpsc;
 pub struct KeyManager {
     keypair: identity::Keypair,
     path: PathBuf,
@@ -379,69 +374,36 @@ pub fn build_swarm(
     Ok(swarm)
 }
 
-#[derive(Clone)]
 pub struct NetHandle {
     config: ConfigHandle,
-    swarm: Arc<RwLock<Option<Swarm<NetBehaviour>>>>,
+    swarm: Option<Swarm<NetBehaviour>>,
 }
 
 impl NetHandle {
     pub fn new(config: ConfigHandle) -> Self {
         Self {
             config,
-            swarm: Arc::new(RwLock::new(None)),
+            swarm: None,
         }
     }
 
     /// 启动网络（必须调用一次以初始化 Swarm）
-    pub fn start(&self, keymanager: &KeyManager) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn start(&mut self, keymanager: &KeyManager) -> Result<(), Box<dyn std::error::Error>> {
         let swarm = build_swarm(&self.config, keymanager)?;
-        *self.swarm.write().unwrap() = Some(swarm);
+        self.swarm = Some(swarm);
         Ok(())
     }
 
-    /// 访问 Swarm（只读）
-    pub fn with_swarm<F, R>(&self, f: F) -> Option<R>
-    where
-        F: FnOnce(&Swarm<NetBehaviour>) -> R,
-    {
-        let guard = self.swarm.read().unwrap();
-        guard.as_ref().map(f)
+    /// 移交 Swarm 所有权，启动事件循环由调用方驱动
+    pub fn run(mut self) -> Swarm<NetBehaviour> {
+        self.swarm.take().expect("swarm not started")
     }
 
-    /// 修改 Swarm（写）
-    pub fn with_swarm_mut<F, R>(&self, f: F) -> Option<R>
-    where
-        F: FnOnce(&mut Swarm<NetBehaviour>) -> R,
-    {
-        let mut guard = self.swarm.write().unwrap();
-        guard.as_mut().map(f)
-    }
-
-    /// 拨号到指定地址
-    pub fn dial(&self, addr: Multiaddr) -> Result<(), String> {
-        self.with_swarm_mut(|swarm| swarm.dial(addr).map_err(|e| e.to_string()))
-            .unwrap_or(Err("Swarm 未初始化".into()))
-    }
-
-    /// 运行事件循环，返回一个接收网络行为事件的通道
-    pub async fn run(&mut self) -> mpsc::UnboundedReceiver<NetBehaviourEvent> {
-        let (tx, rx) = mpsc::unbounded_channel();
-        let swarm_opt = {
-            let mut w = self.swarm.write().unwrap();
-            w.take()
-        };
-        let swarm = swarm_opt.expect("swarm not started");
-        tokio::spawn(async move {
-            let mut swarm = swarm;
-            loop {
-                let event = swarm.select_next_some().await;
-                if let SwarmEvent::Behaviour(bev) = event {
-                    let _ = tx.send(bev);
-                }
-            }
-        });
-
-        rx
+    /// 启动前用于拨号 bootstrap 节点
+    pub fn dial(&mut self, addr: Multiaddr) -> Result<(), String> {
+        self.swarm
+            .as_mut()
+            .ok_or("Swarm not started".into())
+            .and_then(|swarm| swarm.dial(addr).map_err(|e| e.to_string()))
     }
 }

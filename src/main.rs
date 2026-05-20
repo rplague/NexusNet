@@ -29,7 +29,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     )
     .emit();
 
-    let net_handle = NetHandle::new(config_handle.clone());
+    let mut net_handle = NetHandle::new(config_handle.clone());
     net_handle.start(&key_manager)?;
 
     // 连接已有的 bootstrap 节点
@@ -51,9 +51,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         dispatcher.run().await;
     });
 
-    let controller =
-        NodeController::new(config_handle, net_handle, peer_id, cmd_rx, inbound_req_tx);
-    if let Err(e) = controller.run().await {
+    let controller = NodeController::new(config_handle, peer_id, cmd_rx, inbound_req_tx);
+    if let Err(e) = controller.run(net_handle).await {
         LogStruct::new(LogLevel::Critical, "节点运行错误", e.to_string()).emit();
     }
     Ok(())
