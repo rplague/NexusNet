@@ -119,7 +119,7 @@ impl ServiceDispatcher {
             LogStruct::new(
                 LogLevel::Preset,
                 "后端连接建立",
-                &format!("{} -> {}", service.name, addr),
+                format!("{} -> {}", service.name, addr),
             )
             .emit();
         }
@@ -138,7 +138,7 @@ impl ServiceDispatcher {
                 LogStruct::new(
                     LogLevel::Error,
                     "后端读错误",
-                    &format!("{} 读取 uuid_len 失败: {}", service_name, e),
+                    format!("{} 读取 uuid_len 失败: {}", service_name, e),
                 )
                 .emit();
                 break;
@@ -152,7 +152,7 @@ impl ServiceDispatcher {
                     LogStruct::new(
                         LogLevel::Error,
                         "后端读错误",
-                        &format!("{} 读取控制指令 payload_len 失败: {}", service_name, e),
+                        format!("{} 读取控制指令 payload_len 失败: {}", service_name, e),
                     )
                     .emit();
                     break;
@@ -163,7 +163,7 @@ impl ServiceDispatcher {
                     LogStruct::new(
                         LogLevel::Error,
                         "后端读错误",
-                        &format!("{} 读取控制指令 payload 失败: {}", service_name, e),
+                        format!("{} 读取控制指令 payload 失败: {}", service_name, e),
                     )
                     .emit();
                     break;
@@ -187,7 +187,7 @@ impl ServiceDispatcher {
                             LogStruct::new(
                                 LogLevel::Error,
                                 "发送命令失败",
-                                &format!("{}: {}", service_name, e),
+                                format!("{}: {}", service_name, e),
                             )
                             .emit();
                         } else {
@@ -206,7 +206,7 @@ impl ServiceDispatcher {
                                         LogStruct::new(
                                             LogLevel::Error,
                                             "发送命令响应失败",
-                                            &format!("{}: {}", service_name, e),
+                                            format!("{}: {}", service_name, e),
                                         )
                                         .emit();
                                     } else {
@@ -217,7 +217,7 @@ impl ServiceDispatcher {
                                     LogStruct::new(
                                         LogLevel::Warning,
                                         "命令执行失败",
-                                        &format!("{}: {}", service_name, e),
+                                        format!("{}: {}", service_name, e),
                                     )
                                     .emit();
                                 }
@@ -236,7 +236,7 @@ impl ServiceDispatcher {
                         LogStruct::new(
                             LogLevel::Warning,
                             "控制指令格式错误",
-                            &format!("{} 期望 'prefix|content', 实际: {}", service_name, cmd_str),
+                            format!("{} 期望 'prefix|content', 实际: {}", service_name, cmd_str),
                         )
                         .emit();
                     }
@@ -250,7 +250,7 @@ impl ServiceDispatcher {
                     LogStruct::new(
                         LogLevel::Error,
                         "后端读错误",
-                        &format!("{} 读取 UUID 失败: {}", service_name, e),
+                        format!("{} 读取 UUID 失败: {}", service_name, e),
                     )
                     .emit();
                     break;
@@ -261,7 +261,7 @@ impl ServiceDispatcher {
                         LogStruct::new(
                             LogLevel::Error,
                             "后端协议错误",
-                            &format!("{} UUID 非 UTF-8: {}", service_name, e),
+                            format!("{} UUID 非 UTF-8: {}", service_name, e),
                         )
                         .emit();
                         break;
@@ -274,7 +274,7 @@ impl ServiceDispatcher {
                     LogStruct::new(
                         LogLevel::Error,
                         "后端读错误",
-                        &format!("{} 读取响应 payload_len 失败: {}", service_name, e),
+                        format!("{} 读取响应 payload_len 失败: {}", service_name, e),
                     )
                     .emit();
                     break;
@@ -285,7 +285,7 @@ impl ServiceDispatcher {
                     LogStruct::new(
                         LogLevel::Error,
                         "后端读错误",
-                        &format!("{} 读取响应 payload 失败: {}", service_name, e),
+                        format!("{} 读取响应 payload 失败: {}", service_name, e),
                     )
                     .emit();
                     break;
@@ -304,7 +304,7 @@ impl ServiceDispatcher {
         LogStruct::new(
             LogLevel::Warning,
             "后端连接断开",
-            &format!("{} 读循环退出", service_name),
+            format!("{} 读循环退出", service_name),
         )
         .emit();
     }
