@@ -22,6 +22,18 @@ enum KadCallback {
     ListServices(oneshot::Sender<Result<Vec<u8>, String>>),
     /// @discover_providers 命令 → get_providers 完成 → 直接通过 cmd.resp_tx 返回
     DiscoverProviders(oneshot::Sender<Result<Vec<u8>, String>>),
+    /// P2P 服务调用 Phase 1: discover → Phase 2: send_request → Phase 3: response
+    ServiceCall {
+        service: String,
+        payload: Vec<u8>,
+        response_tx: oneshot::Sender<Result<Vec<u8>, String>>,
+    },
+}
+
+/// P2P 服务请求响应的统一回调类型
+enum SvcCallback {
+    Async(oneshot::Sender<Result<service_protocol::Response, String>>),
+    CommandResponse(oneshot::Sender<Result<Vec<u8>, String>>),
 }
 
 pub struct NodeController {
@@ -30,10 +42,7 @@ pub struct NodeController {
     bootstrap_triggered: bool,
     /// 统一的 Kademlia 异步查询等待表
     pending_kad: HashMap<kad::QueryId, KadCallback>,
-    pending_service_responses: HashMap<
-        request_response::OutboundRequestId,
-        oneshot::Sender<Result<service_protocol::Response, String>>,
-    >,
+    pending_service_responses: HashMap<request_response::OutboundRequestId, SvcCallback>,
     node_rtts: Arc<RwLock<HashMap<PeerId, Duration>>>,
     cmd_rx: mpsc::UnboundedReceiver<Command>,
     inbound_req_tx: mpsc::UnboundedSender<InboundServiceRequest>,
@@ -268,6 +277,41 @@ impl NodeController {
                                 };
                                 let _ = sender.send(Ok(serde_json::to_vec(&providers).unwrap()));
                             }
+                            KadCallback::ServiceCall {
+                                service,
+                                payload,
+                                response_tx,
+                            } => {
+                                let providers: Vec<PeerId> = match &result {
+                                    Ok(providers_ok) => match providers_ok {
+                                        kad::GetProvidersOk::FoundProviders {
+                                            providers, ..
+                                        } => providers.iter().copied().collect(),
+                                        _ => Vec::new(),
+                                    },
+                                    _ => Vec::new(),
+                                };
+
+                                if providers.is_empty() {
+                                    let _ = response_tx.send(Err("No provider found".to_string()));
+                                } else {
+                                    let best_peer = self
+                                        .get_best_peer(&providers)
+                                        .or_else(|| providers.first().copied())
+                                        .unwrap();
+
+                                    let request = service_protocol::Request { service, payload };
+                                    let request_id = swarm
+                                        .behaviour_mut()
+                                        .service_req
+                                        .send_request(&best_peer, request);
+
+                                    self.pending_service_responses.insert(
+                                        request_id,
+                                        SvcCallback::CommandResponse(response_tx),
+                                    );
+                                }
+                            }
                             _ => {}
                         }
                     }
@@ -304,7 +348,8 @@ impl NodeController {
             .service_req
             .send_request(&peer, request);
 
-        self.pending_service_responses.insert(request_id, tx);
+        self.pending_service_responses
+            .insert(request_id, SvcCallback::Async(tx));
 
         rx.await.map_err(|_| "请求通道已关闭".to_string())?
     }
@@ -384,8 +429,15 @@ impl NodeController {
                         response,
                         ..
                     } => {
-                        if let Some(sender) = self.pending_service_responses.remove(&request_id) {
-                            let _ = sender.send(Ok(response));
+                        if let Some(cb) = self.pending_service_responses.remove(&request_id) {
+                            match cb {
+                                SvcCallback::Async(sender) => {
+                                    let _ = sender.send(Ok(response));
+                                }
+                                SvcCallback::CommandResponse(sender) => {
+                                    let _ = sender.send(Ok(response.data));
+                                }
+                            }
                         }
                     }
                 }
@@ -393,8 +445,15 @@ impl NodeController {
             request_response::Event::OutboundFailure {
                 request_id, error, ..
             } => {
-                if let Some(sender) = self.pending_service_responses.remove(&request_id) {
-                    let _ = sender.send(Err(error.to_string()));
+                if let Some(cb) = self.pending_service_responses.remove(&request_id) {
+                    match cb {
+                        SvcCallback::Async(sender) => {
+                            let _ = sender.send(Err(error.to_string()));
+                        }
+                        SvcCallback::CommandResponse(sender) => {
+                            let _ = sender.send(Err(error.to_string()));
+                        }
+                    }
                 }
             }
             request_response::Event::InboundFailure {
@@ -579,12 +638,18 @@ impl NodeController {
             "service_request" => {
                 let service = content;
                 let payload = payload;
-                let result = self
-                    .call_service(service, payload, swarm)
-                    .await
-                    .map(|resp| resp.data)
-                    .map_err(|e| e.to_string());
-                Some(result)
+                let key = format!("/oahd/service/{}", service);
+                let record_key = kad::RecordKey::new(&key);
+                let query_id = swarm.behaviour_mut().kademlia.get_providers(record_key);
+                self.pending_kad.insert(
+                    query_id,
+                    KadCallback::ServiceCall {
+                        service,
+                        payload,
+                        response_tx: resp_tx,
+                    },
+                );
+                return;
             }
             _ => Some(Err("command not supported".to_string())),
         };
