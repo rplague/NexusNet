@@ -18,6 +18,10 @@ enum KadCallback {
     GetRecord(oneshot::Sender<Result<kad::GetRecordOk, kad::GetRecordError>>),
     GetProviders(oneshot::Sender<Result<Vec<PeerId>, kad::GetProvidersError>>),
     ServiceTypeMerge(Vec<String>),
+    /// @list_services 命令 → get_record 完成 → 直接通过 cmd.resp_tx 返回
+    ListServices(oneshot::Sender<Result<Vec<u8>, String>>),
+    /// @discover_providers 命令 → get_providers 完成 → 直接通过 cmd.resp_tx 返回
+    DiscoverProviders(oneshot::Sender<Result<Vec<u8>, String>>),
 }
 
 pub struct NodeController {
@@ -219,24 +223,53 @@ impl NodeController {
                                         .put_record(record, kad::Quorum::Majority);
                                 }
                             }
+                            KadCallback::ListServices(sender) => {
+                                let types = match &result {
+                                    Ok(kad::GetRecordOk::FoundRecord(peer_record)) => {
+                                        serde_json::from_slice::<Vec<String>>(
+                                            &peer_record.record.value,
+                                        )
+                                        .unwrap_or_default()
+                                    }
+                                    _ => Vec::new(),
+                                };
+                                let _ = sender.send(Ok(serde_json::to_vec(&types).unwrap()));
+                            }
                             _ => {}
                         }
                     }
                 }
                 kad::QueryResult::GetProviders(result) => {
-                    if let Some(KadCallback::GetProviders(sender)) = self.pending_kad.remove(&id) {
-                        let send_result = match result {
-                            Ok(providers_ok) => match providers_ok {
-                                kad::GetProvidersOk::FoundProviders { providers, .. } => {
-                                    Ok(providers.into_iter().collect())
-                                }
-                                kad::GetProvidersOk::FinishedWithNoAdditionalRecord { .. } => {
-                                    Ok(Vec::new())
-                                }
-                            },
-                            Err(e) => Err(e),
-                        };
-                        let _ = sender.send(send_result);
+                    if let Some(cb) = self.pending_kad.remove(&id) {
+                        match cb {
+                            KadCallback::GetProviders(sender) => {
+                                let send_result = match result {
+                                    Ok(providers_ok) => match providers_ok {
+                                        kad::GetProvidersOk::FoundProviders {
+                                            providers, ..
+                                        } => Ok(providers.into_iter().collect()),
+                                        kad::GetProvidersOk::FinishedWithNoAdditionalRecord {
+                                            ..
+                                        } => Ok(Vec::new()),
+                                    },
+                                    Err(e) => Err(e),
+                                };
+                                let _ = sender.send(send_result);
+                            }
+                            KadCallback::DiscoverProviders(sender) => {
+                                let providers: Vec<PeerId> = match &result {
+                                    Ok(providers_ok) => match providers_ok {
+                                        kad::GetProvidersOk::FoundProviders {
+                                            providers, ..
+                                        } => providers.iter().copied().collect(),
+                                        _ => Vec::new(),
+                                    },
+                                    _ => Vec::new(),
+                                };
+                                let _ = sender.send(Ok(serde_json::to_vec(&providers).unwrap()));
+                            }
+                            _ => {}
+                        }
                     }
                 }
                 _ => {}
@@ -486,27 +519,40 @@ impl NodeController {
     }
 
     async fn handle_command(&mut self, cmd: Command, swarm: &mut Swarm<NetBehaviour>) {
-        let result = match cmd.prefix.as_str() {
-            "@" => match cmd.content.as_str() {
-                "discover_providers" => {
-                    let service_type = String::from_utf8(cmd.payload).unwrap_or_default();
-                    self.discover_providers(&service_type, swarm)
-                        .await
-                        .map(|peers| serde_json::to_vec(&peers).unwrap())
-                        .map_err(|e| e.to_string())
+        let Command {
+            prefix,
+            content,
+            payload,
+            resp_tx,
+        } = cmd;
+
+        let result: Option<Result<Vec<u8>, String>> = match prefix.as_str() {
+            "@" => match content.as_str() {
+                // ── 异步命令：不阻塞 event loop，由 KadCallback 处理器完成 ──
+                "list_services" => {
+                    let types_key = kad::RecordKey::new(b"/oahd/service/types");
+                    let query_id = swarm.behaviour_mut().kademlia.get_record(types_key);
+                    self.pending_kad
+                        .insert(query_id, KadCallback::ListServices(resp_tx));
+                    return;
                 }
-                "list_services" => self
-                    .get_global_service_types(swarm)
-                    .await
-                    .map(|types| serde_json::to_vec(&types).unwrap())
-                    .map_err(|e| e.to_string()),
+                "discover_providers" => {
+                    let service_type = String::from_utf8(payload).unwrap_or_default();
+                    let key = format!("/oahd/service/{}", service_type);
+                    let record_key = kad::RecordKey::new(&key);
+                    let query_id = swarm.behaviour_mut().kademlia.get_providers(record_key);
+                    self.pending_kad
+                        .insert(query_id, KadCallback::DiscoverProviders(resp_tx));
+                    return;
+                }
+                // ── 同步命令 ──
                 "query_public_ip" => {
                     let network = &self.config.read().network;
                     let ip_info = serde_json::json!({
                         "ipv4": network.ipv4_address.map(|a| a.to_string()),
                         "ipv6": network.ipv6_address.map(|a| a.to_string()),
                     });
-                    Ok(serde_json::to_vec(&ip_info).unwrap())
+                    Some(Ok(serde_json::to_vec(&ip_info).unwrap()))
                 }
                 "reconnect_bootstrap" => {
                     let nodes = self.config.bootstrap_nodes();
@@ -519,28 +565,30 @@ impl NodeController {
                     let result = serde_json::json!({
                         "success": any_success
                     });
-                    Ok(serde_json::to_vec(&result).unwrap())
+                    Some(Ok(serde_json::to_vec(&result).unwrap()))
                 }
                 "reannounce_services" => {
                     let result = match self.announce_local_services(swarm).await {
                         Ok(_) => serde_json::json!({"success": true}),
                         Err(e) => serde_json::json!({"success": false, "error": e.to_string()}),
                     };
-                    Ok(serde_json::to_vec(&result).unwrap())
+                    Some(Ok(serde_json::to_vec(&result).unwrap()))
                 }
-                _ => Err("Unknown command".to_string()),
+                _ => Some(Err("Unknown command".to_string())),
             },
             "service_request" => {
-                let service = cmd.content;
-                let payload = cmd.payload;
-                self.call_service(service, payload, swarm)
+                let service = content;
+                let payload = payload;
+                let result = self
+                    .call_service(service, payload, swarm)
                     .await
                     .map(|resp| resp.data)
-                    .map_err(|e| e.to_string())
+                    .map_err(|e| e.to_string());
+                Some(result)
             }
-            _ => Err("command not supported".to_string()),
+            _ => Some(Err("command not supported".to_string())),
         };
-        let _ = cmd.resp_tx.send(result);
+        let _ = resp_tx.send(result.unwrap());
     }
 }
 
