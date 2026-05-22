@@ -13,16 +13,19 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
+/// Kademlia 异步查询的统一回调类型
+enum KadCallback {
+    GetRecord(oneshot::Sender<Result<kad::GetRecordOk, kad::GetRecordError>>),
+    GetProviders(oneshot::Sender<Result<Vec<PeerId>, kad::GetProvidersError>>),
+    ServiceTypeMerge(Vec<String>),
+}
+
 pub struct NodeController {
     config: ConfigHandle,
     my_peer_id: PeerId,
     bootstrap_triggered: bool,
-    pending_records:
-        HashMap<kad::QueryId, oneshot::Sender<Result<kad::GetRecordOk, kad::GetRecordError>>>,
-    pending_providers:
-        HashMap<kad::QueryId, oneshot::Sender<Result<Vec<PeerId>, kad::GetProvidersError>>>,
-    /// 待处理的 service_types 合并（get_record 回调 → Phase 2 put_record）
-    pending_service_type_merges: HashMap<kad::QueryId, Vec<String>>,
+    /// 统一的 Kademlia 异步查询等待表
+    pending_kad: HashMap<kad::QueryId, KadCallback>,
     pending_service_responses: HashMap<
         request_response::OutboundRequestId,
         oneshot::Sender<Result<service_protocol::Response, String>>,
@@ -48,10 +51,8 @@ impl NodeController {
             config,
             my_peer_id,
             bootstrap_triggered: false,
-            pending_records: HashMap::new(),
+            pending_kad: HashMap::new(),
             pending_service_responses: HashMap::new(),
-            pending_providers: HashMap::new(),
-            pending_service_type_merges: HashMap::new(),
             node_rtts,
             cmd_rx,
             inbound_req_tx,
@@ -184,40 +185,46 @@ impl NodeController {
                     }
                 }
                 kad::QueryResult::GetRecord(result) => {
-                    // Phase 2: 在 event loop 中异步完成 put_record 和 service_types 合并
-                    if let Some(my_types) = self.pending_service_type_merges.remove(&id) {
-                        let existing_types = match &result {
-                            Ok(kad::GetRecordOk::FoundRecord(peer_record)) => {
-                                serde_json::from_slice::<Vec<String>>(&peer_record.record.value)
-                                    .unwrap_or_default()
+                    if let Some(cb) = self.pending_kad.remove(&id) {
+                        match cb {
+                            KadCallback::GetRecord(sender) => {
+                                let _ = sender.send(result);
                             }
-                            _ => Vec::new(),
-                        };
-                        let mut all_types = existing_types;
-                        for t in my_types {
-                            if !all_types.contains(&t) {
-                                all_types.push(t);
+                            KadCallback::ServiceTypeMerge(my_types) => {
+                                let existing_types = match &result {
+                                    Ok(kad::GetRecordOk::FoundRecord(peer_record)) => {
+                                        serde_json::from_slice::<Vec<String>>(
+                                            &peer_record.record.value,
+                                        )
+                                        .unwrap_or_default()
+                                    }
+                                    _ => Vec::new(),
+                                };
+                                let mut all_types = existing_types;
+                                for t in my_types {
+                                    if !all_types.contains(&t) {
+                                        all_types.push(t);
+                                    }
+                                }
+                                if let Ok(types_json) = serde_json::to_vec(&all_types) {
+                                    let record = kad::Record {
+                                        key: kad::RecordKey::new(b"/oahd/service/types"),
+                                        value: types_json,
+                                        publisher: None,
+                                        expires: None,
+                                    };
+                                    let _ = swarm
+                                        .behaviour_mut()
+                                        .kademlia
+                                        .put_record(record, kad::Quorum::Majority);
+                                }
                             }
+                            _ => {}
                         }
-                        if let Ok(types_json) = serde_json::to_vec(&all_types) {
-                            let record = kad::Record {
-                                key: kad::RecordKey::new(b"/oahd/service/types"),
-                                value: types_json,
-                                publisher: None,
-                                expires: None,
-                            };
-                            let _ = swarm
-                                .behaviour_mut()
-                                .kademlia
-                                .put_record(record, kad::Quorum::Majority);
-                        }
-                    }
-                    if let Some(sender) = self.pending_records.remove(&id) {
-                        let _ = sender.send(result);
                     }
                 }
                 kad::QueryResult::GetProviders(result) => {
-                    if let Some(sender) = self.pending_providers.remove(&id) {
+                    if let Some(KadCallback::GetProviders(sender)) = self.pending_kad.remove(&id) {
                         let send_result = match result {
                             Ok(providers_ok) => match providers_ok {
                                 kad::GetProvidersOk::FoundProviders { providers, .. } => {
@@ -379,7 +386,8 @@ impl NodeController {
         let types_key = kad::RecordKey::new(b"/oahd/service/types");
         let (tx, rx) = oneshot::channel();
         let query_id = swarm.behaviour_mut().kademlia.get_record(types_key);
-        self.pending_records.insert(query_id, tx);
+        self.pending_kad
+            .insert(query_id, KadCallback::GetRecord(tx));
 
         match rx.await {
             Ok(Ok(record_ok)) => match record_ok {
@@ -426,7 +434,8 @@ impl NodeController {
         // Phase 1: 发起 get_record 查询；Phase 2 在 handle_kademlia 中异步完成
         //   不能在此处 rx.await — Swarm 与 event loop 在同一 task 中，会导致死锁
         let query_id = swarm.behaviour_mut().kademlia.get_record(types_key);
-        self.pending_service_type_merges.insert(query_id, my_types);
+        self.pending_kad
+            .insert(query_id, KadCallback::ServiceTypeMerge(my_types));
         Ok(())
     }
 
@@ -442,7 +451,8 @@ impl NodeController {
 
         let query_id = swarm.behaviour_mut().kademlia.get_providers(record_key);
 
-        self.pending_providers.insert(query_id, tx);
+        self.pending_kad
+            .insert(query_id, KadCallback::GetProviders(tx));
 
         let result = rx.await??;
         Ok(result)
