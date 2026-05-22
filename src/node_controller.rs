@@ -1,29 +1,48 @@
 use crate::config::ConfigHandle;
 use crate::log::{LogLevel, LogStruct};
-use crate::net::{NetBehaviourEvent, NetHandle};
-use crate::service_dispatcher::{self, Command, InboundServiceRequest};
+use crate::net::{NetBehaviour, NetBehaviourEvent, NetHandle};
+use crate::service_dispatcher::{Command, InboundServiceRequest};
 use crate::service_protocol;
+use libp2p::futures::StreamExt;
 use libp2p::multiaddr::Protocol;
-use libp2p::{Multiaddr, PeerId, futures, identify, kad, ping, request_response};
+use libp2p::swarm::SwarmEvent;
+use libp2p::{Multiaddr, PeerId, Swarm, identify, kad, ping, request_response};
 use std::collections::HashMap;
 use std::error::Error;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
+/// Kademlia 异步查询的统一回调类型
+enum KadCallback {
+    GetRecord(oneshot::Sender<Result<kad::GetRecordOk, kad::GetRecordError>>),
+    GetProviders(oneshot::Sender<Result<Vec<PeerId>, kad::GetProvidersError>>),
+    ServiceTypeMerge(Vec<String>),
+    /// @list_services 命令 → get_record 完成 → 直接通过 cmd.resp_tx 返回
+    ListServices(oneshot::Sender<Result<Vec<u8>, String>>),
+    /// @discover_providers 命令 → get_providers 完成 → 直接通过 cmd.resp_tx 返回
+    DiscoverProviders(oneshot::Sender<Result<Vec<u8>, String>>),
+    /// P2P 服务调用 Phase 1: discover → Phase 2: send_request → Phase 3: response
+    ServiceCall {
+        service: String,
+        payload: Vec<u8>,
+        response_tx: oneshot::Sender<Result<Vec<u8>, String>>,
+    },
+}
+
+/// P2P 服务请求响应的统一回调类型
+enum SvcCallback {
+    Async(oneshot::Sender<Result<service_protocol::Response, String>>),
+    CommandResponse(oneshot::Sender<Result<Vec<u8>, String>>),
+}
+
 pub struct NodeController {
     config: ConfigHandle,
-    net: NetHandle,
     my_peer_id: PeerId,
     bootstrap_triggered: bool,
-    pending_records:
-        HashMap<kad::QueryId, oneshot::Sender<Result<kad::GetRecordOk, kad::GetRecordError>>>,
-    pending_providers:
-        HashMap<kad::QueryId, oneshot::Sender<Result<Vec<PeerId>, kad::GetProvidersError>>>,
-    pending_service_responses: HashMap<
-        request_response::OutboundRequestId,
-        oneshot::Sender<Result<service_protocol::Response, String>>,
-    >,
+    /// 统一的 Kademlia 异步查询等待表
+    pending_kad: HashMap<kad::QueryId, KadCallback>,
+    pending_service_responses: HashMap<request_response::OutboundRequestId, SvcCallback>,
     node_rtts: Arc<RwLock<HashMap<PeerId, Duration>>>,
     cmd_rx: mpsc::UnboundedReceiver<Command>,
     inbound_req_tx: mpsc::UnboundedSender<InboundServiceRequest>,
@@ -32,7 +51,6 @@ pub struct NodeController {
 impl NodeController {
     pub fn new(
         config: ConfigHandle,
-        net: NetHandle,
         my_peer_id: PeerId,
         cmd_rx: mpsc::UnboundedReceiver<Command>,
         inbound_req_tx: mpsc::UnboundedSender<InboundServiceRequest>,
@@ -44,32 +62,42 @@ impl NodeController {
 
         Self {
             config,
-            net,
             my_peer_id,
             bootstrap_triggered: false,
-            pending_records: HashMap::new(),
+            pending_kad: HashMap::new(),
             pending_service_responses: HashMap::new(),
-            pending_providers: HashMap::new(),
             node_rtts,
             cmd_rx,
             inbound_req_tx,
         }
     }
 
-    pub async fn run(mut self) -> Result<(), Box<dyn Error>> {
-        let mut event_rx = self.net.run().await;
+    /// 运行节点，需要 NetHandle 来驱动 Swarm 事件循环
+    /// Swarm 不再 spawn 到独立 task，而是在主 select! 循环中直接驱动，
+    /// 这样 handler 方法可以直接访问 &mut Swarm 进行 DHT 操作。
+    pub async fn run(mut self, net_handle: NetHandle) -> Result<(), Box<dyn Error>> {
+        let mut swarm = net_handle.run();
         loop {
             tokio::select! {
-                Some(event) = event_rx.recv() => {
+                event = swarm.select_next_some() => {
                     match event {
-                        NetBehaviourEvent::Ping(ping_event) => { self.handle_ping(ping_event).await?; }
-                        NetBehaviourEvent::Identify(identify_event) => { self.handle_identify(identify_event).await?; }
-                        NetBehaviourEvent::Kademlia(kad_event) => { self.handle_kademlia(kad_event).await?; }
-                        NetBehaviourEvent::ServiceReq(req_event) => { self.handle_service_req(req_event).await; }
+                        SwarmEvent::Behaviour(NetBehaviourEvent::Ping(ping_event)) => {
+                            self.handle_ping(ping_event).await?;
+                        }
+                        SwarmEvent::Behaviour(NetBehaviourEvent::Identify(identify_event)) => {
+                            self.handle_identify(identify_event, &mut swarm).await?;
+                        }
+                        SwarmEvent::Behaviour(NetBehaviourEvent::Kademlia(kad_event)) => {
+                            self.handle_kademlia(kad_event, &mut swarm).await?;
+                        }
+                        SwarmEvent::Behaviour(NetBehaviourEvent::ServiceReq(req_event)) => {
+                            self.handle_service_req(req_event, &mut swarm).await?;
+                        }
+                        _ => {}
                     }
                 }
                 Some(cmd) = self.cmd_rx.recv() => {
-                    self.handle_command(cmd).await;
+                    self.handle_command(cmd, &mut swarm).await;
                 }
             }
         }
@@ -95,17 +123,19 @@ impl NodeController {
         Ok(())
     }
 
-    async fn handle_identify(&mut self, event: identify::Event) -> Result<(), Box<dyn Error>> {
+    async fn handle_identify(
+        &mut self,
+        event: identify::Event,
+        swarm: &mut Swarm<NetBehaviour>,
+    ) -> Result<(), Box<dyn Error>> {
         match event {
             identify::Event::Received { peer_id, info, .. } => {
                 if info.agent_version.starts_with("/oahd/") {
                     for addr in &info.listen_addrs {
-                        self.net.with_swarm_mut(|swarm| {
-                            swarm
-                                .behaviour_mut()
-                                .kademlia
-                                .add_address(&peer_id, addr.clone());
-                        });
+                        swarm
+                            .behaviour_mut()
+                            .kademlia
+                            .add_address(&peer_id, addr.clone());
                     }
                     let full_addr = info
                         .listen_addrs
@@ -129,9 +159,7 @@ impl NodeController {
                     )
                     .emit();
                 } else {
-                    self.net.with_swarm_mut(|swarm| {
-                        swarm.disconnect_peer_id(peer_id);
-                    });
+                    swarm.disconnect_peer_id(peer_id);
                 }
             }
             identify::Event::Error { peer_id, error, .. } => {
@@ -147,14 +175,18 @@ impl NodeController {
         Ok(())
     }
 
-    async fn handle_kademlia(&mut self, event: kad::Event) -> Result<(), Box<dyn Error>> {
-        match event {
-            kad::Event::OutboundQueryProgressed { result, id, .. } => match result {
+    async fn handle_kademlia(
+        &mut self,
+        event: kad::Event,
+        swarm: &mut Swarm<NetBehaviour>,
+    ) -> Result<(), Box<dyn Error>> {
+        if let kad::Event::OutboundQueryProgressed { result, id, .. } = event {
+            match result {
                 kad::QueryResult::Bootstrap(result) => {
                     if result.is_ok() {
                         if !self.bootstrap_triggered {
                             self.bootstrap_triggered = true;
-                            self.announce_local_services().await?;
+                            self.announce_local_services(swarm).await?;
                         }
                     } else if let Err(e) = result {
                         LogStruct::new(
@@ -166,29 +198,126 @@ impl NodeController {
                     }
                 }
                 kad::QueryResult::GetRecord(result) => {
-                    if let Some(sender) = self.pending_records.remove(&id) {
-                        let _ = sender.send(result);
+                    if let Some(cb) = self.pending_kad.remove(&id) {
+                        match cb {
+                            KadCallback::GetRecord(sender) => {
+                                let _ = sender.send(result);
+                            }
+                            KadCallback::ServiceTypeMerge(my_types) => {
+                                let existing_types = match &result {
+                                    Ok(kad::GetRecordOk::FoundRecord(peer_record)) => {
+                                        serde_json::from_slice::<Vec<String>>(
+                                            &peer_record.record.value,
+                                        )
+                                        .unwrap_or_default()
+                                    }
+                                    _ => Vec::new(),
+                                };
+                                let mut all_types = existing_types;
+                                for t in my_types {
+                                    if !all_types.contains(&t) {
+                                        all_types.push(t);
+                                    }
+                                }
+                                if let Ok(types_json) = serde_json::to_vec(&all_types) {
+                                    let record = kad::Record {
+                                        key: kad::RecordKey::new(b"/oahd/service/types"),
+                                        value: types_json,
+                                        publisher: None,
+                                        expires: None,
+                                    };
+                                    let _ = swarm
+                                        .behaviour_mut()
+                                        .kademlia
+                                        .put_record(record, kad::Quorum::Majority);
+                                }
+                            }
+                            KadCallback::ListServices(sender) => {
+                                let types = match &result {
+                                    Ok(kad::GetRecordOk::FoundRecord(peer_record)) => {
+                                        serde_json::from_slice::<Vec<String>>(
+                                            &peer_record.record.value,
+                                        )
+                                        .unwrap_or_default()
+                                    }
+                                    _ => Vec::new(),
+                                };
+                                let _ = sender.send(Ok(serde_json::to_vec(&types).unwrap()));
+                            }
+                            _ => {}
+                        }
                     }
                 }
                 kad::QueryResult::GetProviders(result) => {
-                    if let Some(sender) = self.pending_providers.remove(&id) {
-                        let send_result = match result {
-                            Ok(providers_ok) => match providers_ok {
-                                kad::GetProvidersOk::FoundProviders { providers, .. } => {
-                                    Ok(providers.into_iter().collect())
+                    if let Some(cb) = self.pending_kad.remove(&id) {
+                        match cb {
+                            KadCallback::GetProviders(sender) => {
+                                let send_result = match result {
+                                    Ok(providers_ok) => match providers_ok {
+                                        kad::GetProvidersOk::FoundProviders {
+                                            providers, ..
+                                        } => Ok(providers.into_iter().collect()),
+                                        kad::GetProvidersOk::FinishedWithNoAdditionalRecord {
+                                            ..
+                                        } => Ok(Vec::new()),
+                                    },
+                                    Err(e) => Err(e),
+                                };
+                                let _ = sender.send(send_result);
+                            }
+                            KadCallback::DiscoverProviders(sender) => {
+                                let providers: Vec<PeerId> = match &result {
+                                    Ok(providers_ok) => match providers_ok {
+                                        kad::GetProvidersOk::FoundProviders {
+                                            providers, ..
+                                        } => providers.iter().copied().collect(),
+                                        _ => Vec::new(),
+                                    },
+                                    _ => Vec::new(),
+                                };
+                                let _ = sender.send(Ok(serde_json::to_vec(&providers).unwrap()));
+                            }
+                            KadCallback::ServiceCall {
+                                service,
+                                payload,
+                                response_tx,
+                            } => {
+                                let providers: Vec<PeerId> = match &result {
+                                    Ok(providers_ok) => match providers_ok {
+                                        kad::GetProvidersOk::FoundProviders {
+                                            providers, ..
+                                        } => providers.iter().copied().collect(),
+                                        _ => Vec::new(),
+                                    },
+                                    _ => Vec::new(),
+                                };
+
+                                if providers.is_empty() {
+                                    let _ = response_tx.send(Err("No provider found".to_string()));
+                                } else {
+                                    let best_peer = self
+                                        .get_best_peer(&providers)
+                                        .or_else(|| providers.first().copied())
+                                        .unwrap();
+
+                                    let request = service_protocol::Request { service, payload };
+                                    let request_id = swarm
+                                        .behaviour_mut()
+                                        .service_req
+                                        .send_request(&best_peer, request);
+
+                                    self.pending_service_responses.insert(
+                                        request_id,
+                                        SvcCallback::CommandResponse(response_tx),
+                                    );
                                 }
-                                kad::GetProvidersOk::FinishedWithNoAdditionalRecord { .. } => {
-                                    Ok(Vec::new())
-                                }
-                            },
-                            Err(e) => Err(e),
-                        };
-                        let _ = sender.send(send_result);
+                            }
+                            _ => {}
+                        }
                     }
                 }
                 _ => {}
-            },
-            _ => {}
+            }
         }
         Ok(())
     }
@@ -202,58 +331,13 @@ impl NodeController {
             .map(|(p, _)| *p)
     }
 
-    pub async fn send_request_to_peer(
-        &mut self,
-        peer: PeerId,
-        service: String,
-        payload: Vec<u8>,
-    ) -> Result<service_protocol::Response, String> {
-        let request = service_protocol::Request { service, payload };
-
-        let (tx, rx) = oneshot::channel();
-
-        let request_id = self
-            .net
-            .with_swarm_mut(|swarm| {
-                swarm
-                    .behaviour_mut()
-                    .service_req
-                    .send_request(&peer, request)
-            })
-            .ok_or("Swarm 未初始化")?;
-
-        self.pending_service_responses.insert(request_id, tx);
-
-        rx.await.map_err(|_| "请求通道已关闭".to_string())?
-    }
-
-    pub async fn call_service(
-        &mut self,
-        service: String,
-        payload: Vec<u8>,
-    ) -> Result<service_protocol::Response, String> {
-        let providers = self
-            .discover_providers(&service)
-            .await
-            .map_err(|e| format!("Service discovery failed: {}", e))?;
-        if providers.is_empty() {
-            return Err("No provider found for this service".to_string());
-        }
-
-        let best_peer = self
-            .get_best_peer(&providers)
-            .or_else(|| providers.first().copied())
-            .ok_or("No available provider")?;
-
-        self.send_request_to_peer(best_peer, service, payload).await
-    }
-
     async fn handle_service_req(
         &mut self,
         event: request_response::Event<service_protocol::Request, service_protocol::Response>,
+        swarm: &mut Swarm<NetBehaviour>,
     ) -> Result<(), Box<dyn Error>> {
         match event {
-            request_response::Event::Message { peer, message, .. } => {
+            request_response::Event::Message { message, .. } => {
                 match message {
                     request_response::Message::Request {
                         request, channel, ..
@@ -266,17 +350,14 @@ impl NodeController {
                         };
                         // 转发给 ServiceDispatcher
                         if let Err(e) = self.inbound_req_tx.send(inbound) {
-                            // 如果 ServiceDispatcher 已关闭，返回错误
                             let err_resp = service_protocol::Response {
                                 success: false,
                                 data: format!("service unavailable: {}", e).into_bytes(),
                             };
-                            let _ = self.net.with_swarm_mut(|swarm| {
-                                swarm
-                                    .behaviour_mut()
-                                    .service_req
-                                    .send_response(channel, err_resp);
-                            });
+                            let _ = swarm
+                                .behaviour_mut()
+                                .service_req
+                                .send_response(channel, err_resp);
                             return Ok(());
                         }
                         // 等待 ServiceDispatcher 的处理结果
@@ -292,20 +373,25 @@ impl NodeController {
                             },
                         };
                         // 将结果发送回请求方
-                        self.net.with_swarm_mut(|swarm| {
-                            let _ = swarm
-                                .behaviour_mut()
-                                .service_req
-                                .send_response(channel, result);
-                        });
+                        let _ = swarm
+                            .behaviour_mut()
+                            .service_req
+                            .send_response(channel, result);
                     }
                     request_response::Message::Response {
                         request_id,
                         response,
                         ..
                     } => {
-                        if let Some(sender) = self.pending_service_responses.remove(&request_id) {
-                            let _ = sender.send(Ok(response));
+                        if let Some(cb) = self.pending_service_responses.remove(&request_id) {
+                            match cb {
+                                SvcCallback::Async(sender) => {
+                                    let _ = sender.send(Ok(response));
+                                }
+                                SvcCallback::CommandResponse(sender) => {
+                                    let _ = sender.send(Ok(response.data));
+                                }
+                            }
                         }
                     }
                 }
@@ -313,8 +399,15 @@ impl NodeController {
             request_response::Event::OutboundFailure {
                 request_id, error, ..
             } => {
-                if let Some(sender) = self.pending_service_responses.remove(&request_id) {
-                    let _ = sender.send(Err(error.to_string()));
+                if let Some(cb) = self.pending_service_responses.remove(&request_id) {
+                    match cb {
+                        SvcCallback::Async(sender) => {
+                            let _ = sender.send(Err(error.to_string()));
+                        }
+                        SvcCallback::CommandResponse(sender) => {
+                            let _ = sender.send(Err(error.to_string()));
+                        }
+                    }
                 }
             }
             request_response::Event::InboundFailure {
@@ -332,29 +425,10 @@ impl NodeController {
         Ok(())
     }
 
-    async fn get_global_service_types(&mut self) -> Result<Vec<String>, Box<dyn Error>> {
-        let types_key = kad::RecordKey::new(b"/oahd/service/types");
-        let (tx, rx) = oneshot::channel();
-        let query_id = self
-            .net
-            .with_swarm_mut(|swarm| swarm.behaviour_mut().kademlia.get_record(types_key))
-            .ok_or("Swarm 未初始化")?;
-        self.pending_records.insert(query_id, tx);
-
-        match rx.await {
-            Ok(Ok(record_ok)) => match record_ok {
-                kad::GetRecordOk::FoundRecord(peer_record) => {
-                    let types: Vec<String> = serde_json::from_slice(&peer_record.record.value)?;
-                    Ok(types)
-                }
-                kad::GetRecordOk::FinishedWithNoAdditionalRecord { .. } => Ok(Vec::new()),
-            },
-            Ok(Err(e)) => Err(Box::new(e)),
-            Err(_) => Err("通道关闭".into()),
-        }
-    }
-
-    async fn announce_local_services(&mut self) -> Result<(), Box<dyn Error>> {
+    async fn announce_local_services(
+        &mut self,
+        swarm: &mut Swarm<NetBehaviour>,
+    ) -> Result<(), Box<dyn Error>> {
         let local_services = self
             .config
             .read()
@@ -369,10 +443,7 @@ impl NodeController {
         for local_service in &local_services {
             let key = format!("/oahd/service/{}", local_service.name);
             let record_key = libp2p::kad::RecordKey::new(&key);
-            self.net.with_swarm_mut(|swarm| {
-                swarm.behaviour_mut().kademlia.start_providing(record_key)?;
-                Ok::<_, Box<dyn Error>>(())
-            });
+            swarm.behaviour_mut().kademlia.start_providing(record_key)?;
             LogStruct::new(
                 LogLevel::Preset,
                 format!("已注册服务: {}", local_service.name),
@@ -383,66 +454,12 @@ impl NodeController {
 
         let my_types: Vec<String> = local_services.iter().map(|s| s.name.clone()).collect();
         let types_key = kad::RecordKey::new(b"/oahd/service/types");
-        let (tx, rx) = oneshot::channel();
-        let query_id = self
-            .net
-            .with_swarm_mut(|swarm| swarm.behaviour_mut().kademlia.get_record(types_key.clone()))
-            .expect("msg");
-        self.pending_records.insert(query_id, tx);
-
-        let existing_types = match rx.await {
-            Ok(Ok(record_ok)) => match record_ok {
-                kad::GetRecordOk::FoundRecord(peer_record) => {
-                    serde_json::from_slice::<Vec<String>>(&peer_record.record.value)
-                        .unwrap_or_default()
-                }
-                kad::GetRecordOk::FinishedWithNoAdditionalRecord { .. } => Vec::new(),
-            },
-            _ => Vec::new(),
-        };
-        let mut all_types = existing_types;
-        for t in my_types {
-            if !all_types.contains(&t) {
-                all_types.push(t);
-            }
-        }
-        let types_json = serde_json::to_vec(&all_types)?;
-        let record = kad::Record {
-            key: types_key,
-            value: types_json,
-            publisher: None,
-            expires: None,
-        };
-        self.net
-            .with_swarm_mut(|swarm| {
-                swarm
-                    .behaviour_mut()
-                    .kademlia
-                    .put_record(record, kad::Quorum::Majority)?;
-                Ok::<_, Box<dyn Error>>(())
-            })
-            .ok_or("Swarm 未初始化")??;
+        // Phase 1: 发起 get_record 查询；Phase 2 在 handle_kademlia 中异步完成
+        //   不能在此处 rx.await — Swarm 与 event loop 在同一 task 中，会导致死锁
+        let query_id = swarm.behaviour_mut().kademlia.get_record(types_key);
+        self.pending_kad
+            .insert(query_id, KadCallback::ServiceTypeMerge(my_types));
         Ok(())
-    }
-
-    pub async fn discover_providers(
-        &mut self,
-        service_type: &str,
-    ) -> Result<Vec<PeerId>, Box<dyn Error>> {
-        let key = format!("/oahd/service/{}", service_type);
-        let record_key = kad::RecordKey::new(&key);
-
-        let (tx, rx) = oneshot::channel();
-
-        let query_id = self
-            .net
-            .with_swarm_mut(|swarm| swarm.behaviour_mut().kademlia.get_providers(record_key))
-            .ok_or("Swarm 未初始化")?;
-
-        self.pending_providers.insert(query_id, tx);
-
-        let result = rx.await??;
-        Ok(result)
     }
 
     async fn add_bootstrap_node(
@@ -472,62 +489,83 @@ impl NodeController {
         Ok(())
     }
 
-    async fn handle_command(&mut self, cmd: Command) {
-        let result = match cmd.prefix.as_str() {
-            "@" => match cmd.content.as_str() {
-                "discover_providers" => {
-                    let service_type = String::from_utf8(cmd.payload).unwrap_or_default();
-                    self.discover_providers(&service_type)
-                        .await
-                        .map(|peers| serde_json::to_vec(&peers).unwrap())
-                        .map_err(|e| e.to_string())
+    async fn handle_command(&mut self, cmd: Command, swarm: &mut Swarm<NetBehaviour>) {
+        let Command {
+            prefix,
+            content,
+            payload,
+            resp_tx,
+        } = cmd;
+
+        let result: Option<Result<Vec<u8>, String>> = match prefix.as_str() {
+            "@" => match content.as_str() {
+                // ── 异步命令：不阻塞 event loop，由 KadCallback 处理器完成 ──
+                "list_services" => {
+                    let types_key = kad::RecordKey::new(b"/oahd/service/types");
+                    let query_id = swarm.behaviour_mut().kademlia.get_record(types_key);
+                    self.pending_kad
+                        .insert(query_id, KadCallback::ListServices(resp_tx));
+                    return;
                 }
-                "list_services" => self
-                    .get_global_service_types()
-                    .await
-                    .map(|types| serde_json::to_vec(&types).unwrap())
-                    .map_err(|e| e.to_string()),
+                "discover_providers" => {
+                    let service_type = String::from_utf8(payload).unwrap_or_default();
+                    let key = format!("/oahd/service/{}", service_type);
+                    let record_key = kad::RecordKey::new(&key);
+                    let query_id = swarm.behaviour_mut().kademlia.get_providers(record_key);
+                    self.pending_kad
+                        .insert(query_id, KadCallback::DiscoverProviders(resp_tx));
+                    return;
+                }
+                // ── 同步命令 ──
                 "query_public_ip" => {
                     let network = &self.config.read().network;
                     let ip_info = serde_json::json!({
                         "ipv4": network.ipv4_address.map(|a| a.to_string()),
                         "ipv6": network.ipv6_address.map(|a| a.to_string()),
                     });
-                    Ok(serde_json::to_vec(&ip_info).unwrap())
+                    Some(Ok(serde_json::to_vec(&ip_info).unwrap()))
                 }
                 "reconnect_bootstrap" => {
                     let nodes = self.config.bootstrap_nodes();
                     let mut any_success = false;
                     for addr in &nodes {
-                        if self.net.dial(addr.clone()).is_ok() {
+                        if swarm.dial(addr.clone()).is_ok() {
                             any_success = true;
                         }
                     }
                     let result = serde_json::json!({
                         "success": any_success
                     });
-                    Ok(serde_json::to_vec(&result).unwrap())
+                    Some(Ok(serde_json::to_vec(&result).unwrap()))
                 }
                 "reannounce_services" => {
-                    let result = match self.announce_local_services().await {
+                    let result = match self.announce_local_services(swarm).await {
                         Ok(_) => serde_json::json!({"success": true}),
                         Err(e) => serde_json::json!({"success": false, "error": e.to_string()}),
                     };
-                    Ok(serde_json::to_vec(&result).unwrap())
+                    Some(Ok(serde_json::to_vec(&result).unwrap()))
                 }
-                _ => Err("Unknown command".to_string()),
+                _ => Some(Err("Unknown command".to_string())),
             },
             "service_request" => {
-                let service = cmd.content;
-                let payload = cmd.payload;
-                self.call_service(service, payload)
-                    .await
-                    .map(|resp| resp.data)
-                    .map_err(|e| e.to_string())
+                let service = content;
+                let payload = payload;
+                let key = format!("/oahd/service/{}", service);
+                let record_key = kad::RecordKey::new(&key);
+                let query_id = swarm.behaviour_mut().kademlia.get_providers(record_key);
+                self.pending_kad.insert(
+                    query_id,
+                    KadCallback::ServiceCall {
+                        service,
+                        payload,
+                        response_tx: resp_tx,
+                    },
+                );
+                return;
             }
-            _ => Err("command not supported".to_string()),
+            _ => Some(Err("command not supported".to_string())),
         };
-        let _ = cmd.resp_tx.send(result);
+        let _ = resp_tx.send(result.unwrap());
     }
 }
 
