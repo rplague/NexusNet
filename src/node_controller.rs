@@ -91,7 +91,7 @@ impl NodeController {
                             self.handle_kademlia(kad_event, &mut swarm).await?;
                         }
                         SwarmEvent::Behaviour(NetBehaviourEvent::ServiceReq(req_event)) => {
-                            self.handle_service_req(req_event, &mut swarm).await;
+                            self.handle_service_req(req_event, &mut swarm).await?;
                         }
                         _ => {}
                     }
@@ -180,8 +180,8 @@ impl NodeController {
         event: kad::Event,
         swarm: &mut Swarm<NetBehaviour>,
     ) -> Result<(), Box<dyn Error>> {
-        match event {
-            kad::Event::OutboundQueryProgressed { result, id, .. } => match result {
+        if let kad::Event::OutboundQueryProgressed { result, id, .. } = event {
+            match result {
                 kad::QueryResult::Bootstrap(result) => {
                     if result.is_ok() {
                         if !self.bootstrap_triggered {
@@ -317,8 +317,7 @@ impl NodeController {
                     }
                 }
                 _ => {}
-            },
-            _ => {}
+            }
         }
         Ok(())
     }
@@ -332,58 +331,13 @@ impl NodeController {
             .map(|(p, _)| *p)
     }
 
-    pub async fn send_request_to_peer(
-        &mut self,
-        peer: PeerId,
-        service: String,
-        payload: Vec<u8>,
-        swarm: &mut Swarm<NetBehaviour>,
-    ) -> Result<service_protocol::Response, String> {
-        let request = service_protocol::Request { service, payload };
-
-        let (tx, rx) = oneshot::channel();
-
-        let request_id = swarm
-            .behaviour_mut()
-            .service_req
-            .send_request(&peer, request);
-
-        self.pending_service_responses
-            .insert(request_id, SvcCallback::Async(tx));
-
-        rx.await.map_err(|_| "请求通道已关闭".to_string())?
-    }
-
-    pub async fn call_service(
-        &mut self,
-        service: String,
-        payload: Vec<u8>,
-        swarm: &mut Swarm<NetBehaviour>,
-    ) -> Result<service_protocol::Response, String> {
-        let providers = self
-            .discover_providers(&service, swarm)
-            .await
-            .map_err(|e| format!("Service discovery failed: {}", e))?;
-        if providers.is_empty() {
-            return Err("No provider found for this service".to_string());
-        }
-
-        let best_peer = self
-            .get_best_peer(&providers)
-            .or_else(|| providers.first().copied())
-            .ok_or("No available provider")?;
-
-        self.send_request_to_peer(best_peer, service, payload, swarm)
-            .await
-    }
-
     async fn handle_service_req(
         &mut self,
         event: request_response::Event<service_protocol::Request, service_protocol::Response>,
         swarm: &mut Swarm<NetBehaviour>,
     ) -> Result<(), Box<dyn Error>> {
         match event {
-            request_response::Event::Message { peer, message, .. } => {
+            request_response::Event::Message { message, .. } => {
                 match message {
                     request_response::Message::Request {
                         request, channel, ..
@@ -471,29 +425,6 @@ impl NodeController {
         Ok(())
     }
 
-    async fn get_global_service_types(
-        &mut self,
-        swarm: &mut Swarm<NetBehaviour>,
-    ) -> Result<Vec<String>, Box<dyn Error>> {
-        let types_key = kad::RecordKey::new(b"/oahd/service/types");
-        let (tx, rx) = oneshot::channel();
-        let query_id = swarm.behaviour_mut().kademlia.get_record(types_key);
-        self.pending_kad
-            .insert(query_id, KadCallback::GetRecord(tx));
-
-        match rx.await {
-            Ok(Ok(record_ok)) => match record_ok {
-                kad::GetRecordOk::FoundRecord(peer_record) => {
-                    let types: Vec<String> = serde_json::from_slice(&peer_record.record.value)?;
-                    Ok(types)
-                }
-                kad::GetRecordOk::FinishedWithNoAdditionalRecord { .. } => Ok(Vec::new()),
-            },
-            Ok(Err(e)) => Err(Box::new(e)),
-            Err(_) => Err("通道关闭".into()),
-        }
-    }
-
     async fn announce_local_services(
         &mut self,
         swarm: &mut Swarm<NetBehaviour>,
@@ -529,25 +460,6 @@ impl NodeController {
         self.pending_kad
             .insert(query_id, KadCallback::ServiceTypeMerge(my_types));
         Ok(())
-    }
-
-    pub async fn discover_providers(
-        &mut self,
-        service_type: &str,
-        swarm: &mut Swarm<NetBehaviour>,
-    ) -> Result<Vec<PeerId>, Box<dyn Error>> {
-        let key = format!("/oahd/service/{}", service_type);
-        let record_key = kad::RecordKey::new(&key);
-
-        let (tx, rx) = oneshot::channel();
-
-        let query_id = swarm.behaviour_mut().kademlia.get_providers(record_key);
-
-        self.pending_kad
-            .insert(query_id, KadCallback::GetProviders(tx));
-
-        let result = rx.await??;
-        Ok(result)
     }
 
     async fn add_bootstrap_node(
