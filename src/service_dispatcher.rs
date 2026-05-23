@@ -128,7 +128,14 @@ impl ServiceDispatcher {
                     )
                     .emit();
 
-                    let _ = Self::read_loop_inner(read_half, &service_name, &pending_map, &cmd_tx, &writer).await;
+                    let _ = Self::read_loop_inner(
+                        read_half,
+                        &service_name,
+                        &pending_map,
+                        &cmd_tx,
+                        &writer,
+                    )
+                    .await;
 
                     backend_writers.lock().await.remove(&service_name);
 
