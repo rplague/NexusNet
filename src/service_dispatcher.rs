@@ -1,3 +1,4 @@
+use std::cmp::min;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -32,7 +33,7 @@ pub struct ServiceDispatcher {
     local_services: Vec<LocalServiceEntry>,
     pending_requests:
         HashMap<String, Arc<Mutex<HashMap<String, oneshot::Sender<Result<Vec<u8>, String>>>>>>,
-    backend_writers: HashMap<String, Arc<Mutex<OwnedWriteHalf>>>,
+    backend_writers: Arc<Mutex<HashMap<String, Arc<Mutex<OwnedWriteHalf>>>>>,
 }
 
 impl ServiceDispatcher {
@@ -52,7 +53,7 @@ impl ServiceDispatcher {
             config,
             local_services,
             pending_requests,
-            backend_writers: HashMap::new(),
+            backend_writers: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -61,7 +62,10 @@ impl ServiceDispatcher {
 
         while let Some(req) = self.inbound_rx.recv().await {
             let pending_map = self.pending_requests.get(&req.service).cloned(); // 获取该服务的等待表
-            let writer = self.backend_writers.get(&req.service).cloned();
+            let writer = {
+                let map = self.backend_writers.lock().await;
+                map.get(&req.service).cloned()
+            };
 
             if let (Some(pending_map), Some(writer)) = (pending_map, writer) {
                 tokio::spawn(async move {
@@ -79,59 +83,84 @@ impl ServiceDispatcher {
     }
 
     async fn init_backend_connections(&mut self) {
+        let backend_writers = self.backend_writers.clone();
         for service in &self.local_services {
             let addr = format!("127.0.0.1:{}", service.port);
-            // 重试机制：最多尝试 3 次，每次间隔 1 秒
-            let mut retries = 3;
-            let stream = loop {
-                match TcpStream::connect(&addr).await {
-                    Ok(stream) => break stream,
-                    Err(e) => {
-                        retries -= 1;
-                        if retries == 0 {
-                            panic!("无法连接到后端服务 {}: {}", service.name, e);
-                        }
-                        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-                    }
-                }
-            };
-
-            // 分割读写半句柄
-            let (read_half, write_half) = stream.into_split();
-
-            // 启动读任务
             let service_name = service.name.clone();
             let pending_map = self.pending_requests.get(&service_name).cloned().unwrap();
             let cmd_tx = self.cmd_tx.clone();
-            let writer = Arc::new(Mutex::new(write_half));
 
             tokio::spawn(Self::backend_read_loop(
-                read_half,
                 service_name,
                 pending_map,
                 cmd_tx,
-                writer.clone(),
+                backend_writers.clone(),
+                addr,
             ));
-
-            // 存储写半句柄
-            self.backend_writers.insert(service.name.clone(), writer);
-
-            LogStruct::new(
-                LogLevel::Preset,
-                "后端连接建立",
-                format!("{} -> {}", service.name, addr),
-            )
-            .emit();
         }
     }
 
     async fn backend_read_loop(
-        mut read_half: OwnedReadHalf,
         service_name: String,
         pending_map: Arc<Mutex<HashMap<String, oneshot::Sender<Result<Vec<u8>, String>>>>>,
         cmd_tx: mpsc::UnboundedSender<Command>,
-        writer: Arc<Mutex<OwnedWriteHalf>>,
+        backend_writers: Arc<Mutex<HashMap<String, Arc<Mutex<OwnedWriteHalf>>>>>,
+        addr: String,
     ) {
+        let mut backoff = 1u64;
+
+        loop {
+            match TcpStream::connect(&addr).await {
+                Ok(stream) => {
+                    backoff = 1;
+                    let (read_half, write_half) = stream.into_split();
+                    let writer = Arc::new(Mutex::new(write_half));
+
+                    backend_writers
+                        .lock()
+                        .await
+                        .insert(service_name.clone(), writer.clone());
+
+                    LogStruct::new(
+                        LogLevel::Preset,
+                        "后端连接建立",
+                        format!("{} -> {}", service_name, addr),
+                    )
+                    .emit();
+
+                    let _ = Self::read_loop_inner(read_half, &service_name, &pending_map, &cmd_tx, &writer).await;
+
+                    backend_writers.lock().await.remove(&service_name);
+
+                    LogStruct::new(
+                        LogLevel::Warning,
+                        "后端连接断开",
+                        format!("{} 将在 {} 秒后重连", service_name, backoff),
+                    )
+                    .emit();
+                }
+                Err(e) => {
+                    LogStruct::new(
+                        LogLevel::Warning,
+                        "后端连接失败",
+                        format!("{}: {}, {} 秒后重试", service_name, e, backoff),
+                    )
+                    .emit();
+                }
+            }
+
+            tokio::time::sleep(Duration::from_secs(backoff)).await;
+            backoff = min(backoff * 2, 60);
+        }
+    }
+
+    async fn read_loop_inner(
+        mut read_half: OwnedReadHalf,
+        service_name: &str,
+        pending_map: &Arc<Mutex<HashMap<String, oneshot::Sender<Result<Vec<u8>, String>>>>>,
+        cmd_tx: &mpsc::UnboundedSender<Command>,
+        writer: &Arc<Mutex<OwnedWriteHalf>>,
+    ) -> Result<(), ()> {
         loop {
             let mut len_buf = [0u8; 4];
             if let Err(e) = read_half.read_exact(&mut len_buf).await {
@@ -141,12 +170,11 @@ impl ServiceDispatcher {
                     format!("{} 读取 uuid_len 失败: {}", service_name, e),
                 )
                 .emit();
-                break;
+                return Err(());
             }
             let uuid_len = u32::from_be_bytes(len_buf);
 
             if uuid_len == 0 {
-                // 主动控制指令：没有 UUID，直接读取 payload_len + payload
                 let mut payload_len_buf = [0u8; 4];
                 if let Err(e) = read_half.read_exact(&mut payload_len_buf).await {
                     LogStruct::new(
@@ -155,7 +183,7 @@ impl ServiceDispatcher {
                         format!("{} 读取控制指令 payload_len 失败: {}", service_name, e),
                     )
                     .emit();
-                    break;
+                    return Err(());
                 }
                 let payload_len = u32::from_be_bytes(payload_len_buf) as usize;
                 let mut payload = vec![0u8; payload_len];
@@ -166,7 +194,7 @@ impl ServiceDispatcher {
                         format!("{} 读取控制指令 payload 失败: {}", service_name, e),
                     )
                     .emit();
-                    break;
+                    return Err(());
                 }
                 if let Ok(cmd_str) = String::from_utf8(payload) {
                     let parts: Vec<&str> = cmd_str.splitn(3, '|').collect();
@@ -174,7 +202,6 @@ impl ServiceDispatcher {
                         let prefix = parts[0].to_string();
                         let content = parts[1].to_string();
                         let payload = parts[2].as_bytes().to_vec();
-                        // 构造 Command
                         let (resp_tx, resp_rx) = oneshot::channel();
                         let command = Command {
                             prefix,
@@ -182,7 +209,6 @@ impl ServiceDispatcher {
                             payload,
                             resp_tx,
                         };
-                        // 发送给 NodeController
                         if let Err(e) = cmd_tx.send(command) {
                             LogStruct::new(
                                 LogLevel::Error,
@@ -191,7 +217,6 @@ impl ServiceDispatcher {
                             )
                             .emit();
                         } else {
-                            // 等待执行结果
                             match timeout(Duration::from_secs(30), resp_rx).await {
                                 Ok(Ok(Ok(result_data))) => {
                                     let mut response = Vec::new();
@@ -225,7 +250,7 @@ impl ServiceDispatcher {
                                     LogStruct::new(
                                         LogLevel::Error,
                                         "命令响应通道关闭",
-                                        &service_name,
+                                        service_name,
                                     )
                                     .emit();
                                 }
@@ -241,7 +266,7 @@ impl ServiceDispatcher {
                         .emit();
                     }
                 } else {
-                    LogStruct::new(LogLevel::Warning, "控制指令非 UTF-8", &service_name).emit();
+                    LogStruct::new(LogLevel::Warning, "控制指令非 UTF-8", service_name).emit();
                 }
             } else {
                 let uuid_len_usize = uuid_len as usize;
@@ -253,7 +278,7 @@ impl ServiceDispatcher {
                         format!("{} 读取 UUID 失败: {}", service_name, e),
                     )
                     .emit();
-                    break;
+                    return Err(());
                 }
                 let uuid = match String::from_utf8(uuid_bytes) {
                     Ok(s) => s,
@@ -264,11 +289,10 @@ impl ServiceDispatcher {
                             format!("{} UUID 非 UTF-8: {}", service_name, e),
                         )
                         .emit();
-                        break;
+                        return Err(());
                     }
                 };
 
-                // 读取 payload_len
                 let mut payload_len_buf = [0u8; 4];
                 if let Err(e) = read_half.read_exact(&mut payload_len_buf).await {
                     LogStruct::new(
@@ -277,7 +301,7 @@ impl ServiceDispatcher {
                         format!("{} 读取响应 payload_len 失败: {}", service_name, e),
                     )
                     .emit();
-                    break;
+                    return Err(());
                 }
                 let payload_len = u32::from_be_bytes(payload_len_buf) as usize;
                 let mut payload = vec![0u8; payload_len];
@@ -288,10 +312,9 @@ impl ServiceDispatcher {
                         format!("{} 读取响应 payload 失败: {}", service_name, e),
                     )
                     .emit();
-                    break;
+                    return Err(());
                 }
 
-                // 从等待表中查找并唤醒等待者
                 let sender = {
                     let mut map = pending_map.lock().await;
                     map.remove(&uuid)
@@ -301,12 +324,6 @@ impl ServiceDispatcher {
                 }
             }
         }
-        LogStruct::new(
-            LogLevel::Warning,
-            "后端连接断开",
-            format!("{} 读循环退出", service_name),
-        )
-        .emit();
     }
 
     fn encode_request(uuid: &str, payload: &[u8]) -> Vec<u8> {
