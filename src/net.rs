@@ -150,7 +150,11 @@ impl KeyManager {
     }
 
     /// 保存 PQ 密钥到 sidecar 文件
-    pub fn save_pq_keys(&mut self, secret: Vec<u8>, public: Vec<u8>) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn save_pq_keys(
+        &mut self,
+        secret: Vec<u8>,
+        public: Vec<u8>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let mut buf = Vec::with_capacity(8 + secret.len() + public.len());
         buf.extend_from_slice(&(secret.len() as u32).to_be_bytes());
         buf.extend_from_slice(&secret);
@@ -180,7 +184,8 @@ impl KeyManager {
             return (None, None);
         }
         let secret = bytes[4..4 + secret_len].to_vec();
-        let public_len = u32::from_be_bytes(bytes[4 + secret_len..8 + secret_len].try_into().unwrap()) as usize;
+        let public_len =
+            u32::from_be_bytes(bytes[4 + secret_len..8 + secret_len].try_into().unwrap()) as usize;
         if 8 + secret_len + public_len > bytes.len() {
             return (None, None);
         }
