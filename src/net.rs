@@ -31,9 +31,9 @@ use std::{
 pub struct KeyManager {
     keypair: identity::Keypair,
     path: PathBuf,
+    pq_path: PathBuf,
     pq_secret_key: Option<Vec<u8>>,
     pq_public_key: Option<Vec<u8>>,
-    pq_path: PathBuf,
 }
 
 impl KeyManager {
