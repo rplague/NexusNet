@@ -31,14 +31,18 @@ use std::{
 pub struct KeyManager {
     keypair: identity::Keypair,
     path: PathBuf,
+    pq_path: PathBuf,
+    pq_secret_key: Option<Vec<u8>>,
+    pq_public_key: Option<Vec<u8>>,
 }
 
 impl KeyManager {
     /// 从指定路径加载密钥，若不存在则生成并原子保存
     pub fn load_or_create(path: impl AsRef<Path>) -> Result<Self, Box<dyn std::error::Error>> {
         let path = path.as_ref();
+        let pq_path = path.with_extension("pq.bin");
 
-        // 尝试读取并解析现有密钥文件
+        // 尝试读取并解析现有 ED25519 密钥文件
         match fs::read(path) {
             Ok(bytes) => match identity::Keypair::from_protobuf_encoding(&bytes) {
                 Ok(keypair) => {
@@ -48,9 +52,13 @@ impl KeyManager {
                         path.display().to_string(),
                     )
                     .emit();
+                    let (pq_secret, pq_public) = KeyManager::load_pq_keys(&pq_path);
                     return Ok(KeyManager {
                         keypair,
                         path: path.to_path_buf(),
+                        pq_secret_key: pq_secret,
+                        pq_public_key: pq_public,
+                        pq_path,
                     });
                 }
                 Err(e) => {
@@ -113,6 +121,9 @@ impl KeyManager {
         Ok(KeyManager {
             keypair,
             path: path.to_path_buf(),
+            pq_secret_key: None,
+            pq_public_key: None,
+            pq_path,
         })
     }
     pub fn keypair(&self) -> &identity::Keypair {
@@ -121,6 +132,65 @@ impl KeyManager {
     /// 获取 peer id
     pub fn peer_id(&self) -> PeerId {
         self.keypair.public().to_peer_id()
+    }
+
+    /// 是否有 PQ 密钥
+    pub fn has_pq_keys(&self) -> bool {
+        self.pq_secret_key.is_some() && self.pq_public_key.is_some()
+    }
+
+    /// 获取 PQ 公钥
+    pub fn pq_public_key(&self) -> Option<&[u8]> {
+        self.pq_public_key.as_deref()
+    }
+
+    /// 获取 PQ 私钥
+    pub fn pq_secret_key(&self) -> Option<&[u8]> {
+        self.pq_secret_key.as_deref()
+    }
+
+    /// 保存 PQ 密钥到 sidecar 文件
+    pub fn save_pq_keys(
+        &mut self,
+        secret: Vec<u8>,
+        public: Vec<u8>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut buf = Vec::with_capacity(8 + secret.len() + public.len());
+        buf.extend_from_slice(&(secret.len() as u32).to_be_bytes());
+        buf.extend_from_slice(&secret);
+        buf.extend_from_slice(&(public.len() as u32).to_be_bytes());
+        buf.extend_from_slice(&public);
+
+        let temp_path = self.pq_path.with_extension("tmp");
+        fs::write(&temp_path, &buf)?;
+        fs::rename(&temp_path, &self.pq_path)?;
+
+        self.pq_secret_key = Some(secret);
+        self.pq_public_key = Some(public);
+        Ok(())
+    }
+
+    /// 从 sidecar 文件加载 PQ 密钥
+    fn load_pq_keys(pq_path: &Path) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+        let bytes = match fs::read(pq_path) {
+            Ok(b) => b,
+            Err(_) => return (None, None),
+        };
+        if bytes.len() < 8 {
+            return (None, None);
+        }
+        let secret_len = u32::from_be_bytes(bytes[0..4].try_into().unwrap()) as usize;
+        if 4 + secret_len + 4 > bytes.len() {
+            return (None, None);
+        }
+        let secret = bytes[4..4 + secret_len].to_vec();
+        let public_len =
+            u32::from_be_bytes(bytes[4 + secret_len..8 + secret_len].try_into().unwrap()) as usize;
+        if 8 + secret_len + public_len > bytes.len() {
+            return (None, None);
+        }
+        let public = bytes[8 + secret_len..8 + secret_len + public_len].to_vec();
+        (Some(secret), Some(public))
     }
 }
 

@@ -60,6 +60,8 @@ pub struct NodeConfig {
     pub network: NetworkConfig,
     #[serde(default)]
     pub services: ServicesConfig,
+    #[serde(default)]
+    pub crypto: CryptoConfig,
 }
 
 impl Default for NodeConfig {
@@ -68,6 +70,7 @@ impl Default for NodeConfig {
             node: NodeInfo::default(),
             network: NetworkConfig::default(),
             services: ServicesConfig::default(),
+            crypto: CryptoConfig::default(),
         }
     }
 }
@@ -289,6 +292,26 @@ impl Default for DispatcherConfig {
             query_timeout_secs: default_query_timeout_seconds(),
             record_ttl_secs: default_record_ttl_seconds(),
             local_services: vec![],
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct CryptoConfig {
+    #[serde(default = "bool_false")]
+    pub pq_transport_enabled: bool,
+    #[serde(default = "bool_false")]
+    pub pq_identity_enabled: bool,
+    #[serde(default = "bool_false")]
+    pub pq_required: bool,
+}
+
+impl Default for CryptoConfig {
+    fn default() -> Self {
+        CryptoConfig {
+            pq_transport_enabled: false,
+            pq_identity_enabled: false,
+            pq_required: false,
         }
     }
 }
