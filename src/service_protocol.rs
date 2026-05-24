@@ -37,6 +37,18 @@ pub struct Response {
     pub data: Vec<u8>,
 }
 
+/// PQ 加密信封 — 在 CBOR Request/Response 外层包裹
+/// Phase 1 启用后，对方可通过 kyber 封装协商会话密钥
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PqEnvelope {
+    /// Kyber 封装密文 (用于密钥交换)
+    pub kem_ciphertext: Vec<u8>,
+    /// AEAD 加密的载荷 (使用 KDF(共享密钥) 派生密钥)
+    pub encrypted_payload: Vec<u8>,
+    /// 可选的 PQ 签名 (ML-DSA)
+    pub pq_signature: Option<Vec<u8>>,
+}
+
 /// 创建默认配置的请求响应行为
 pub fn new_service_req_behaviour() -> cbor::Behaviour<Request, Response> {
     let cfg = Config::default().with_request_timeout(Duration::from_secs(30));
