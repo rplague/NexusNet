@@ -198,35 +198,68 @@ impl NodeController {
     async fn handle_relay(&mut self, event: relay::Event) -> Result<(), Box<dyn Error>> {
         match event {
             relay::Event::ReservationReqAccepted { src_peer_id, .. } => {
-                LogStruct::new(LogLevel::Debug, "中继预约已接受",
-                    format!("对端: {}", src_peer_id)).emit();
+                LogStruct::new(
+                    LogLevel::Debug,
+                    "中继预约已接受",
+                    format!("对端: {}", src_peer_id),
+                )
+                .emit();
             }
-            relay::Event::ReservationReqDenied { src_peer_id, status } => {
-                LogStruct::new(LogLevel::Debug, "中继预约被拒绝",
-                    format!("对端: {}, 状态: {:?}", src_peer_id, status)).emit();
+            relay::Event::ReservationReqDenied {
+                src_peer_id,
+                status,
+            } => {
+                LogStruct::new(
+                    LogLevel::Debug,
+                    "中继预约被拒绝",
+                    format!("对端: {}, 状态: {:?}", src_peer_id, status),
+                )
+                .emit();
             }
-            relay::Event::CircuitReqAccepted { src_peer_id, dst_peer_id } => {
-                LogStruct::new(LogLevel::Debug, "中继电路已建立",
-                    format!("来源: {}, 目标: {}", src_peer_id, dst_peer_id)).emit();
+            relay::Event::CircuitReqAccepted {
+                src_peer_id,
+                dst_peer_id,
+            } => {
+                LogStruct::new(
+                    LogLevel::Debug,
+                    "中继电路已建立",
+                    format!("来源: {}, 目标: {}", src_peer_id, dst_peer_id),
+                )
+                .emit();
             }
             _ => {}
         }
         Ok(())
     }
 
-    async fn handle_relay_client(&mut self, event: relay::client::Event) -> Result<(), Box<dyn Error>> {
+    async fn handle_relay_client(
+        &mut self,
+        event: relay::client::Event,
+    ) -> Result<(), Box<dyn Error>> {
         match event {
             relay::client::Event::ReservationReqAccepted { relay_peer_id, .. } => {
-                LogStruct::new(LogLevel::Preset, "中继预约成功",
-                    format!("中继节点: {}", relay_peer_id)).emit();
+                LogStruct::new(
+                    LogLevel::Preset,
+                    "中继预约成功",
+                    format!("中继节点: {}", relay_peer_id),
+                )
+                .emit();
             }
             relay::client::Event::OutboundCircuitEstablished { relay_peer_id, .. } => {
-                LogStruct::new(LogLevel::Debug, "出站中继电路已建立",
-                    format!("中继节点: {}", relay_peer_id)).emit();
+                LogStruct::new(
+                    LogLevel::Debug,
+                    "出站中继电路已建立",
+                    format!("中继节点: {}", relay_peer_id),
+                )
+                .emit();
             }
             relay::client::Event::InboundCircuitEstablished { src_peer_id, .. } => {
-                LogStruct::new(LogLevel::Debug, "入站中继电路已建立",
-                    format!("来源: {}", src_peer_id)).emit();
+                LogStruct::new(
+                    LogLevel::Debug,
+                    "入站中继电路已建立",
+                    format!("来源: {}", src_peer_id),
+                )
+                .emit();
             }
         }
         Ok(())

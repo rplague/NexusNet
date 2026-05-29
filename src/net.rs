@@ -415,7 +415,12 @@ impl NetBehaviour {
         let mut relay_cfg = relay::Config::default();
         if is_dual_stack {
             relay_cfg.max_reservations = 16;
-            LogStruct::new(LogLevel::Preset, "双栈节点", "启用中继服务器模式 (max 16 reservations)").emit();
+            LogStruct::new(
+                LogLevel::Preset,
+                "双栈节点",
+                "启用中继服务器模式 (max 16 reservations)",
+            )
+            .emit();
         } else {
             relay_cfg.max_reservations = 0;
             relay_cfg.max_reservations_per_peer = 0;
