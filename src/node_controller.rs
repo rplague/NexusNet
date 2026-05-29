@@ -45,6 +45,21 @@ enum KadCallback {
         payload: Vec<u8>,
         response_tx: oneshot::Sender<Result<Vec<u8>, String>>,
     },
+    /// @put_record 命令 → put_record 完成 → 通过 cmd.resp_tx 返回
+    PutRecord {
+        key: kad::RecordKey,
+        response_tx: oneshot::Sender<Result<Vec<u8>, String>>,
+    },
+    /// @get_record 命令 → get_record 完成 → 通过 cmd.resp_tx 返回
+    GetRecordByKey {
+        key: kad::RecordKey,
+        response_tx: oneshot::Sender<Result<Vec<u8>, String>>,
+    },
+    /// @start_providing 命令 → start_providing 完成 → 通过 cmd.resp_tx 返回
+    StartProviding {
+        key: kad::RecordKey,
+        response_tx: oneshot::Sender<Result<Vec<u8>, String>>,
+    },
 }
 
 /// P2P 服务请求响应的统一回调类型
@@ -335,6 +350,30 @@ impl NodeController {
                                 };
                                 let _ = sender.send(Ok(serde_json::to_vec(&types).unwrap()));
                             }
+                            KadCallback::GetRecordByKey { key, response_tx } => match &result {
+                                Ok(kad::GetRecordOk::FoundRecord(peer_record)) => {
+                                    let value = String::from_utf8_lossy(&peer_record.record.value);
+                                    let key_str =
+                                        String::from_utf8_lossy(&key.to_vec()).into_owned();
+                                    let json = serde_json::json!({
+                                        "success": true,
+                                        "key": key_str,
+                                        "value": value,
+                                    });
+                                    let _ =
+                                        response_tx.send(Ok(serde_json::to_vec(&json).unwrap()));
+                                }
+                                Ok(kad::GetRecordOk::FinishedWithNoAdditionalRecord { .. }) => {
+                                    let _ = response_tx.send(Err(format!(
+                                        "record not found: {}",
+                                        String::from_utf8_lossy(&key.to_vec()).into_owned()
+                                    )));
+                                }
+                                Err(e) => {
+                                    let _ =
+                                        response_tx.send(Err(format!("GetRecord failed: {e:?}")));
+                                }
+                            },
                             _ => {}
                         }
                     }
@@ -404,6 +443,46 @@ impl NodeController {
                                 }
                             }
                             _ => {}
+                        }
+                    }
+                }
+                kad::QueryResult::PutRecord(result) => {
+                    if let Some(cb) = self.pending_kad.remove(&id) {
+                        if let KadCallback::PutRecord { key, response_tx } = cb {
+                            match result {
+                                Ok(_) => {
+                                    let json = serde_json::json!({
+                                        "success": true,
+                                        "key": String::from_utf8_lossy(&key.to_vec()).into_owned(),
+                                    });
+                                    let _ =
+                                        response_tx.send(Ok(serde_json::to_vec(&json).unwrap()));
+                                }
+                                Err(e) => {
+                                    let _ =
+                                        response_tx.send(Err(format!("PutRecord failed: {e:?}")));
+                                }
+                            }
+                        }
+                    }
+                }
+                kad::QueryResult::StartProviding(result) => {
+                    if let Some(cb) = self.pending_kad.remove(&id) {
+                        if let KadCallback::StartProviding { key, response_tx } = cb {
+                            match result {
+                                Ok(_) => {
+                                    let json = serde_json::json!({
+                                        "success": true,
+                                        "key": String::from_utf8_lossy(&key.to_vec()).into_owned(),
+                                    });
+                                    let _ =
+                                        response_tx.send(Ok(serde_json::to_vec(&json).unwrap()));
+                                }
+                                Err(e) => {
+                                    let _ = response_tx
+                                        .send(Err(format!("StartProviding failed: {e:?}")));
+                                }
+                            }
                         }
                     }
                 }
@@ -688,6 +767,92 @@ impl NodeController {
                         Err(e) => serde_json::json!({"success": false, "error": e.to_string()}),
                     };
                     Some(Ok(serde_json::to_vec(&result).unwrap()))
+                }
+                // ── DHT 读写命令 ──
+                "put_record" => match serde_json::from_slice::<serde_json::Value>(&payload) {
+                    Ok(json) => {
+                        let key_str = json["key"].as_str().unwrap_or_default().to_string();
+                        let value_str = json["value"].as_str().unwrap_or_default().to_string();
+                        if key_str.is_empty() {
+                            Some(Err("missing 'key' field".to_string()))
+                        } else {
+                            let record = kad::Record::new(
+                                key_str.clone().into_bytes(),
+                                value_str.into_bytes(),
+                            );
+                            match swarm
+                                .behaviour_mut()
+                                .kademlia
+                                .put_record(record, kad::Quorum::One)
+                            {
+                                Ok(query_id) => {
+                                    let key = kad::RecordKey::new(&key_str);
+                                    self.pending_kad.insert(
+                                        query_id,
+                                        KadCallback::PutRecord {
+                                            key,
+                                            response_tx: resp_tx,
+                                        },
+                                    );
+                                    return;
+                                }
+                                Err(e) => Some(Err(format!("put_record failed: {e}"))),
+                            }
+                        }
+                    }
+                    Err(e) => Some(Err(format!("invalid JSON: {e}"))),
+                },
+                "get_record" => {
+                    let key_str = String::from_utf8_lossy(&payload).to_string();
+                    if key_str.is_empty() {
+                        Some(Err("missing key".to_string()))
+                    } else {
+                        let key = kad::RecordKey::new(&key_str);
+                        let query_id = swarm.behaviour_mut().kademlia.get_record(key.clone());
+                        self.pending_kad.insert(
+                            query_id,
+                            KadCallback::GetRecordByKey {
+                                key,
+                                response_tx: resp_tx,
+                            },
+                        );
+                        return;
+                    }
+                }
+                "start_providing" => {
+                    let key_str = String::from_utf8_lossy(&payload).to_string();
+                    if key_str.is_empty() {
+                        Some(Err("missing key".to_string()))
+                    } else {
+                        let key = kad::RecordKey::new(&key_str);
+                        match swarm.behaviour_mut().kademlia.start_providing(key.clone()) {
+                            Ok(query_id) => {
+                                self.pending_kad.insert(
+                                    query_id,
+                                    KadCallback::StartProviding {
+                                        key,
+                                        response_tx: resp_tx,
+                                    },
+                                );
+                                return;
+                            }
+                            Err(e) => Some(Err(format!("start_providing failed: {e}"))),
+                        }
+                    }
+                }
+                "stop_providing" => {
+                    let key_str = String::from_utf8_lossy(&payload).to_string();
+                    if key_str.is_empty() {
+                        Some(Err("missing key".to_string()))
+                    } else {
+                        let key = kad::RecordKey::new(&key_str);
+                        swarm.behaviour_mut().kademlia.stop_providing(&key);
+                        let result = serde_json::json!({
+                            "success": true,
+                            "key": key_str,
+                        });
+                        Some(Ok(serde_json::to_vec(&result).unwrap()))
+                    }
                 }
                 _ => Some(Err("Unknown command".to_string())),
             },
