@@ -20,7 +20,7 @@ use crate::{LogLevel, LogStruct, config::ConfigHandle};
 use libp2p::request_response::{self, cbor};
 use libp2p::{
     Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder, identify, identity, kad, noise, ping,
-    swarm::NetworkBehaviour, tcp, yamux,
+    relay, swarm::NetworkBehaviour, tcp, yamux,
 };
 use std::{
     fs, io,
@@ -323,6 +323,8 @@ pub struct NetBehaviour {
     pub identify: identify::Behaviour,
     pub kademlia: kad::Behaviour<kad::store::MemoryStore>,
     pub service_req: cbor::Behaviour<service_protocol::Request, service_protocol::Response>,
+    pub relay_server: relay::Behaviour,
+    pub relay_client: relay::client::Behaviour,
 }
 
 #[derive(Debug)]
@@ -331,6 +333,8 @@ pub enum NetBehaviourEvent {
     Identify(identify::Event),
     Kademlia(kad::Event),
     ServiceReq(request_response::Event<service_protocol::Request, service_protocol::Response>),
+    Relay(relay::Event),
+    RelayClient(relay::client::Event),
 }
 
 impl From<ping::Event> for NetBehaviourEvent {
@@ -357,9 +361,23 @@ impl From<request_response::Event<service_protocol::Request, service_protocol::R
         NetBehaviourEvent::ServiceReq(event)
     }
 }
+impl From<relay::Event> for NetBehaviourEvent {
+    fn from(event: relay::Event) -> Self {
+        NetBehaviourEvent::Relay(event)
+    }
+}
+impl From<relay::client::Event> for NetBehaviourEvent {
+    fn from(event: relay::client::Event) -> Self {
+        NetBehaviourEvent::RelayClient(event)
+    }
+}
 
 impl NetBehaviour {
-    pub fn new(config: &ConfigHandle, keypair: &identity::Keypair) -> Self {
+    pub fn new(
+        config: &ConfigHandle,
+        keypair: &identity::Keypair,
+        relay_client: relay::client::Behaviour,
+    ) -> Self {
         // Ping 配置
         let ping_config = ping::Config::new()
             .with_interval(Duration::from_secs(config.ping_interval().into()))
@@ -388,11 +406,34 @@ impl NetBehaviour {
         kademlia.set_mode(Some(kad::Mode::Server));
 
         let service_req = service_protocol::new_service_req_behaviour();
+
+        // Relay server — 双栈节点接受 reservation，单栈节点拒绝所有
+        let is_dual_stack = {
+            let cfg = config.read();
+            cfg.network.ipv4_enabled && cfg.network.ipv6_enabled
+        };
+        let mut relay_cfg = relay::Config::default();
+        if is_dual_stack {
+            relay_cfg.max_reservations = 16;
+            LogStruct::new(
+                LogLevel::Preset,
+                "双栈节点",
+                "启用中继服务器模式 (max 16 reservations)",
+            )
+            .emit();
+        } else {
+            relay_cfg.max_reservations = 0;
+            relay_cfg.max_reservations_per_peer = 0;
+        }
+        let relay_server = relay::Behaviour::new(keypair.public().to_peer_id(), relay_cfg);
+
         Self {
             ping,
             identify,
             kademlia,
             service_req,
+            relay_server,
+            relay_client,
         }
     }
 }
@@ -413,7 +454,7 @@ pub fn build_swarm(
     keymanager: &KeyManager,
 ) -> Result<Swarm<NetBehaviour>, Box<dyn std::error::Error>> {
     let keypair = keymanager.keypair();
-    let behaviour = NetBehaviour::new(config, keypair);
+    let config_clone = config.clone();
 
     // 获取监听地址（从配置中读取）
     let listen_addrs: Vec<Multiaddr> = {
@@ -450,7 +491,10 @@ pub fn build_swarm(
             noise::Config::new,
             yamux::Config::default,
         )?
-        .with_behaviour(|_| behaviour)?
+        .with_relay_client(noise::Config::new, yamux::Config::default)?
+        .with_behaviour(|keypair, relay_client| {
+            NetBehaviour::new(&config_clone, keypair, relay_client)
+        })?
         .with_swarm_config(|config| config.with_idle_connection_timeout(Duration::from_secs(300)))
         .build();
 

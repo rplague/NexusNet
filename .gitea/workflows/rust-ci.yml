@@ -1,26 +1,92 @@
 name: Rust CI
-on: [push]
+on:
+  push:
+    branches: [main]
 
 jobs:
   build-and-test:
     runs-on: qst001
 
     steps:
-      # 检出代码：从仓库拉取最新代码
       - name: Checkout code manually
         run: |
           git clone --depth 1 --progress https://${{ secrets.GITHUB_TOKEN }}@git.oahd.cn/${{ github.repository }}.git .
           git fetch --depth 1 origin ${{ github.sha }}
           git checkout ${{ github.sha }}
 
-      # 代码格式化检查：确保代码风格统一
       - name: 代码格式化检查 | Check code format
         run: /home/git/.cargo/bin/cargo fmt -- --check
 
-      # 运行测试：保障代码功能正确
       - name: 运行测试 | Run tests
         run: /home/git/.cargo/bin/cargo test --verbose
 
-      # 生产构建：验证项目最终可以成功编译
       - name: 生产构建 | Build in release mode
         run: /home/git/.cargo/bin/cargo build --release
+
+  release:
+    if: github.ref == 'refs/heads/main'
+    runs-on: qst001
+    needs: [build-and-test]
+
+    steps:
+      - name: Checkout with full history
+        run: |
+          git clone --progress https://${{ secrets.GITHUB_TOKEN }}@git.oahd.cn/${{ github.repository }}.git .
+          git fetch --tags origin
+
+      - name: 提取 Cargo.toml 版本并与最新 tag 对比
+        id: version
+        run: |
+          VERSION=$(grep '^version' Cargo.toml | sed 's/version = "\(.*\)"/\1/')
+          echo "cargo_version=$VERSION" >> $GITHUB_ENV
+          LATEST_TAG=$(git tag --sort=-version:refname | head -1 || echo "")
+          echo "latest_tag=$LATEST_TAG" >> $GITHUB_ENV
+          echo "Cargo.toml: $VERSION, latest tag: $LATEST_TAG"
+
+      - name: 构建 Release 二进制
+        if: env.cargo_version != '' && format('v{0}', env.cargo_version) != env.latest_tag
+        run: /home/git/.cargo/bin/cargo build --release
+
+      - name: 创建 Release 并上传附件
+        if: env.cargo_version != '' && format('v{0}', env.cargo_version) != env.latest_tag
+        run: |
+          set -x
+          TAG="v${{ env.cargo_version }}"
+          REPO="${{ github.repository }}"
+          TOKEN="${{ secrets.GITHUB_TOKEN }}"
+          API="https://git.oahd.cn/api/v1/repos/$REPO"
+          BINARY="target/release/NexusNet"
+
+          echo "TAG=$TAG  REPO=$REPO  API=$API"
+          ls -lh "$BINARY"
+
+          # Gitea API 创建 Release（tag 不存在时自动创建）
+          CREATE_RESP=$(curl -s -w "\n%{http_code}" -X POST \
+            -H "Authorization: token $TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{\"tag_name\":\"$TAG\",\"name\":\"$TAG\"}" \
+            "$API/releases")
+          HTTP_CODE=$(echo "$CREATE_RESP" | tail -1)
+          BODY=$(echo "$CREATE_RESP" | sed '$d')
+          RELEASE_ID=$(echo "$BODY" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2) || true
+          echo "RELEASE_ID=$RELEASE_ID"
+
+          if [ -z "$RELEASE_ID" ]; then
+            echo "ERROR: Failed to create release"
+            exit 1
+          fi
+
+          # 上传二进制到 release
+          UPLOAD_RESP=$(curl -s -w "\n%{http_code}" -X POST \
+            -H "Authorization: token $TOKEN" \
+            -H "Content-Type: application/octet-stream" \
+            "$API/releases/$RELEASE_ID/assets?name=NexusNet-linux-amd64" \
+            --data-binary @"$BINARY")
+          HTTP_CODE=$(echo "$UPLOAD_RESP" | tail -1)
+
+          if [ "$HTTP_CODE" != "201" ]; then
+            echo "ERROR: Upload failed with HTTP $HTTP_CODE"
+            exit 1
+          fi
+
+          echo "Release $TAG created and asset uploaded successfully"

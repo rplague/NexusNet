@@ -23,7 +23,7 @@ use crate::service_protocol;
 use libp2p::futures::StreamExt;
 use libp2p::multiaddr::Protocol;
 use libp2p::swarm::SwarmEvent;
-use libp2p::{Multiaddr, PeerId, Swarm, identify, kad, ping, request_response};
+use libp2p::{Multiaddr, PeerId, Swarm, identify, kad, ping, relay, request_response};
 use std::collections::HashMap;
 use std::error::Error;
 use std::sync::{Arc, RwLock};
@@ -110,7 +110,16 @@ impl NodeController {
                         SwarmEvent::Behaviour(NetBehaviourEvent::ServiceReq(req_event)) => {
                             self.handle_service_req(req_event, &mut swarm).await?;
                         }
-                        _ => {}
+                        SwarmEvent::Behaviour(NetBehaviourEvent::Relay(event)) => {
+                            self.handle_relay(event).await?;
+                        }
+                        SwarmEvent::Behaviour(NetBehaviourEvent::RelayClient(event)) => {
+                            self.handle_relay_client(event).await?;
+                        }
+                        _ => {
+                            LogStruct::new(LogLevel::Debug, "未处理事件",
+                                format!("{:?}", event)).emit();
+                        }
                     }
                 }
                 Some(cmd) = self.cmd_rx.recv() => {
@@ -169,12 +178,6 @@ impl NodeController {
                             addr
                         });
                     self.add_bootstrap_node(full_addr, peer_id).await?;
-                    LogStruct::new(
-                        LogLevel::Preset,
-                        "节点发现",
-                        format!("同版本节点: {}", peer_id),
-                    )
-                    .emit();
                 } else {
                     swarm.disconnect_peer_id(peer_id);
                 }
@@ -192,6 +195,76 @@ impl NodeController {
         Ok(())
     }
 
+    async fn handle_relay(&mut self, event: relay::Event) -> Result<(), Box<dyn Error>> {
+        match event {
+            relay::Event::ReservationReqAccepted { src_peer_id, .. } => {
+                LogStruct::new(
+                    LogLevel::Debug,
+                    "中继预约已接受",
+                    format!("对端: {}", src_peer_id),
+                )
+                .emit();
+            }
+            relay::Event::ReservationReqDenied {
+                src_peer_id,
+                status,
+            } => {
+                LogStruct::new(
+                    LogLevel::Debug,
+                    "中继预约被拒绝",
+                    format!("对端: {}, 状态: {:?}", src_peer_id, status),
+                )
+                .emit();
+            }
+            relay::Event::CircuitReqAccepted {
+                src_peer_id,
+                dst_peer_id,
+            } => {
+                LogStruct::new(
+                    LogLevel::Debug,
+                    "中继电路已建立",
+                    format!("来源: {}, 目标: {}", src_peer_id, dst_peer_id),
+                )
+                .emit();
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    async fn handle_relay_client(
+        &mut self,
+        event: relay::client::Event,
+    ) -> Result<(), Box<dyn Error>> {
+        match event {
+            relay::client::Event::ReservationReqAccepted { relay_peer_id, .. } => {
+                LogStruct::new(
+                    LogLevel::Preset,
+                    "中继预约成功",
+                    format!("中继节点: {}", relay_peer_id),
+                )
+                .emit();
+            }
+            relay::client::Event::OutboundCircuitEstablished { relay_peer_id, .. } => {
+                LogStruct::new(
+                    LogLevel::Debug,
+                    "出站中继电路已建立",
+                    format!("中继节点: {}", relay_peer_id),
+                )
+                .emit();
+            }
+            relay::client::Event::InboundCircuitEstablished { src_peer_id, .. } => {
+                LogStruct::new(
+                    LogLevel::Debug,
+                    "入站中继电路已建立",
+                    format!("来源: {}", src_peer_id),
+                )
+                .emit();
+            }
+        }
+        Ok(())
+    }
+
     async fn handle_kademlia(
         &mut self,
         event: kad::Event,
@@ -204,6 +277,7 @@ impl NodeController {
                         if !self.bootstrap_triggered {
                             self.bootstrap_triggered = true;
                             self.announce_local_services(swarm).await?;
+                            self.request_relay_reservation_if_needed(swarm).await?;
                         }
                     } else if let Err(e) = result {
                         LogStruct::new(
@@ -476,6 +550,59 @@ impl NodeController {
         let query_id = swarm.behaviour_mut().kademlia.get_record(types_key);
         self.pending_kad
             .insert(query_id, KadCallback::ServiceTypeMerge(my_types));
+        Ok(())
+    }
+
+    /// 单栈节点在 bootstrap 后主动向一个已知 relay 节点建立 reservation
+    async fn request_relay_reservation_if_needed(
+        &mut self,
+        swarm: &mut Swarm<NetBehaviour>,
+    ) -> Result<(), Box<dyn Error>> {
+        let need_relay = {
+            let cfg = self.config.read();
+            !(cfg.network.ipv4_enabled && cfg.network.ipv6_enabled)
+        };
+        if !need_relay {
+            return Ok(());
+        }
+
+        let candidates = self.config.bootstrap_nodes();
+        for addr in &candidates {
+            if let Some(peer_id) = extract_peer_id_from_multiaddr(addr) {
+                if peer_id == self.my_peer_id {
+                    continue;
+                }
+                // 构造 relay listen 地址：/ip4/.../tcp/.../p2p/<relay>/p2p-circuit
+                // relay transport 解析到 /p2p-circuit → 自动触发 RESERVE 握手
+                let mut relay_listen_addr = addr.clone();
+                relay_listen_addr.push(Protocol::P2pCircuit);
+                match swarm.listen_on(relay_listen_addr) {
+                    Ok(_id) => {
+                        LogStruct::new(
+                            LogLevel::Preset,
+                            "请求中继预约",
+                            format!("中继节点: {}", peer_id),
+                        )
+                        .emit();
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        LogStruct::new(
+                            LogLevel::Warning,
+                            "中继预约失败",
+                            format!("{}: {}", peer_id, e),
+                        )
+                        .emit();
+                    }
+                }
+            }
+        }
+        LogStruct::new(
+            LogLevel::Warning,
+            "无可用中继",
+            "未找到可用的中继节点，部分跨 IP 族通信不可用",
+        )
+        .emit();
         Ok(())
     }
 
