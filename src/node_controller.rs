@@ -915,7 +915,29 @@ impl NodeController {
                 return;
             }
             "service_request_to" => {
-                Some(Err("service_request_to: not implemented yet".to_string()))
+                let parts: Vec<&str> = content.splitn(2, "/in").collect();
+                if parts.len() != 2 {
+                    Some(Err(
+                        "expected format: <service>/in<peerid>".to_string(),
+                    ))
+                } else {
+                    let service = parts[0].to_string();
+                    match parts[1].parse::<PeerId>() {
+                        Ok(peer_id) => {
+                            let request = service_protocol::Request { service, payload };
+                            let request_id = swarm
+                                .behaviour_mut()
+                                .service_req
+                                .send_request(&peer_id, request);
+                            self.pending_service_responses.insert(
+                                request_id,
+                                SvcCallback::CommandResponse(resp_tx),
+                            );
+                            return;
+                        }
+                        Err(e) => Some(Err(format!("invalid peer id: {e}"))),
+                    }
+                }
             }
             _ => Some(Err("command not supported".to_string())),
         };
