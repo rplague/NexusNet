@@ -357,17 +357,12 @@ impl NodeController {
                                 };
                                 let _ = sender.send(Ok(serde_json::to_vec(&types).unwrap()));
                             }
-                            KadCallback::QueryKeyPhase1 {
-                                key,
-                                response_tx,
-                            } => {
+                            KadCallback::QueryKeyPhase1 { key, response_tx } => {
                                 let value = match &result {
-                                    Ok(kad::GetRecordOk::FoundRecord(peer_record)) => {
-                                        Some(String::from_utf8_lossy(
-                                            &peer_record.record.value,
-                                        )
-                                        .into_owned())
-                                    }
+                                    Ok(kad::GetRecordOk::FoundRecord(peer_record)) => Some(
+                                        String::from_utf8_lossy(&peer_record.record.value)
+                                            .into_owned(),
+                                    ),
                                     _ => None,
                                 };
                                 let record_key = kad::RecordKey::new(&key.to_vec());
@@ -436,8 +431,7 @@ impl NodeController {
                                 if !providers.is_empty() {
                                     resp["providers"] = serde_json::json!(providers);
                                 }
-                                let _ = response_tx
-                                    .send(Ok(serde_json::to_vec(&resp).unwrap()));
+                                let _ = response_tx.send(Ok(serde_json::to_vec(&resp).unwrap()));
                             }
                             KadCallback::ServiceCall {
                                 service,
@@ -487,8 +481,7 @@ impl NodeController {
                         } = cb
                         {
                             if let Err(e) = &result {
-                                let _ = response_tx
-                                    .send(Err(format!("put_record failed: {e:?}")));
+                                let _ = response_tx.send(Err(format!("put_record failed: {e:?}")));
                                 return Ok(());
                             }
                             if need_provide {
@@ -509,8 +502,7 @@ impl NodeController {
                                     "success": true,
                                     "key": String::from_utf8_lossy(&key.to_vec()).into_owned(),
                                 });
-                                let _ =
-                                    response_tx.send(Ok(serde_json::to_vec(&json).unwrap()));
+                                let _ = response_tx.send(Ok(serde_json::to_vec(&json).unwrap()));
                             }
                         }
                     }
@@ -831,19 +823,18 @@ impl NodeController {
                                 .and_then(|v| v.as_bool())
                                 .unwrap_or(false);
                             if has_value.is_none() && !providing {
-                                Some(Err(
-                                    "at least one of 'value' or 'providing' is required"
-                                        .to_string(),
-                                ))
+                                Some(Err("at least one of 'value' or 'providing' is required"
+                                    .to_string()))
                             } else if let Some(value_str) = has_value {
                                 let record = kad::Record::new(
                                     key_str.into_bytes(),
                                     value_str.as_bytes().to_vec(),
                                 );
-                                match swarm.behaviour_mut().kademlia.put_record(
-                                    record,
-                                    kad::Quorum::One,
-                                ) {
+                                match swarm
+                                    .behaviour_mut()
+                                    .kademlia
+                                    .put_record(record, kad::Quorum::One)
+                                {
                                     Ok(query_id) => {
                                         self.pending_kad.insert(
                                             query_id,
@@ -855,9 +846,7 @@ impl NodeController {
                                         );
                                         return;
                                     }
-                                    Err(e) => {
-                                        Some(Err(format!("put_record failed: {e}")))
-                                    }
+                                    Err(e) => Some(Err(format!("put_record failed: {e}"))),
                                 }
                             } else {
                                 // 仅 providing
@@ -917,9 +906,7 @@ impl NodeController {
             "service_request_to" => {
                 let parts: Vec<&str> = content.splitn(2, "/in").collect();
                 if parts.len() != 2 {
-                    Some(Err(
-                        "expected format: <service>/in<peerid>".to_string(),
-                    ))
+                    Some(Err("expected format: <service>/in<peerid>".to_string()))
                 } else {
                     let service = parts[0].to_string();
                     match parts[1].parse::<PeerId>() {
@@ -929,10 +916,8 @@ impl NodeController {
                                 .behaviour_mut()
                                 .service_req
                                 .send_request(&peer_id, request);
-                            self.pending_service_responses.insert(
-                                request_id,
-                                SvcCallback::CommandResponse(resp_tx),
-                            );
+                            self.pending_service_responses
+                                .insert(request_id, SvcCallback::CommandResponse(resp_tx));
                             return;
                         }
                         Err(e) => Some(Err(format!("invalid peer id: {e}"))),
