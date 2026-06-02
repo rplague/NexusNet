@@ -22,6 +22,7 @@ mod net;
 mod node_controller;
 mod service_dispatcher;
 mod service_protocol;
+mod swarm_actor;
 
 use log::{LogLevel, LogStruct};
 use net::{KeyManager, NetHandle};
@@ -68,8 +69,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         dispatcher.run().await;
     });
 
-    let controller = NodeController::new(config_handle, peer_id, cmd_rx, inbound_req_tx);
-    if let Err(e) = controller.run(net_handle).await {
+    let controller =
+        NodeController::new(config_handle, peer_id, cmd_rx, inbound_req_tx, net_handle);
+    if let Err(e) = controller.run().await {
         LogStruct::new(LogLevel::Critical, "节点运行错误", e.to_string()).emit();
     }
     Ok(())
