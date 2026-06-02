@@ -91,11 +91,7 @@ impl SwarmHandle {
         rx.await.expect("SwarmActor died")
     }
 
-    pub async fn put_record(
-        &self,
-        key: kad::RecordKey,
-        value: Vec<u8>,
-    ) -> Result<(), String> {
+    pub async fn put_record(&self, key: kad::RecordKey, value: Vec<u8>) -> Result<(), String> {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
             .send(SwarmCommand::KadPutRecord {
@@ -131,14 +127,11 @@ impl SwarmHandle {
         rx.await.expect("SwarmActor died")
     }
 
-    pub fn send_response(
-        &self,
-        request_id: String,
-        response: service_protocol::Response,
-    ) {
-        let _ = self
-            .cmd_tx
-            .send(SwarmCommand::ServiceSendResponse { request_id, response });
+    pub fn send_response(&self, request_id: String, response: service_protocol::Response) {
+        let _ = self.cmd_tx.send(SwarmCommand::ServiceSendResponse {
+            request_id,
+            response,
+        });
     }
 
     pub async fn listen_on(&self, addr: Multiaddr) -> Result<(), String> {
@@ -165,10 +158,11 @@ pub(crate) struct SwarmActor {
     event_tx: mpsc::UnboundedSender<ControllerEvent>,
     bootstrap_triggered: bool,
     pending_kad: HashMap<kad::QueryId, KadPending>,
-    pending_outbound:
-        HashMap<request_response::OutboundRequestId, oneshot::Sender<Result<service_protocol::Response, String>>>,
-    pending_inbound:
-        HashMap<String, request_response::ResponseChannel<service_protocol::Response>>,
+    pending_outbound: HashMap<
+        request_response::OutboundRequestId,
+        oneshot::Sender<Result<service_protocol::Response, String>>,
+    >,
+    pending_inbound: HashMap<String, request_response::ResponseChannel<service_protocol::Response>>,
 }
 
 impl SwarmActor {
@@ -220,10 +214,7 @@ impl SwarmActor {
         }
     }
 
-    async fn handle_event(
-        &mut self,
-        event: SwarmEvent<NetBehaviourEvent>,
-    ) -> Result<(), ()> {
+    async fn handle_event(&mut self, event: SwarmEvent<NetBehaviourEvent>) -> Result<(), ()> {
         match event {
             SwarmEvent::Behaviour(NetBehaviourEvent::Kademlia(kad_event)) => {
                 self.handle_kad_event(kad_event).await;

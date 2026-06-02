@@ -18,7 +18,6 @@
 use crate::service_protocol;
 use crate::swarm_actor::{ControllerEvent, SwarmHandle};
 use crate::{LogLevel, LogStruct, config::ConfigHandle};
-use tokio::sync::mpsc;
 use libp2p::request_response::{self, cbor};
 use libp2p::{
     Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder, identify, identity, kad, noise, ping,
@@ -30,6 +29,7 @@ use std::{
     path::{Path, PathBuf},
     time::Duration,
 };
+use tokio::sync::mpsc;
 pub struct KeyManager {
     keypair: identity::Keypair,
     path: PathBuf,

@@ -118,10 +118,7 @@ impl NodeController {
         Ok(())
     }
 
-    async fn handle_identify(
-        &mut self,
-        event: identify::Event,
-    ) -> Result<(), Box<dyn Error>> {
+    async fn handle_identify(&mut self, event: identify::Event) -> Result<(), Box<dyn Error>> {
         match event {
             identify::Event::Received { peer_id, info, .. } => {
                 if info.agent_version.starts_with("/oahd/") {
@@ -161,7 +158,9 @@ impl NodeController {
                 .emit();
             }
             relay::Event::ReservationReqDenied {
-                src_peer_id, status, ..
+                src_peer_id,
+                status,
+                ..
             } => {
                 LogStruct::new(
                     LogLevel::Debug,
@@ -267,8 +266,7 @@ impl NodeController {
 
         let existing_types = match self.swarm.get_record(types_key.clone()).await {
             Ok(kad::GetRecordOk::FoundRecord(peer_record)) => {
-                serde_json::from_slice::<Vec<String>>(&peer_record.record.value)
-                    .unwrap_or_default()
+                serde_json::from_slice::<Vec<String>>(&peer_record.record.value).unwrap_or_default()
             }
             _ => Vec::new(),
         };
@@ -282,12 +280,7 @@ impl NodeController {
 
         if let Ok(types_json) = serde_json::to_vec(&all_types) {
             if let Err(e) = self.swarm.put_record(types_key, types_json).await {
-                LogStruct::new(
-                    LogLevel::Warning,
-                    "更新服务类型列表失败",
-                    e,
-                )
-                .emit();
+                LogStruct::new(LogLevel::Warning, "更新服务类型列表失败", e).emit();
             }
         }
 
@@ -396,10 +389,9 @@ impl NodeController {
                     let types_key = kad::RecordKey::new(b"/oahd/service/types");
                     match self.swarm.get_record(types_key).await {
                         Ok(kad::GetRecordOk::FoundRecord(peer_record)) => {
-                            let types = serde_json::from_slice::<Vec<String>>(
-                                &peer_record.record.value,
-                            )
-                            .unwrap_or_default();
+                            let types =
+                                serde_json::from_slice::<Vec<String>>(&peer_record.record.value)
+                                    .unwrap_or_default();
                             Some(Ok(serde_json::to_vec(&types).unwrap()))
                         }
                         _ => Some(Ok(serde_json::to_vec::<Vec<String>>(&vec![]).unwrap())),
@@ -410,9 +402,7 @@ impl NodeController {
                     let key = format!("/oahd/service/{}", service_type);
                     let record_key = kad::RecordKey::new(&key);
                     match self.swarm.get_providers(record_key).await {
-                        Ok(providers) => {
-                            Some(Ok(serde_json::to_vec(&providers).unwrap()))
-                        }
+                        Ok(providers) => Some(Ok(serde_json::to_vec(&providers).unwrap())),
                         Err(e) => Some(Err(format!("{e:?}"))),
                     }
                 }
@@ -446,93 +436,76 @@ impl NodeController {
                     };
                     Some(Ok(serde_json::to_vec(&result).unwrap()))
                 }
-                "add_key" => {
-                    match serde_json::from_slice::<serde_json::Value>(&payload) {
-                        Ok(json) => {
-                            let key_str = json["key"]
-                                .as_str()
-                                .unwrap_or_default()
-                                .to_string();
-                            if key_str.is_empty() {
-                                Some(Err("missing 'key' field".to_string()))
-                            } else {
-                                let key = kad::RecordKey::new(&key_str);
-                                let has_value =
-                                    json.get("value").and_then(|v| v.as_str());
-                                let providing = json
-                                    .get("providing")
-                                    .and_then(|v| v.as_bool())
-                                    .unwrap_or(false);
+                "add_key" => match serde_json::from_slice::<serde_json::Value>(&payload) {
+                    Ok(json) => {
+                        let key_str = json["key"].as_str().unwrap_or_default().to_string();
+                        if key_str.is_empty() {
+                            Some(Err("missing 'key' field".to_string()))
+                        } else {
+                            let key = kad::RecordKey::new(&key_str);
+                            let has_value = json.get("value").and_then(|v| v.as_str());
+                            let providing = json
+                                .get("providing")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false);
 
-                                if has_value.is_none() && !providing {
-                                    Some(Err(
-                                        "at least one of 'value' or 'providing' is required"
-                                            .to_string(),
-                                    ))
-                                } else if let Some(value_str) = has_value {
-                                    match self
-                                        .swarm
-                                        .put_record(key, value_str.as_bytes().to_vec())
-                                        .await
-                                    {
-                                        Ok(_) => {
-                                            if providing {
-                                                match self
-                                                    .swarm
-                                                    .start_providing(
-                                                        kad::RecordKey::new(&key_str),
-                                                    )
-                                                    .await
-                                                {
-                                                    Ok(_) => {
-                                                        let json = serde_json::json!({
-                                                            "success": true,
-                                                            "key": key_str,
-                                                        });
-                                                        Some(
-                                                            Ok(serde_json::to_vec(&json)
-                                                                .unwrap()),
-                                                        )
-                                                    }
-                                                    Err(e) => Some(Err(format!(
-                                                        "start_providing failed: {e}"
-                                                    ))),
+                            if has_value.is_none() && !providing {
+                                Some(Err("at least one of 'value' or 'providing' is required"
+                                    .to_string()))
+                            } else if let Some(value_str) = has_value {
+                                match self
+                                    .swarm
+                                    .put_record(key, value_str.as_bytes().to_vec())
+                                    .await
+                                {
+                                    Ok(_) => {
+                                        if providing {
+                                            match self
+                                                .swarm
+                                                .start_providing(kad::RecordKey::new(&key_str))
+                                                .await
+                                            {
+                                                Ok(_) => {
+                                                    let json = serde_json::json!({
+                                                        "success": true,
+                                                        "key": key_str,
+                                                    });
+                                                    Some(Ok(serde_json::to_vec(&json).unwrap()))
                                                 }
-                                            } else {
-                                                let json = serde_json::json!({
-                                                    "success": true,
-                                                    "key": key_str,
-                                                });
-                                                Some(
-                                                    Ok(serde_json::to_vec(&json).unwrap()),
-                                                )
+                                                Err(e) => Some(Err(format!(
+                                                    "start_providing failed: {e}"
+                                                ))),
                                             }
-                                        }
-                                        Err(e) => Some(Err(format!("put_record failed: {e}"))),
-                                    }
-                                } else {
-                                    match self
-                                        .swarm
-                                        .start_providing(kad::RecordKey::new(&key_str))
-                                        .await
-                                    {
-                                        Ok(_) => {
+                                        } else {
                                             let json = serde_json::json!({
                                                 "success": true,
                                                 "key": key_str,
                                             });
                                             Some(Ok(serde_json::to_vec(&json).unwrap()))
                                         }
-                                        Err(e) => {
-                                            Some(Err(format!("start_providing failed: {e}")))
-                                        }
                                     }
+                                    Err(e) => Some(Err(format!("put_record failed: {e}"))),
+                                }
+                            } else {
+                                match self
+                                    .swarm
+                                    .start_providing(kad::RecordKey::new(&key_str))
+                                    .await
+                                {
+                                    Ok(_) => {
+                                        let json = serde_json::json!({
+                                            "success": true,
+                                            "key": key_str,
+                                        });
+                                        Some(Ok(serde_json::to_vec(&json).unwrap()))
+                                    }
+                                    Err(e) => Some(Err(format!("start_providing failed: {e}"))),
                                 }
                             }
                         }
-                        Err(e) => Some(Err(format!("invalid JSON: {e}"))),
                     }
-                }
+                    Err(e) => Some(Err(format!("invalid JSON: {e}"))),
+                },
                 "query_key" => {
                     let key_str = String::from_utf8_lossy(&payload).to_string();
                     if key_str.is_empty() {
@@ -541,10 +514,8 @@ impl NodeController {
                         let key = kad::RecordKey::new(&key_str);
                         match self.swarm.get_record(key.clone()).await {
                             Ok(kad::GetRecordOk::FoundRecord(peer_record)) => {
-                                let value = String::from_utf8_lossy(
-                                    &peer_record.record.value,
-                                )
-                                .into_owned();
+                                let value =
+                                    String::from_utf8_lossy(&peer_record.record.value).into_owned();
                                 let record_key = kad::RecordKey::new(&key_str);
                                 match self.swarm.get_providers(record_key).await {
                                     Ok(providers) => {
@@ -553,21 +524,16 @@ impl NodeController {
                                             "value": value,
                                         });
                                         if !providers.is_empty() {
-                                            resp["providers"] =
-                                                serde_json::json!(providers);
+                                            resp["providers"] = serde_json::json!(providers);
                                         }
-                                        Some(
-                                            Ok(serde_json::to_vec(&resp).unwrap()),
-                                        )
+                                        Some(Ok(serde_json::to_vec(&resp).unwrap()))
                                     }
                                     Err(_) => {
                                         let resp = serde_json::json!({
                                             "key": key_str,
                                             "value": value,
                                         });
-                                        Some(
-                                            Ok(serde_json::to_vec(&resp).unwrap()),
-                                        )
+                                        Some(Ok(serde_json::to_vec(&resp).unwrap()))
                                     }
                                 }
                             }
@@ -579,16 +545,11 @@ impl NodeController {
                                             "key": key_str,
                                         });
                                         if !providers.is_empty() {
-                                            resp["providers"] =
-                                                serde_json::json!(providers);
+                                            resp["providers"] = serde_json::json!(providers);
                                         }
-                                        Some(
-                                            Ok(serde_json::to_vec(&resp).unwrap()),
-                                        )
+                                        Some(Ok(serde_json::to_vec(&resp).unwrap()))
                                     }
-                                    Err(_) => {
-                                        Some(Err("key not found".to_string()))
-                                    }
+                                    Err(_) => Some(Err("key not found".to_string())),
                                 }
                             }
                         }
@@ -608,8 +569,10 @@ impl NodeController {
                                 .get_best_peer(&providers)
                                 .or_else(|| providers.first().copied())
                                 .unwrap();
-                            let request =
-                                service_protocol::Request { service: content, payload };
+                            let request = service_protocol::Request {
+                                service: content,
+                                payload,
+                            };
                             match self.swarm.send_request(&best_peer, request).await {
                                 Ok(resp) => Some(Ok(resp.data)),
                                 Err(e) => Some(Err(e)),
@@ -627,10 +590,7 @@ impl NodeController {
                     let service = parts[0].to_string();
                     match parts[1].parse::<PeerId>() {
                         Ok(peer_id) => {
-                            let request = service_protocol::Request {
-                                service,
-                                payload,
-                            };
+                            let request = service_protocol::Request { service, payload };
                             match self.swarm.send_request(&peer_id, request).await {
                                 Ok(resp) => Some(Ok(resp.data)),
                                 Err(e) => Some(Err(e)),
