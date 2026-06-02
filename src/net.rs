@@ -16,7 +16,9 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 use crate::service_protocol;
+use crate::swarm_actor::{ControllerEvent, SwarmHandle};
 use crate::{LogLevel, LogStruct, config::ConfigHandle};
+use tokio::sync::mpsc;
 use libp2p::request_response::{self, cbor};
 use libp2p::{
     Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder, identify, identity, kad, noise, ping,
@@ -525,9 +527,16 @@ impl NetHandle {
         Ok(())
     }
 
-    /// 移交 Swarm 所有权，启动事件循环由调用方驱动
-    pub fn run(mut self) -> Swarm<NetBehaviour> {
-        self.swarm.take().expect("swarm not started")
+    /// 移交 Swarm 所有权给 SwarmActor，返回 handle 供编排层通信
+    pub fn spawn_actor(
+        mut self,
+    ) -> (
+        SwarmHandle,
+        mpsc::UnboundedReceiver<ControllerEvent>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let swarm = self.swarm.take().expect("swarm not started");
+        crate::swarm_actor::SwarmActor::spawn(swarm)
     }
 
     /// 启动前用于拨号 bootstrap 节点
