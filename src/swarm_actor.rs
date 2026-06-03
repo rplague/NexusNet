@@ -235,7 +235,7 @@ impl SwarmActor {
                 let _ = self.event_tx.send(ControllerEvent::RelayClient(event));
             }
             _ => {
-                LogStruct::new(LogLevel::Debug, "未处理事件", format!("{:?}", event)).emit();
+                // LogStruct::new(LogLevel::Debug, "未处理事件", format!("{:?}", event)).emit();
             }
         }
         Ok(())
