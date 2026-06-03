@@ -273,11 +273,8 @@ impl ServiceDispatcher {
                                     .await;
                                 }
                                 Err(_) => {
-                                    Self::write_response(
-                                        writer,
-                                        b"command execution timeout",
-                                    )
-                                    .await;
+                                    Self::write_response(writer, b"command execution timeout")
+                                        .await;
                                 }
                             }
                         }
