@@ -44,13 +44,13 @@ graph TD
 
 ## 快速开始
 
-### 编译与运行
+### 编译与运行（开发）
 
 ```bash
 cargo run
 ```
 
-首次运行自动生成 `config.toml` 和 `keypair.bin`。
+未设置任何环境变量时，运行回退当前目录，首次运行自动生成 `./config.toml` 和 `./keypair.bin`。
 
 ### 命令行参数
 
@@ -66,6 +66,27 @@ cargo run -- --connect-overwrite /ip4/192.168.1.100/tcp/5000/p2p/12D3KooW...
 ```
 
 所有 CLI 变更自动写回 `config.toml`。
+
+## 部署（systemd / deb）
+
+生产环境以原生的 Debian 包（`.deb`）分发，由 `dpkg`/`apt` 管理生命周期：
+
+```bash
+apt install -y ./nexusnet_<version>_amd64.deb
+```
+
+安装后服务自动启用（`postinst` 创建专用用户 `nexusnet`、目录并 `enable`），
+配置与数据落位到标准目录：
+
+| 文件 | 路径 | 说明 |
+|---|---|---|
+| 配置 | `/etc/nexusnet/config.toml` | 首启自动生成 |
+| 节点身份 | `/var/lib/nexusnet/keypair.bin` | 不可丢失，升级/卸载保留 |
+| 日志 | `/var/log/nexusnet/nexusnet.log` | 追加写 + gz 轮转（归档保留） |
+
+查看运行状态：`systemctl status nexusnet`；日志：`journalctl -u nexusnet -f`。
+
+构建、升级、卸载等详见 [deploy/README.md](./deploy/README.md)。
 
 ## 配置（config.toml）
 
@@ -113,6 +134,9 @@ pq_required = false
 
 所有字段均有 `#[serde(default)]`，省略即默认值。
 
+配置路径由环境变量决定（见 `src/paths.rs`）：`NEXUSNET_CONFIG`、`NEXUSNET_KEYPAIR`、
+`NEXUSNET_LOG_FILE`、`NEXUSNET_HOME`；未设置时回退当前目录。
+
 ## 启动流程
 
 ```
@@ -125,26 +149,31 @@ boot::init()
   ├─ NetHandle::start() → 绑定端口，组建 Swarm
   ├─ 拨号所有 bootstrap 节点
   ├─ 启动 ServiceDispatcher（后台 tokio::spawn）
-  └─ NodeController::run()（主协程）
-       tokio::select! {
-           event_rx → 网络事件
-           cmd_rx  → 后端命令
-       }
+   └─ NodeController::run()（主协程）
+        tokio::select! {
+            event_rx → 网络事件
+            cmd_rx  → 后端命令
+            shutdown→ SIGTERM/Ctrl-C 优雅退出
+        }
 ```
+
+路径由 `paths.rs` 解析；收到 SIGTERM/Ctrl-C 时 NodeController 与 ServiceDispatcher
+收到共享关闭信号并结束循环，进程干净退出。
 
 ## 模块清单
 
-| 模块 | 行数 | 职责 |
-|------|------|------|
-| **boot** | 71 | 初始化 |
-| **main** | 60 | 程序入口 |
-| **node_controller** | 421 | 事件循环统一处理、服务自动宣告，处理远程查询和内部命令 |
-| **service_dispatcher** | 292 | 后端连接管理 |
-| **net** | 437 | KeyManager、Swarm 构建、地址检测 |
-| **config** | 467 | 提供ConfigHandle |
-| **service_protocol** | 51 | 提供通讯协议 |
-| **log** | 265 | 终端 + 文件输出、日志轮转 |
-| **合计** | ~2020 | |
+| 模块 | 职责 |
+|------|------|
+| **boot** | 初始化 |
+| **main** | 程序入口 |
+| **paths** | 统一路径解析（环境变量锚定，本地回退当前目录） |
+| **node_controller** | 事件循环统一处理、服务自动宣告，处理远程查询和内部命令 |
+| **service_dispatcher** | 后端连接管理 |
+| **net** | KeyManager、Swarm 构建、地址检测 |
+| **config** | 提供ConfigHandle |
+| **service_protocol** | 提供通讯协议 |
+| **log** | 终端 + 文件输出、日志轮转（路径可配，非 TTY 去彩色） |
+| **swarm_actor** | Swarm 分发封装 |
 
 ## 后端帧协议（TCP）
 
@@ -217,7 +246,7 @@ NexusNet 与后端进程之间使用**持久 TCP 连接**，由节点主动发�
 
 ## 开发状态
 
-当前版本：**0.2.1** — 完成度 **5.1/10**
+当前版本：**0.2.2** — 完成度 **5.1/10**
 
 ## 许可
 
