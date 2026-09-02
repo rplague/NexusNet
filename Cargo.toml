@@ -4,6 +4,30 @@ version = "0.2.2"
 edition = "2024"
 license = "GPL-3.0"
 
+[package.metadata.deb]
+maintainer = "OAHD"
+copyright = "2026 OAHD"
+extended-description = "NexusNet - OAHD 计划的核心网络层，基于 libp2p 的去中心化 P2P 节点网络。"
+section = "net"
+priority = "optional"
+depends = "libc6 (>= 2.31)"
+maintainer-scripts = "deb/"
+
+[[package.metadata.deb.assets]]
+source = "deploy/nexusnet.service"
+target = "/lib/systemd/system/nexusnet.service"
+mode = "644"
+
+[[package.metadata.deb.assets]]
+source = "deploy/nexusnet.tmpfiles.conf"
+target = "/usr/lib/tmpfiles.d/nexusnet.conf"
+mode = "644"
+
+[[package.metadata.deb.assets]]
+source = "deploy/nexusnet.sysusers"
+target = "/usr/lib/sysusers.d/nexusnet.conf"
+mode = "644"
+
 [dependencies]
 chrono = "0.4.44"
 colored = "3.1.1"

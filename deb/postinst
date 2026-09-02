@@ -1,0 +1,48 @@
+#!/bin/sh
+# NexusNet deb 包 postinst
+# 参数:
+#   configure     安装 或 升级
+#   abort-upgrade 升级中途失败回滚
+set -e
+
+USER_NAME="nexusnet"
+UNIT_NAME="nexusnet"
+
+create_system_user() {
+    if command -v systemd-sysusers >/dev/null 2>&1; then
+        # 处理 /usr/lib/sysusers.d 下的所有声明
+        systemd-sysusers >/dev/null 2>&1 || true
+    elif command -v useradd >/dev/null 2>&1; then
+        useradd --system --no-create-home --shell /usr/sbin/nologin "${USER_NAME}" || true
+    fi
+}
+
+create_dirs() {
+    if command -v systemd-tmpfiles >/dev/null 2>&1; then
+        systemd-tmpfiles --create /usr/lib/tmpfiles.d/nexusnet.conf >/dev/null 2>&1 || true
+    else
+        mkdir -p /etc/nexusnet /var/lib/nexusnet /var/log/nexusnet
+        chown "${USER_NAME}:${USER_NAME}" /etc/nexusnet /var/lib/nexusnet /var/log/nexusnet || true
+        chmod 0755 /etc/nexusnet; chmod 0700 /var/lib/nexusnet; chmod 0750 /var/log/nexusnet
+    fi
+}
+
+case "$1" in
+    configure)
+        create_system_user
+        create_dirs
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        systemctl enable "${UNIT_NAME}" >/dev/null 2>&1 || true
+        if systemctl is-active --quiet "${UNIT_NAME}" 2>/dev/null; then
+            # 升级场景：保持运行并应用新二进制
+            systemctl try-restart "${UNIT_NAME}" >/dev/null 2>&1 || true
+        else
+            systemctl start "${UNIT_NAME}" >/dev/null 2>&1 || true
+        fi
+        ;;
+    abort-upgrade)
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        ;;
+esac
+
+exit 0
