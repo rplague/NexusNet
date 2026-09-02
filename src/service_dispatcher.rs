@@ -240,27 +240,15 @@ impl ServiceDispatcher {
                                 format!("{}: {}", service_name, e),
                             )
                             .emit();
+                            Self::write_response(
+                                writer,
+                                format!("failed to send command: {}", e).as_bytes(),
+                            )
+                            .await;
                         } else {
                             match timeout(Duration::from_secs(30), resp_rx).await {
                                 Ok(Ok(Ok(result_data))) => {
-                                    let mut response = Vec::new();
-                                    response.extend_from_slice(&0u32.to_be_bytes());
-                                    response.extend_from_slice(
-                                        &(result_data.len() as u32).to_be_bytes(),
-                                    );
-                                    response.extend_from_slice(&result_data);
-
-                                    let mut writer_guard = writer.lock().await;
-                                    if let Err(e) = writer_guard.write_all(&response).await {
-                                        LogStruct::new(
-                                            LogLevel::Error,
-                                            "发送命令响应失败",
-                                            format!("{}: {}", service_name, e),
-                                        )
-                                        .emit();
-                                    } else {
-                                        let _ = writer_guard.flush().await;
-                                    }
+                                    Self::write_response(writer, &result_data).await;
                                 }
                                 Ok(Ok(Err(e))) => {
                                     LogStruct::new(
@@ -269,6 +257,7 @@ impl ServiceDispatcher {
                                         format!("{}: {}", service_name, e),
                                     )
                                     .emit();
+                                    Self::write_response(writer, e.as_bytes()).await;
                                 }
                                 Ok(Err(_)) => {
                                     LogStruct::new(
@@ -277,8 +266,16 @@ impl ServiceDispatcher {
                                         service_name,
                                     )
                                     .emit();
+                                    Self::write_response(
+                                        writer,
+                                        b"command response channel closed",
+                                    )
+                                    .await;
                                 }
-                                Err(_) => {}
+                                Err(_) => {
+                                    Self::write_response(writer, b"command execution timeout")
+                                        .await;
+                                }
                             }
                         }
                     } else {
@@ -347,6 +344,25 @@ impl ServiceDispatcher {
                     let _ = tx.send(Ok(payload));
                 }
             }
+        }
+    }
+
+    async fn write_response(writer: &Arc<Mutex<OwnedWriteHalf>>, data: &[u8]) {
+        let mut response = Vec::new();
+        response.extend_from_slice(&0u32.to_be_bytes());
+        response.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        response.extend_from_slice(data);
+
+        let mut writer_guard = writer.lock().await;
+        if let Err(e) = writer_guard.write_all(&response).await {
+            LogStruct::new(
+                LogLevel::Error,
+                "发送命令响应失败",
+                format!("(write_response) {}", e),
+            )
+            .emit();
+        } else {
+            let _ = writer_guard.flush().await;
         }
     }
 
