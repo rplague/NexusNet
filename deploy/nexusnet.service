@@ -1,0 +1,46 @@
+[Unit]
+Description=NexusNet P2P Node (OAHD core network layer)
+Documentation=file:/etc/nexusnet/README.md
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=nexusnet
+Group=nexusnet
+WorkingDirectory=/var/lib/nexusnet
+Environment=NEXUSNET_HOME=/var/lib/nexusnet
+Environment=NEXUSNET_LOG_FILE=/var/log/nexusnet/nexusnet.log
+
+ExecStart=/usr/bin/NexusNet
+ExecReload=/bin/kill -HUP $MAINPID
+
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=15
+LimitNOFILE=65536
+
+StandardOutput=journal
+StandardError=journal
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+PrivateDevices=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+RestrictNamespaces=true
+# 允许写配置目录（CLI 变更回写）与数据/日志目录
+ReadWritePaths=/etc/nexusnet /var/lib/nexusnet /var/log/nexusnet
+
+[Install]
+WantedBy=multi-user.target

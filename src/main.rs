@@ -20,6 +20,7 @@ mod config;
 mod log;
 mod net;
 mod node_controller;
+mod paths;
 mod service_dispatcher;
 mod service_protocol;
 mod swarm_actor;
@@ -29,6 +30,7 @@ use net::{KeyManager, NetHandle};
 use node_controller::NodeController;
 use std::error::Error;
 use tokio::sync::mpsc;
+use tokio::sync::watch;
 
 use crate::service_dispatcher::ServiceDispatcher;
 
@@ -38,7 +40,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     if let Err(e) = net::update_config_with_public_ip(&config_handle) {
         LogStruct::new(LogLevel::Warning, "更新公网IP失败", e.to_string()).emit();
     }
-    let key_manager = KeyManager::load_or_create("keypair.bin")?;
+    let key_manager = KeyManager::load_or_create(&paths::keypair_path())?;
     let peer_id = key_manager.peer_id();
     LogStruct::new(
         LogLevel::Important,
@@ -57,6 +59,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     }
 
+    // 优雅退出信号：收到 SIGTERM / Ctrl-C 时通知各任务结束循环
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    tokio::spawn(async move {
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("无法安装 SIGTERM 处理器");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = sigterm.recv() => {}
+        }
+        LogStruct::new(LogLevel::Warning, "收到退出信号", "正在优雅关闭...").emit();
+        let _ = shutdown_tx.send(true);
+    });
+
     //    cmd_tx -> ServiceDispatcher 发送命令给 NodeController
     //    cmd_rx -> NodeController 接收命令
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
@@ -64,13 +79,24 @@ async fn main() -> Result<(), Box<dyn Error>> {
     //    inbound_req_rx -> ServiceDispatcher 接收入站请求
     let (inbound_req_tx, inbound_req_rx) = mpsc::unbounded_channel();
 
-    let dispatcher = ServiceDispatcher::new(inbound_req_rx, cmd_tx, config_handle.clone());
+    let dispatcher = ServiceDispatcher::new(
+        inbound_req_rx,
+        cmd_tx,
+        config_handle.clone(),
+        shutdown_rx.clone(),
+    );
     tokio::spawn(async move {
         dispatcher.run().await;
     });
 
-    let controller =
-        NodeController::new(config_handle, peer_id, cmd_rx, inbound_req_tx, net_handle);
+    let controller = NodeController::new(
+        config_handle,
+        peer_id,
+        cmd_rx,
+        inbound_req_tx,
+        net_handle,
+        shutdown_rx,
+    );
     if let Err(e) = controller.run().await {
         LogStruct::new(LogLevel::Critical, "节点运行错误", e.to_string()).emit();
     }

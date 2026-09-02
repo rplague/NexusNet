@@ -15,6 +15,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+use crate::paths;
 use crate::{LogLevel, LogStruct};
 use libp2p::Multiaddr;
 use std::fs;
@@ -334,7 +335,7 @@ impl ConfigHandle {
     }
 
     pub fn load_or_create_default() -> Self {
-        Self::from_toml_file("./config.toml", true)
+        Self::from_toml_file(paths::config_path(), true)
     }
 
     /// 将当前配置保存到 TOML 文件
@@ -380,9 +381,9 @@ impl ConfigHandle {
         }
     }
 
-    /// 便捷方法：保存到默认路径 `./config.toml`
+    /// 便捷方法：保存到默认路径（由 paths::config_path() 解析）
     pub fn save_to_default(&self) {
-        self.save_to_file("./config.toml");
+        self.save_to_file(paths::config_path());
     }
 
     /// 获取只读锁

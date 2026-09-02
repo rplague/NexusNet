@@ -1,0 +1,19 @@
+#!/bin/sh
+# NexusNet deb 包 prerm（卸载前）
+# 参数:
+#   remove       卸载
+#   upgrade      升级
+set -e
+
+UNIT_NAME="nexusnet"
+
+case "$1" in
+    remove)
+        systemctl disable --now "${UNIT_NAME}" >/dev/null 2>&1 || true
+        ;;
+    upgrade|deconfigure)
+        systemctl stop "${UNIT_NAME}" >/dev/null 2>&1 || true
+        ;;
+esac
+
+exit 0

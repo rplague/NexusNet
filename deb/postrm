@@ -1,0 +1,27 @@
+#!/bin/sh
+# NexusNet deb 包 postrm（卸载后）
+# 参数:
+#   remove       常规卸载
+#   upgrade      升级
+#   purge        彻底清除（dpkg -P）
+# 注意：不删除 /var/lib/nexusnet/keypair.bin 与 /var/log/nexusnet 归档，
+#       以免丢失 PeerId 与历史日志。
+set -e
+
+UNIT_NAME="nexusnet"
+USER_NAME="nexusnet"
+
+case "$1" in
+    remove|upgrade|abort-install|abort-upgrade|disappear)
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        ;;
+    purge)
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        # 移除专用用户账号（数据目录与日志保留）
+        if id "${USER_NAME}" >/dev/null 2>&1; then
+            userdel "${USER_NAME}" >/dev/null 2>&1 || true
+        fi
+        ;;
+esac
+
+exit 0
