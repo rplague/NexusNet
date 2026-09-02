@@ -11,6 +11,7 @@ use std::error::Error;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::sync::mpsc;
+use tokio::sync::watch;
 
 pub struct NodeController {
     config: ConfigHandle,
@@ -20,6 +21,7 @@ pub struct NodeController {
     inbound_req_tx: mpsc::UnboundedSender<InboundServiceRequest>,
     swarm: SwarmHandle,
     event_rx: mpsc::UnboundedReceiver<ControllerEvent>,
+    shutdown_rx: watch::Receiver<bool>,
 }
 
 impl NodeController {
@@ -29,6 +31,7 @@ impl NodeController {
         cmd_rx: mpsc::UnboundedReceiver<Command>,
         inbound_req_tx: mpsc::UnboundedSender<InboundServiceRequest>,
         net_handle: NetHandle,
+        shutdown_rx: watch::Receiver<bool>,
     ) -> Self {
         let node_rtts = Arc::new(RwLock::new(HashMap::new()));
         if let Ok(mut map) = node_rtts.write() {
@@ -45,6 +48,7 @@ impl NodeController {
             inbound_req_tx,
             swarm,
             event_rx,
+            shutdown_rx,
         }
     }
 
@@ -57,6 +61,9 @@ impl NodeController {
                 }
                 Some(cmd) = self.cmd_rx.recv() => {
                     self.handle_command(cmd).await;
+                }
+                _ = self.shutdown_rx.changed() => {
+                    return Ok(());
                 }
             }
         }

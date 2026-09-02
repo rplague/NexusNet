@@ -22,7 +22,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use tokio::time::{Duration, timeout};
 use uuid::Uuid;
 
@@ -48,6 +48,7 @@ pub struct ServiceDispatcher {
     cmd_tx: mpsc::UnboundedSender<Command>,
     config: ConfigHandle,
     local_services: Vec<LocalServiceEntry>,
+    shutdown_rx: watch::Receiver<bool>,
     pending_requests:
         HashMap<String, Arc<Mutex<HashMap<String, oneshot::Sender<Result<Vec<u8>, String>>>>>>,
     backend_writers: Arc<Mutex<HashMap<String, Arc<Mutex<OwnedWriteHalf>>>>>,
@@ -58,6 +59,7 @@ impl ServiceDispatcher {
         inbound_rx: mpsc::UnboundedReceiver<InboundServiceRequest>,
         cmd_tx: mpsc::UnboundedSender<Command>,
         config: ConfigHandle,
+        shutdown_rx: watch::Receiver<bool>,
     ) -> Self {
         let local_services = config.read().services.dispatcher.local_services.clone();
         let mut pending_requests = HashMap::new();
@@ -69,6 +71,7 @@ impl ServiceDispatcher {
             cmd_tx,
             config,
             local_services,
+            shutdown_rx,
             pending_requests,
             backend_writers: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -77,24 +80,35 @@ impl ServiceDispatcher {
     pub async fn run(mut self) {
         self.init_backend_connections().await;
 
-        while let Some(req) = self.inbound_rx.recv().await {
-            let pending_map = self.pending_requests.get(&req.service).cloned(); // 获取该服务的等待表
-            let writer = {
-                let map = self.backend_writers.lock().await;
-                map.get(&req.service).cloned()
-            };
+        loop {
+            tokio::select! {
+                maybe_req = self.inbound_rx.recv() => {
+                    let Some(req) = maybe_req else {
+                        // 所有发送者已关闭，结束
+                        return;
+                    };
+                    let pending_map = self.pending_requests.get(&req.service).cloned(); // 获取该服务的等待表
+                    let writer = {
+                        let map = self.backend_writers.lock().await;
+                        map.get(&req.service).cloned()
+                    };
 
-            if let (Some(pending_map), Some(writer)) = (pending_map, writer) {
-                tokio::spawn(async move {
-                    let response =
-                        Self::handle_request_with_backend(req.payload, pending_map, writer).await;
-                    let _ = req.response_tx.send(response);
-                });
-            } else {
-                // 没有对应的后端连接，直接返回错误
-                let _ = req
-                    .response_tx
-                    .send(Err(format!("No backend for service {}", req.service)));
+                    if let (Some(pending_map), Some(writer)) = (pending_map, writer) {
+                        tokio::spawn(async move {
+                            let response =
+                                Self::handle_request_with_backend(req.payload, pending_map, writer).await;
+                            let _ = req.response_tx.send(response);
+                        });
+                    } else {
+                        // 没有对应的后端连接，直接返回错误
+                        let _ = req
+                            .response_tx
+                            .send(Err(format!("No backend for service {}", req.service)));
+                    }
+                }
+                _ = self.shutdown_rx.changed() => {
+                    return;
+                }
             }
         }
     }
