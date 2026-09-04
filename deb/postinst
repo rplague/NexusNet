@@ -32,12 +32,8 @@ case "$1" in
         create_system_user
         create_dirs
         systemctl daemon-reload >/dev/null 2>&1 || true
-        systemctl enable "${UNIT_NAME}" >/dev/null 2>&1 || true
         if systemctl is-active --quiet "${UNIT_NAME}" 2>/dev/null; then
-            # 升级场景：保持运行并应用新二进制
             systemctl try-restart "${UNIT_NAME}" >/dev/null 2>&1 || true
-        else
-            systemctl start "${UNIT_NAME}" >/dev/null 2>&1 || true
         fi
         ;;
     abort-upgrade)

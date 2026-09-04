@@ -11,6 +11,7 @@ Group=nexusnet
 WorkingDirectory=/var/lib/nexusnet
 Environment=NEXUSNET_HOME=/var/lib/nexusnet
 Environment=NEXUSNET_LOG_FILE=/var/log/nexusnet/nexusnet.log
+Environment=NEXUSNET_CONFIG=/etc/nexusnet/config.toml 
 
 ExecStart=/usr/bin/NexusNet
 ExecReload=/bin/kill -HUP $MAINPID
