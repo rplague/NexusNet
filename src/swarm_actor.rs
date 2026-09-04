@@ -40,6 +40,10 @@ pub enum SwarmCommand {
         addr: Multiaddr,
         resp: oneshot::Sender<Result<(), String>>,
     },
+    Dial {
+        addr: Multiaddr,
+        resp: oneshot::Sender<Result<(), String>>,
+    },
     Shutdown,
 }
 
@@ -138,6 +142,14 @@ impl SwarmHandle {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
             .send(SwarmCommand::ListenOn { addr, resp: tx })
+            .expect("SwarmActor died");
+        rx.await.expect("SwarmActor died")
+    }
+
+    pub async fn dial(&self, addr: Multiaddr) -> Result<(), String> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SwarmCommand::Dial { addr, resp: tx })
             .expect("SwarmActor died");
         rx.await.expect("SwarmActor died")
     }
@@ -423,6 +435,10 @@ impl SwarmActor {
                     .listen_on(addr)
                     .map(|_| ())
                     .map_err(|e| e.to_string());
+                let _ = resp.send(result);
+            }
+            SwarmCommand::Dial { addr, resp } => {
+                let result = self.swarm.dial(addr).map(|_| ()).map_err(|e| e.to_string());
                 let _ = resp.send(result);
             }
             SwarmCommand::Shutdown => {}
