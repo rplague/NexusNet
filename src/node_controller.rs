@@ -425,7 +425,7 @@ impl NodeController {
                     let nodes = self.config.bootstrap_nodes();
                     let mut any_success = false;
                     for addr in &nodes {
-                        if self.swarm.listen_on(addr.clone()).await.is_ok() {
+                        if self.swarm.dial(addr.clone()).await.is_ok() {
                             any_success = true;
                         }
                     }
