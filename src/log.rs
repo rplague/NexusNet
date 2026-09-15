@@ -59,6 +59,15 @@ fn use_color() -> bool {
     std::io::stdout().is_terminal()
 }
 
+/// stdout/stderr 是否由 systemd journald 捕获。
+///
+/// journald 会自行记录时间戳，故流输出无需重复。仅当 `JOURNAL_STREAM`
+/// 存在时成立（`StandardOutput=journal` 时由 systemd 注入）。
+fn stream_timestamped_by_journald() -> bool {
+    static DETECTED: OnceLock<bool> = OnceLock::new();
+    *DETECTED.get_or_init(|| std::env::var_os("JOURNAL_STREAM").is_some_and(|v| !v.is_empty()))
+}
+
 pub enum LogLevel {
     Important,
     Debug,
@@ -246,33 +255,43 @@ fn check_and_roll() {
     });
 }
 
-fn format_colored(level: &LogLevel, time: &str, topic: &str, content: &str) -> String {
-    let prefix = level.color();
-    if content.is_empty() {
-        format!("{} {}\n    {}", prefix, time, topic)
-    } else {
-        format!("{} {}\n    {}\n    {}", prefix, time, topic, content)
+fn format_entry(
+    prefix: impl std::fmt::Display,
+    time: Option<&str>,
+    topic: &str,
+    content: &str,
+) -> String {
+    match (time, content.is_empty()) {
+        (Some(t), true) => format!("{} {}\n    {}", prefix, t, topic),
+        (Some(t), false) => format!("{} {}\n    {}\n    {}", prefix, t, topic, content),
+        (None, true) => format!("{} {}", prefix, topic),
+        (None, false) => format!("{} {}\n    {}", prefix, topic, content),
     }
 }
 
-fn format_plain(level: &LogLevel, time: &str, topic: &str, content: &str) -> String {
-    let prefix = level.as_str();
-    if content.is_empty() {
-        format!("{} {}\n    {}", prefix, time, topic)
+fn format_colored(level: &LogLevel, time: Option<&str>, topic: &str, content: &str) -> String {
+    format_entry(level.color(), time, topic, content)
+}
+
+fn format_plain(level: &LogLevel, time: Option<&str>, topic: &str, content: &str) -> String {
+    format_entry(level.as_str(), time, topic, content)
+}
+
+/// 按是否彩色渲染流（终端/journald）输出。
+fn render_stream(info: &LogStruct, time: Option<&str>) -> String {
+    if use_color() {
+        format_colored(&info.level, time, &info.topic, &info.content)
     } else {
-        format!("{} {}\n    {}\n    {}", prefix, time, topic, content)
+        format_plain(&info.level, time, &info.topic, &info.content)
     }
 }
 
 fn log(info: &LogStruct) {
     let time = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let stream_time = (!stream_timestamped_by_journald()).then_some(time.as_str());
 
-    let cli_text = if use_color() {
-        format_colored(&info.level, &time, &info.topic, &info.content)
-    } else {
-        format_plain(&info.level, &time, &info.topic, &info.content)
-    };
-    let file_text = format_plain(&info.level, &time, &info.topic, &info.content);
+    let cli_text = render_stream(info, stream_time);
+    let file_text = format_plain(&info.level, Some(&time), &info.topic, &info.content);
 
     match info.level {
         LogLevel::Error | LogLevel::Critical | LogLevel::Warning => {
@@ -305,11 +324,8 @@ fn log(info: &LogStruct) {
 
 fn log_onlycli(info: &LogStruct) {
     let time = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-    let text = if use_color() {
-        format_colored(&info.level, &time, &info.topic, &info.content)
-    } else {
-        format_plain(&info.level, &time, &info.topic, &info.content)
-    };
+    let stream_time = (!stream_timestamped_by_journald()).then_some(time.as_str());
+    let text = render_stream(info, stream_time);
     match info.level {
         LogLevel::Error | LogLevel::Critical | LogLevel::Warning => {
             eprintln!("{}", text);
@@ -317,5 +333,52 @@ fn log_onlycli(info: &LogStruct) {
         _ => {
             println!("{}", text);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TIME: &str = "2026-01-01 00:00:00";
+
+    #[test]
+    fn plain_with_time_and_content() {
+        assert_eq!(
+            format_plain(&LogLevel::Debug, Some(TIME), "topic", "body"),
+            format!("[+] {}\n    topic\n    body", TIME)
+        );
+    }
+
+    #[test]
+    fn plain_with_time_without_content() {
+        assert_eq!(
+            format_plain(&LogLevel::Debug, Some(TIME), "topic", ""),
+            format!("[+] {}\n    topic", TIME)
+        );
+    }
+
+    #[test]
+    fn plain_without_time_with_content() {
+        assert_eq!(
+            format_plain(&LogLevel::Debug, None, "topic", "body"),
+            "[+] topic\n    body"
+        );
+    }
+
+    #[test]
+    fn plain_without_time_without_content() {
+        assert_eq!(
+            format_plain(&LogLevel::Debug, None, "topic", ""),
+            "[+] topic"
+        );
+    }
+
+    #[test]
+    fn plain_uses_level_prefix() {
+        assert_eq!(
+            format_plain(&LogLevel::Critical, None, "boom", ""),
+            "[CRITICAL] boom"
+        );
     }
 }
