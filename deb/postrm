@@ -4,8 +4,8 @@
 #   remove       常规卸载
 #   upgrade      升级
 #   purge        彻底清除（dpkg -P）
-# 注意：不删除 /var/lib/nexusnet/keypair.bin 与 /var/log/nexusnet 归档，
-#       以免丢失 PeerId 与历史日志。
+# 注意：不删除 /var/lib/nexusnet/keypair.bin，以免丢失 PeerId。
+#       日志由 journald 管理，不在此处理。
 set -e
 
 UNIT_NAME="nexusnet"

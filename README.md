@@ -82,7 +82,7 @@ apt install -y ./nexusnet_<version>_amd64.deb
 |---|---|---|
 | 配置 | `/etc/nexusnet/config.toml` | 首启自动生成 |
 | 节点身份 | `/var/lib/nexusnet/keypair.bin` | 不可丢失，升级/卸载保留 |
-| 日志 | `/var/log/nexusnet/nexusnet.log` | 追加写 + gz 轮转（归档保留） |
+| 日志 | journald | systemd 采集/轮转/压缩/保留 |
 
 查看运行状态：`systemctl status nexusnet`；日志：`journalctl -u nexusnet -f`。
 
@@ -140,7 +140,8 @@ pq_required = false
 所有字段均有 `#[serde(default)]`，省略即默认值。
 
 配置路径由环境变量决定（见 `src/paths.rs`）：`NEXUSNET_CONFIG`、`NEXUSNET_KEYPAIR`、
-`NEXUSNET_LOG_PATH`、`NEXUSNET_HOME`；未设置时回退当前目录。
+`NEXUSNET_LOG_PATH`（仅文件输出模式用；systemd 下日志走 journald）、`NEXUSNET_HOME`；
+未设置时回退当前目录。
 
 ## 启动流程
 
@@ -174,7 +175,7 @@ boot::init()
 | **network** | 网络层门面：身份、地址探测、行为装配、Swarm Actor（`network/identity`、`network/addr`、`network/behaviour`、`network/builder`、`network/actor`） |
 | **config** | 提供ConfigHandle |
 | **service_protocol** | 提供通讯协议 |
-| **log** | 终端 + 文件输出、日志轮转（路径可配，非 TTY 去彩色） |
+| **log** | 自动检测输出模式：systemd 下交 journald，其余终端+文件轮转 |
 
 ## 后端帧协议（TCP）
 
@@ -252,9 +253,11 @@ NexusNet 与后端进程之间使用**持久 TCP 连接**，由节点主动发�
 
 ## 日志
 
-- 双输出：终端+ 文本文件
-- 格式：`[LEVEL] 时间\n    主题\n    内容`
-- 等级：`Critical | Error | Warning | Important | Preset | Debug`
+输出模式**自动检测**：
+
+- **systemd**：只写 stdout/stderr，**不写文件**；轮转、压缩、保留、检索全部交给 journald。输出为**单行**并带 syslog 级别前缀，可用 `journalctl -u nexusnet -p err` 过滤。
+- **其他**：终端 + 文本文件双输出，文件 10MB 触发 gz 轮转。
+- 等级：`Critical | Error | Warning | Important | Preset | Debug`；非 TTY 自动去彩色。
 
 ## 节点身份
 

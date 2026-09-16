@@ -21,9 +21,18 @@ create_dirs() {
     if command -v systemd-tmpfiles >/dev/null 2>&1; then
         systemd-tmpfiles --create /usr/lib/tmpfiles.d/nexusnet.conf >/dev/null 2>&1 || true
     else
-        mkdir -p /etc/nexusnet /var/lib/nexusnet /var/log/nexusnet
-        chown "${USER_NAME}:${USER_NAME}" /etc/nexusnet /var/lib/nexusnet /var/log/nexusnet || true
-        chmod 0755 /etc/nexusnet; chmod 0700 /var/lib/nexusnet; chmod 0750 /var/log/nexusnet
+        mkdir -p /etc/nexusnet /var/lib/nexusnet
+        chown "${USER_NAME}:${USER_NAME}" /etc/nexusnet /var/lib/nexusnet || true
+        chmod 0755 /etc/nexusnet; chmod 0700 /var/lib/nexusnet
+    fi
+}
+
+ensure_persistent_journal() {
+    if [ ! -d /var/log/journal ]; then
+        mkdir -p /var/log/journal 2>/dev/null || return 0
+        chown root:systemd-journal /var/log/journal 2>/dev/null || true
+        chmod 2755 /var/log/journal 2>/dev/null || true
+        systemctl restart systemd-journald >/dev/null 2>&1 || true
     fi
 }
 
@@ -31,6 +40,7 @@ case "$1" in
     configure)
         create_system_user
         create_dirs
+        ensure_persistent_journal
         systemctl daemon-reload >/dev/null 2>&1 || true
         if systemctl is-active --quiet "${UNIT_NAME}" 2>/dev/null; then
             systemctl try-restart "${UNIT_NAME}" >/dev/null 2>&1 || true

@@ -27,11 +27,14 @@ use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::spawn;
+use std::time::{Duration, Instant};
 
 static LOG_MUTEX: Mutex<()> = Mutex::new(());
 static ROLLING: AtomicBool = AtomicBool::new(false);
+static LAST_ROLL_CHECK: Mutex<Option<Instant>> = Mutex::new(None);
 
 const MAX_SIZE_BYTES: u64 = 10 * 1024 * 1024; // 10MB
+const ROLL_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 
 /// 系统日志文件路径。
 ///
@@ -64,13 +67,25 @@ fn use_color() -> bool {
     std::io::stdout().is_terminal()
 }
 
-/// stdout/stderr 是否由 systemd journald 捕获。
+/// 日志输出模式。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LogMode {
+    Journald,
+    File,
+}
+
+/// 判定日志模式
 ///
-/// journald 会自行记录时间戳，故流输出无需重复。仅当 `JOURNAL_STREAM`
-/// 存在时成立
-fn stream_timestamped_by_journald() -> bool {
-    static DETECTED: OnceLock<bool> = OnceLock::new();
-    *DETECTED.get_or_init(|| std::env::var_os("JOURNAL_STREAM").is_some_and(|v| !v.is_empty()))
+/// `JOURNAL_STREAM` 存在表示 stdout/stderr 被 journald 捕获，此时完全交由 journald 管理。
+fn log_mode() -> LogMode {
+    static MODE: OnceLock<LogMode> = OnceLock::new();
+    *MODE.get_or_init(|| {
+        if std::env::var_os("JOURNAL_STREAM").is_some_and(|v| !v.is_empty()) {
+            LogMode::Journald
+        } else {
+            LogMode::File
+        }
+    })
 }
 
 pub enum LogLevel {
@@ -104,6 +119,18 @@ impl LogLevel {
             LogLevel::Critical => "[CRITICAL]".on_red().bold().blink(),
         }
     }
+
+    /// 映射到 syslog priority（journald 会解析并剥离行首 `<N>`）。
+    fn syslog_priority(&self) -> u8 {
+        match self {
+            LogLevel::Critical => 2,
+            LogLevel::Error => 3,
+            LogLevel::Warning => 4,
+            LogLevel::Important => 5,
+            LogLevel::Preset => 6,
+            LogLevel::Debug => 7,
+        }
+    }
 }
 
 pub struct LogStruct {
@@ -121,8 +148,8 @@ impl LogStruct {
         }
     }
     pub fn emit(&self) {
-        if !ROLLING.swap(true, Ordering::AcqRel) {
-            check_and_roll();
+        if log_mode() == LogMode::File {
+            maybe_check_and_roll();
         }
         log(self)
     }
@@ -238,6 +265,21 @@ fn perform_roll(file_metadata: fs::Metadata) {
     archive_and_cleanup(logtmp_filepath().to_owned(), output_filepath);
 }
 
+/// 节流后的轮转检查：File 模式下每 `ROLL_CHECK_INTERVAL` 最多 stat 一次。
+fn maybe_check_and_roll() {
+    {
+        let mut last = LAST_ROLL_CHECK.lock().unwrap();
+        let now = Instant::now();
+        if last.is_some_and(|prev| now.duration_since(prev) < ROLL_CHECK_INTERVAL) {
+            return;
+        }
+        *last = Some(now);
+    }
+    if !ROLLING.swap(true, Ordering::AcqRel) {
+        check_and_roll();
+    }
+}
+
 fn check_and_roll() {
     let metadata = match fs::metadata(log_filepath()) {
         Ok(m) => m,
@@ -276,7 +318,7 @@ fn format_entry(
     }
 }
 
-/// 按是否彩色渲染流输出
+/// 按是否彩色渲染流输出（File 模式，多行）。
 fn render_stream(info: &LogStruct, time: Option<&str>) -> String {
     if use_color() {
         format_entry(info.level.color(), time, &info.topic, &info.content)
@@ -285,22 +327,47 @@ fn render_stream(info: &LogStruct, time: Option<&str>) -> String {
     }
 }
 
+/// journald 模式：单行 + `<N>` 优先级前缀（journald 会解析并剥离该前缀）。
+fn render_journald(info: &LogStruct) -> String {
+    let content = info
+        .content
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let body = if content.is_empty() {
+        format!("{} {}", info.level.as_str(), info.topic)
+    } else {
+        format!("{} {}: {}", info.level.as_str(), info.topic, content)
+    };
+    format!("<{}>{}", info.level.syslog_priority(), body)
+}
+
+/// 写一行到流（错误类走 stderr，其余 stdout）。
+fn write_stream(level: &LogLevel, text: &str) {
+    match level {
+        LogLevel::Error | LogLevel::Critical | LogLevel::Warning => eprintln!("{}", text),
+        _ => println!("{}", text),
+    }
+}
+
 fn log(info: &LogStruct) {
-    let time = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-    let stream_time = (!stream_timestamped_by_journald()).then_some(time.as_str());
-
-    let cli_text = render_stream(info, stream_time);
-    let file_text = format_entry(info.level.as_str(), Some(&time), &info.topic, &info.content);
-
-    match info.level {
-        LogLevel::Error | LogLevel::Critical | LogLevel::Warning => {
-            eprintln!("{}", cli_text);
+    match log_mode() {
+        LogMode::Journald => {
+            write_stream(&info.level, &render_journald(info));
         }
-        _ => {
-            println!("{}", cli_text);
+        LogMode::File => {
+            let time = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+            write_stream(&info.level, &render_stream(info, Some(&time)));
+
+            let file_text =
+                format_entry(info.level.as_str(), Some(&time), &info.topic, &info.content);
+            append_file(&file_text);
         }
     }
+}
 
+/// 追加写入日志文件（File 模式）。
+fn append_file(text: &str) {
     let _guard = LOG_MUTEX.lock().unwrap();
     let mut log_file = match fs::OpenOptions::new()
         .append(true)
@@ -315,22 +382,49 @@ fn log(info: &LogStruct) {
         }
     };
 
-    if writeln!(log_file, "{}", file_text).is_err() {
+    if writeln!(log_file, "{}", text).is_err() {
         let err = LogStruct::new(LogLevel::Error, "无法录入日志", "log文件无法被追加写入");
         log_onlycli(&err);
     }
 }
 
 fn log_onlycli(info: &LogStruct) {
-    let time = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-    let stream_time = (!stream_timestamped_by_journald()).then_some(time.as_str());
-    let text = render_stream(info, stream_time);
-    match info.level {
-        LogLevel::Error | LogLevel::Critical | LogLevel::Warning => {
-            eprintln!("{}", text);
+    match log_mode() {
+        LogMode::Journald => {
+            write_stream(&info.level, &render_journald(info));
         }
-        _ => {
-            println!("{}", text);
+        LogMode::File => {
+            let time = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+            write_stream(&info.level, &render_stream(info, Some(&time)));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn syslog_priority_mapping() {
+        assert_eq!(LogLevel::Critical.syslog_priority(), 2);
+        assert_eq!(LogLevel::Error.syslog_priority(), 3);
+        assert_eq!(LogLevel::Warning.syslog_priority(), 4);
+        assert_eq!(LogLevel::Important.syslog_priority(), 5);
+        assert_eq!(LogLevel::Preset.syslog_priority(), 6);
+        assert_eq!(LogLevel::Debug.syslog_priority(), 7);
+    }
+
+    #[test]
+    fn journald_single_line_with_prefix_and_collapsed_newlines() {
+        let entry = LogStruct::new(LogLevel::Error, "topic", "line1\nline2");
+        let line = render_journald(&entry);
+        assert_eq!(line, "<3>[!] topic: line1 line2");
+        assert!(!line.contains('\n'));
+    }
+
+    #[test]
+    fn journald_empty_content() {
+        let entry = LogStruct::new(LogLevel::Debug, "topic", "");
+        assert_eq!(render_journald(&entry), "<7>[+] topic");
     }
 }
