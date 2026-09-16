@@ -17,7 +17,7 @@
 
 //! 统一路径解析。
 //!
-//! - systemd 部署：由 `NEXUSNET_HOME` / `NEXUSNET_LOG_FILE` 等环境变量锚定标准目录。
+//! - systemd 部署：由 `NEXUSNET_HOME` / `NEXUSNET_LOG_PATH` 等环境变量锚定标准目录。
 //! - 本地 `cargo run`：未设置任何环境变量时回退当前目录（`./config.toml`、`./keypair.bin`、`./log`），
 //!   以兼容既有行为。
 
@@ -71,15 +71,15 @@ pub fn keypair_path() -> PathBuf {
 
 /// 日志文件路径。
 ///
-/// 优先级：`NEXUSNET_LOG_FILE` → `$NEXUSNET_HOME/log` → `./log`。
+/// 优先级：`NEXUSNET_LOG_PATH` → `$NEXUSNET_HOME/log` → `./log`。
 pub fn log_path() -> PathBuf {
-    if let Some(path) = env::var_os("NEXUSNET_LOG_FILE") {
+    if let Some(path) = env::var_os("NEXUSNET_LOG_PATH") {
         if !path.is_empty() {
             return PathBuf::from(path);
         }
     }
     if has_data_home() {
-        return data_home().join("log");
+        return data_home();
     }
-    PathBuf::from("./log")
+    PathBuf::from("./")
 }
