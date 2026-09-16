@@ -42,12 +42,17 @@ use crate::config::ConfigHandle;
 use crate::network::NetworkError;
 use crate::network::behaviour::{NetBehaviour, NetBehaviourEvent};
 use crate::network::builder::build_swarm;
+use crate::network::pq::{self, PqIdentity, PqKeys, PqRequest, PqResponse};
 use crate::service_protocol;
+use crate::{LogLevel, LogStruct};
 
 use libp2p::futures::StreamExt;
 use libp2p::swarm::{ConnectionId, SwarmEvent};
-use libp2p::{Multiaddr, PeerId, Swarm, identify, identity, kad, ping, relay, request_response};
-use std::collections::HashMap;
+use libp2p::{
+    Multiaddr, PeerId, StreamProtocol, Swarm, identify, identity, kad, ping, relay,
+    request_response,
+};
+use std::collections::{HashMap, HashSet};
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
@@ -282,32 +287,49 @@ pub struct NetworkStart {
     pub task: tokio::task::JoinHandle<()>,
 }
 
+/// 入站请求的回复上下文：区分明文与 PQ。
+enum PendingInbound {
+    Plain(request_response::ResponseChannel<service_protocol::Response>),
+    Pq {
+        channel: request_response::ResponseChannel<PqResponse>,
+        inbound: pq::PqInbound,
+    },
+}
+
+/// 出站 PQ 请求的等待者与响应密钥。
+struct PqOutboundPending {
+    resp: oneshot::Sender<Result<service_protocol::Response, NetworkError>>,
+    out: pq::PqOutbound,
+}
+
 pub(crate) struct SwarmActor {
     swarm: Swarm<NetBehaviour>,
     config: ConfigHandle,
     keypair: identity::Keypair,
+    pq_keys: Option<PqKeys>,
     cmd_rx: mpsc::UnboundedReceiver<SwarmCommand>,
     cmd_tx: mpsc::UnboundedSender<SwarmCommand>,
     event_tx: mpsc::UnboundedSender<NetworkEvent>,
     bootstrap_triggered: bool,
+    /// 对端已宣告的协议集合（来自 Identify），用于 PQ 能力判定。
+    peer_protocols: HashMap<PeerId, HashSet<StreamProtocol>>,
+    /// 已校验并缓存的对端 PQ 身份。
+    pq_identities: HashMap<PeerId, PqIdentity>,
     pending_kad: HashMap<kad::QueryId, KadPending>,
     pending_outbound: HashMap<
         request_response::OutboundRequestId,
         oneshot::Sender<Result<service_protocol::Response, NetworkError>>,
     >,
-    pending_inbound: HashMap<
-        String,
-        (
-            ConnectionId,
-            request_response::ResponseChannel<service_protocol::Response>,
-        ),
-    >,
+    pending_outbound_pq: HashMap<request_response::OutboundRequestId, PqOutboundPending>,
+    pending_pq_identity: HashMap<request_response::OutboundRequestId, PeerId>,
+    pending_inbound: HashMap<String, (ConnectionId, PendingInbound)>,
 }
 
 /// 构建 Swarm 并启动 Actor 任务。
 pub fn spawn(
     config: ConfigHandle,
     keypair: identity::Keypair,
+    pq_keys: Option<PqKeys>,
 ) -> Result<NetworkStart, NetworkError> {
     let swarm = build_swarm(&config, &keypair)?;
 
@@ -320,12 +342,17 @@ pub fn spawn(
         swarm,
         config,
         keypair,
+        pq_keys,
         cmd_rx,
         cmd_tx,
         event_tx,
         bootstrap_triggered: false,
+        peer_protocols: HashMap::new(),
+        pq_identities: HashMap::new(),
         pending_kad: HashMap::new(),
         pending_outbound: HashMap::new(),
+        pending_outbound_pq: HashMap::new(),
+        pending_pq_identity: HashMap::new(),
         pending_inbound: HashMap::new(),
     };
 
@@ -378,6 +405,12 @@ impl SwarmActor {
             SwarmEvent::Behaviour(NetBehaviourEvent::ServiceReq(svc_event)) => {
                 self.handle_service_req(svc_event).await;
             }
+            SwarmEvent::Behaviour(NetBehaviourEvent::ServiceReqPq(svc_event)) => {
+                self.handle_service_req_pq(svc_event).await;
+            }
+            SwarmEvent::Behaviour(NetBehaviourEvent::PqIdentity(svc_event)) => {
+                self.handle_pq_identity(svc_event).await;
+            }
             SwarmEvent::Behaviour(NetBehaviourEvent::Ping(event)) => {
                 let _ = self.event_tx.send(NetworkEvent::Ping(event));
             }
@@ -393,10 +426,19 @@ impl SwarmActor {
             SwarmEvent::Behaviour(NetBehaviourEvent::RelayClient(event)) => {
                 let _ = self.event_tx.send(NetworkEvent::RelayClient(event));
             }
-            SwarmEvent::ConnectionClosed { connection_id, .. } => {
+            SwarmEvent::ConnectionClosed {
+                peer_id,
+                connection_id,
+                num_established,
+                ..
+            } => {
                 // 连接关闭后其挂起的入站请求无法再回复，清理避免泄漏。
                 self.pending_inbound
                     .retain(|_, (cid, _)| *cid != connection_id);
+                if num_established == 0 {
+                    self.peer_protocols.remove(&peer_id);
+                    self.pq_identities.remove(&peer_id);
+                }
             }
             SwarmEvent::ListenerClosed { addresses, .. } => {
                 let _ = self
@@ -412,14 +454,41 @@ impl SwarmActor {
     /// 把 OAHD 对端宣告的监听地址写入 DHT 路由表；`add_address` 会在新节点插入时
     /// 触发自动 bootstrap，节流约 500ms，从而最终发出 `BootstrapCompleted`。
     fn on_identify_peer(&mut self, peer_id: PeerId, info: &identify::Info) {
+        // 缓存对端协议表，用于 PQ 能力判定。
+        self.peer_protocols
+            .insert(peer_id, info.protocols.iter().cloned().collect());
+
         if !info.agent_version.starts_with("/oahd/") {
             return;
         }
-        let Ok(kad) = self.kad() else {
+        // Identify → Kademlia 地址桥接
+        if let Ok(kad) = self.kad() {
+            for addr in &info.listen_addrs {
+                kad.add_address(&peer_id, addr.clone());
+            }
+        }
+        // 对端支持 PQ 且身份未缓存 → 拉取并校验其 PQ 身份
+        self.maybe_fetch_pq_identity(peer_id);
+    }
+
+    /// 若 PQ 启用且对端宣告支持，则请求其 PQ 身份（一次）。
+    fn maybe_fetch_pq_identity(&mut self, peer_id: PeerId) {
+        if self.pq_keys.is_none() || !self.config.pq_enabled() {
             return;
-        };
-        for addr in &info.listen_addrs {
-            kad.add_address(&peer_id, addr.clone());
+        }
+        if self.pq_identities.contains_key(&peer_id) {
+            return;
+        }
+        let supports = self
+            .peer_protocols
+            .get(&peer_id)
+            .is_some_and(|p| p.contains(&StreamProtocol::new(pq::SERVICE_REQ_PQ_PROTOCOL)));
+        if !supports {
+            return;
+        }
+        if let Some(behaviour) = self.swarm.behaviour_mut().pq_identity.as_mut() {
+            let id = behaviour.send_request(&peer_id, ());
+            self.pending_pq_identity.insert(id, peer_id);
         }
     }
 
@@ -490,11 +559,24 @@ impl SwarmActor {
                 request_response::Message::Request {
                     request, channel, ..
                 } => {
+                    // pq_required：拒绝明文请求
+                    if self.config.pq_required() {
+                        let _ = self.swarm.behaviour_mut().service_req.send_response(
+                            channel,
+                            service_protocol::Response {
+                                success: false,
+                                data: b"PQ required".to_vec(),
+                            },
+                        );
+                        return;
+                    }
                     let request_id = Uuid::new_v4().to_string();
                     let (resp_tx, resp_rx) = oneshot::channel();
 
-                    self.pending_inbound
-                        .insert(request_id.clone(), (connection_id, channel));
+                    self.pending_inbound.insert(
+                        request_id.clone(),
+                        (connection_id, PendingInbound::Plain(channel)),
+                    );
 
                     let _ = self.event_tx.send(NetworkEvent::InboundServiceRequest {
                         request_id: request_id.clone(),
@@ -541,6 +623,131 @@ impl SwarmActor {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// 处理 PQ 加密服务请求/响应。
+    async fn handle_service_req_pq(
+        &mut self,
+        event: request_response::Event<PqRequest, PqResponse>,
+    ) {
+        match event {
+            request_response::Event::Message {
+                connection_id,
+                message,
+                ..
+            } => match message {
+                request_response::Message::Request {
+                    request, channel, ..
+                } => {
+                    let Some(keys) = self.pq_keys.as_ref() else {
+                        return;
+                    };
+                    let inbound = match pq::open_request(keys, &request) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            LogStruct::new(LogLevel::Warning, "PQ 请求解密失败", e.to_string())
+                                .emit();
+                            return;
+                        }
+                    };
+                    let Some(req) = decode_request(&inbound.plaintext) else {
+                        return;
+                    };
+                    let request_id = Uuid::new_v4().to_string();
+                    let (resp_tx, resp_rx) = oneshot::channel();
+                    self.pending_inbound.insert(
+                        request_id.clone(),
+                        (connection_id, PendingInbound::Pq { channel, inbound }),
+                    );
+                    let _ = self.event_tx.send(NetworkEvent::InboundServiceRequest {
+                        request_id: request_id.clone(),
+                        service: req.service,
+                        payload: req.payload,
+                        response_tx: resp_tx,
+                    });
+                    let cmd_tx = self.cmd_tx.clone();
+                    tokio::spawn(async move {
+                        let response = match resp_rx.await {
+                            Ok(Ok(response)) => response,
+                            Ok(Err(e)) => service_protocol::Response {
+                                success: false,
+                                data: e.into_bytes(),
+                            },
+                            Err(_) => service_protocol::Response {
+                                success: false,
+                                data: b"request handler dropped".to_vec(),
+                            },
+                        };
+                        let _ = cmd_tx.send(SwarmCommand::ServiceSendResponse {
+                            request_id,
+                            response,
+                        });
+                    });
+                }
+                request_response::Message::Response {
+                    request_id,
+                    response,
+                    ..
+                } => {
+                    if let Some(pending) = self.pending_outbound_pq.remove(&request_id) {
+                        let result = match pending.out.open_response(&response) {
+                            Ok(bytes) => match decode_response(&bytes) {
+                                Some(resp) => Ok(resp),
+                                None => {
+                                    Err(NetworkError::Request("pq response decode failed".into()))
+                                }
+                            },
+                            Err(e) => Err(NetworkError::Request(e.to_string())),
+                        };
+                        let _ = pending.resp.send(result);
+                    }
+                }
+            },
+            request_response::Event::OutboundFailure {
+                request_id, error, ..
+            } => {
+                if let Some(pending) = self.pending_outbound_pq.remove(&request_id) {
+                    let _ = pending
+                        .resp
+                        .send(Err(NetworkError::Request(error.to_string())));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// 处理 PQ 身份交换（请求应答 + 响应缓存校验）。
+    async fn handle_pq_identity(&mut self, event: request_response::Event<(), PqIdentity>) {
+        let request_response::Event::Message { message, .. } = event else {
+            return;
+        };
+        match message {
+            request_response::Message::Request { channel, .. } => {
+                let identity = self
+                    .pq_keys
+                    .as_ref()
+                    .and_then(|k| k.identity(&self.keypair).ok());
+                if let Some(identity) = identity
+                    && let Some(b) = self.swarm.behaviour_mut().pq_identity.as_mut()
+                {
+                    let _ = b.send_response(channel, identity);
+                }
+            }
+            request_response::Message::Response {
+                request_id,
+                response,
+                ..
+            } => {
+                if let Some(expected) = self.pending_pq_identity.remove(&request_id) {
+                    if response.verify(&expected).is_ok() {
+                        self.pq_identities.insert(expected, response);
+                    } else {
+                        LogStruct::new(LogLevel::Warning, "PQ 身份校验失败", expected.to_string())
+                            .emit();
+                    }
+                }
+            }
         }
     }
 
@@ -611,23 +818,89 @@ impl SwarmActor {
                 request,
                 resp,
             } => {
-                let request_id = self
-                    .swarm
-                    .behaviour_mut()
-                    .service_req
-                    .send_request(&peer, request);
-                self.pending_outbound.insert(request_id, resp);
+                // pq_required：对端非 PQ 则拒绝
+                if self.config.pq_required() && !self.pq_identities.contains_key(&peer) {
+                    let _ = resp.send(Err(NetworkError::Request(
+                        "PQ required but peer is not PQ-capable".into(),
+                    )));
+                    return true;
+                }
+
+                let use_pq = self.config.pq_transport_enabled()
+                    && self.pq_keys.is_some()
+                    && self.pq_identities.contains_key(&peer);
+
+                if use_pq {
+                    let recipient = self.pq_identities.get(&peer).cloned().unwrap();
+                    let sign = self.config.pq_identity_enabled();
+                    let sealed = {
+                        let keys = self.pq_keys.as_ref().unwrap();
+                        pq::seal_request(
+                            keys,
+                            &recipient,
+                            &encode_request(&request),
+                            sign,
+                            &self.keypair,
+                        )
+                    };
+                    match sealed {
+                        Ok(out) => {
+                            if let Some(b) = self.swarm.behaviour_mut().service_req_pq.as_mut() {
+                                let id = b.send_request(&peer, out.request.clone());
+                                self.pending_outbound_pq
+                                    .insert(id, PqOutboundPending { resp, out });
+                            } else {
+                                let _ = resp.send(Err(NetworkError::Request(
+                                    "pq behaviour disabled".into(),
+                                )));
+                            }
+                        }
+                        Err(e) => {
+                            let _ = resp.send(Err(NetworkError::Request(e.to_string())));
+                        }
+                    }
+                } else {
+                    let request_id = self
+                        .swarm
+                        .behaviour_mut()
+                        .service_req
+                        .send_request(&peer, request);
+                    self.pending_outbound.insert(request_id, resp);
+                }
             }
             SwarmCommand::ServiceSendResponse {
                 request_id,
                 response,
             } => {
-                if let Some((_, channel)) = self.pending_inbound.remove(&request_id) {
-                    let _ = self
-                        .swarm
-                        .behaviour_mut()
-                        .service_req
-                        .send_response(channel, response);
+                if let Some((_, pending)) = self.pending_inbound.remove(&request_id) {
+                    match pending {
+                        PendingInbound::Plain(channel) => {
+                            let _ = self
+                                .swarm
+                                .behaviour_mut()
+                                .service_req
+                                .send_response(channel, response);
+                        }
+                        PendingInbound::Pq { channel, inbound } => {
+                            match inbound.seal_response(&encode_response(&response)) {
+                                Ok(resp) => {
+                                    if let Some(b) =
+                                        self.swarm.behaviour_mut().service_req_pq.as_mut()
+                                    {
+                                        let _ = b.send_response(channel, resp);
+                                    }
+                                }
+                                Err(e) => {
+                                    LogStruct::new(
+                                        LogLevel::Warning,
+                                        "PQ 响应加密失败",
+                                        e.to_string(),
+                                    )
+                                    .emit();
+                                }
+                            }
+                        }
+                    }
                 }
             }
             SwarmCommand::ListenOn { addr, resp } => {
@@ -668,6 +941,12 @@ impl SwarmActor {
         for (_, tx) in self.pending_outbound.drain() {
             let _ = tx.send(Err(NetworkError::Reloaded));
         }
+        for (_, pending) in self.pending_outbound_pq.drain() {
+            let _ = pending.resp.send(Err(NetworkError::Reloaded));
+        }
+        self.pending_pq_identity.clear();
+        self.pq_identities.clear();
+        self.peer_protocols.clear();
         self.pending_inbound.clear();
 
         // 2. 重建 Swarm。旧 Swarm 在此 drop，连接与监听随之关闭。
@@ -682,4 +961,44 @@ impl SwarmActor {
 
         Ok(())
     }
+}
+
+// ---------------------------------------------------------------------------
+// 明文编码（PQ 信封内部的 Request/Response）
+// ---------------------------------------------------------------------------
+
+/// Request 内部编码：`[u32 service_len][service][payload]`。
+fn encode_request(req: &service_protocol::Request) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + req.service.len() + req.payload.len());
+    out.extend_from_slice(&(req.service.len() as u32).to_be_bytes());
+    out.extend_from_slice(req.service.as_bytes());
+    out.extend_from_slice(&req.payload);
+    out
+}
+
+fn decode_request(bytes: &[u8]) -> Option<service_protocol::Request> {
+    let len_bytes = bytes.get(0..4)?;
+    let len = u32::from_be_bytes(len_bytes.try_into().unwrap()) as usize;
+    let end = 4usize.checked_add(len)?;
+    let service = String::from_utf8(bytes.get(4..end)?.to_vec()).ok()?;
+    Some(service_protocol::Request {
+        service,
+        payload: bytes.get(end..)?.to_vec(),
+    })
+}
+
+/// Response 内部编码：`[u8 success][data]`。
+fn encode_response(resp: &service_protocol::Response) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + resp.data.len());
+    out.push(resp.success as u8);
+    out.extend_from_slice(&resp.data);
+    out
+}
+
+fn decode_response(bytes: &[u8]) -> Option<service_protocol::Response> {
+    let (success, data) = bytes.split_first()?;
+    Some(service_protocol::Response {
+        success: *success != 0,
+        data: data.to_vec(),
+    })
 }

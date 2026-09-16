@@ -40,7 +40,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     if let Err(e) = network::update_config_with_public_ip(&config_handle) {
         LogStruct::new(LogLevel::Warning, "更新公网IP失败", e.to_string()).emit();
     }
-    let key_manager = KeyManager::load_or_create(paths::keypair_path())?;
+    let mut key_manager = KeyManager::load_or_create(paths::keypair_path())?;
+    if config_handle.pq_enabled()
+        && let Err(e) = key_manager.ensure_pq_keys()
+    {
+        LogStruct::new(LogLevel::Warning, "PQ 密钥初始化失败", e.to_string()).emit();
+    }
     let peer_id = key_manager.peer_id();
     let dial: Vec<String> = network::dialable_addrs(&config_handle, peer_id)
         .iter()
@@ -54,7 +59,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     LogStruct::new(LogLevel::Important, "节点身份", identity).emit();
 
     // 构建网络并启动 Swarm Actor
-    let network = Network::start(config_handle.clone(), key_manager.keypair().clone())?;
+    let keypair = key_manager.keypair().clone();
+    let pq_keys = key_manager.take_pq_keys();
+    let network = Network::start(config_handle.clone(), keypair, pq_keys)?;
 
     // 拨号已有的 bootstrap 节点
     for addr in config_handle.bootstrap_nodes() {

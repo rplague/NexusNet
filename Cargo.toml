@@ -43,3 +43,10 @@ get_if_addrs = "0.5.3"
 base64 = "0.22"
 scopeguard = "1"
 uuid = "1.23.1"
+ml-kem = { version = "0.3.2", features = ["alloc", "getrandom", "zeroize"] }
+ml-dsa = { version = "0.1.1", features = ["alloc", "getrandom", "rand_core", "zeroize"] }
+hkdf = "0.12"
+sha2 = "0.10"
+chacha20poly1305 = "0.10"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+rand_core = { version = "0.6", features = ["getrandom"] }

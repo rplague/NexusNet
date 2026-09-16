@@ -695,6 +695,15 @@ impl NodeController {
                     });
                     Some(Ok(serde_json::to_vec(&result).unwrap()))
                 }
+                "pq_status" => {
+                    let result = serde_json::json!({
+                        "enabled": self.config.pq_enabled(),
+                        "transport": self.config.pq_transport_enabled(),
+                        "identity": self.config.pq_identity_enabled(),
+                        "required": self.config.pq_required(),
+                    });
+                    Some(Ok(serde_json::to_vec(&result).unwrap()))
+                }
                 "add_key" => match serde_json::from_slice::<serde_json::Value>(&payload) {
                     Ok(json) => {
                         let key_str = json["key"].as_str().unwrap_or_default().to_string();

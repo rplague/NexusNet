@@ -445,6 +445,24 @@ impl ConfigHandle {
         self.read().services.relay.max_failures
     }
 
+    pub fn pq_transport_enabled(&self) -> bool {
+        self.read().crypto.pq_transport_enabled
+    }
+
+    pub fn pq_identity_enabled(&self) -> bool {
+        self.read().crypto.pq_identity_enabled
+    }
+
+    pub fn pq_required(&self) -> bool {
+        self.read().crypto.pq_required
+    }
+
+    /// PQ 是否启用（传输或身份任一）。
+    pub fn pq_enabled(&self) -> bool {
+        let c = self.read();
+        c.crypto.pq_transport_enabled || c.crypto.pq_identity_enabled
+    }
+
     pub fn kademlia_enabled(&self) -> bool {
         self.read().services.kademlia.enabled
     }

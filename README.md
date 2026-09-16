@@ -233,6 +233,23 @@ NexusNet 与后端进程之间使用**持久 TCP 连接**，由节点主动发�
 - `@discover_providers` → DHT get_providers 获取提供者列表
 - `call_service()` → 查询提供者，RTT 排序选优，P2P 调用
 
+## 抗量子加密
+
+应用层混合 PQ 加密，用于服务请求/响应的机密性。关闭时协议不注册、行为与旧版本完全一致。
+
+- **算法**：ML-KEM-768+ X25519 混合 KEM、ChaCha20-Poly1305 AEAD、可选 ML-DSA-65（FIPS 204）签名。
+- **协议**：`/oahd/service_req/2.0.0`与 `/oahd/pq_identity/1.0.0`，仅在启用时注册。
+- **流程**：请求方 encaps 到响应方 KEM 公钥，响应方 decaps 后双方共享同一密钥，响应复用该密钥加密——无需第二次 KEM，也不在请求里携带请求方公钥。
+- **回退**：对端不支持 PQ 时回退明文 `/oahd/service_req/1.0.0`；`crypto.pq_required = true` 则拒绝非 PQ 对端。
+- **密钥**：`keypair.pq.bin`。
+- `@pq_status` → 查看启用状态。
+
+| 配置 | 含义 |
+|---|---|
+| `crypto.pq_transport_enabled` | 启用加密服务调用 |
+| `crypto.pq_identity_enabled` | 附带并校验 ML-DSA 签名 |
+| `crypto.pq_required` | 强制 PQ，拒绝非 PQ 对端 |
+
 ## 日志
 
 - 双输出：终端+ 文本文件
@@ -242,12 +259,12 @@ NexusNet 与后端进程之间使用**持久 TCP 连接**，由节点主动发�
 ## 节点身份
 
 - **ED25519 主身份** — `keypair.bin`，Protobuf 编码，派生 `PeerId`
-- **PQ 辅助密钥**（可选）— `keypair.pq.bin`
+- **PQ 辅助密钥**— `keypair.pq.bin`
 - **keypair.bin 不可丢失** — 丢失后节点身份变更
 
 ## 开发状态
 
-当前版本：**0.3.0** — 完成度 **5.5/10**
+当前版本：**0.3.1** — 完成度 **5.5/10**
 
 ## 许可
 

@@ -19,10 +19,14 @@
 //! 组合成单一的 `NetBehaviour`，并把手写事件枚举作为 `out_event`。
 //!
 //! 配置在构造时读取一次并固化进各行为实例。libp2p 各行为没有运行时 setter。
+//!
+//! PQ 相关的两个行为（`service_req_pq`、`pq_identity`）只在 PQ 启用时注册，
+//! 关闭时协议不出现在 Identify 协议表里，避免"假称支持"。
 
 use crate::config::ConfigHandle;
+use crate::network::pq::{self, PqIdentity, PqRequest, PqResponse};
 use crate::service_protocol;
-use libp2p::request_response::{self, cbor};
+use libp2p::request_response::{self, ProtocolSupport, cbor};
 use libp2p::swarm::behaviour::toggle::Toggle;
 use libp2p::{StreamProtocol, identify, identity, kad, ping, relay, swarm::NetworkBehaviour};
 use std::num::NonZeroUsize;
@@ -37,6 +41,8 @@ pub struct NetBehaviour {
     pub identify: identify::Behaviour,
     pub kademlia: Toggle<kad::Behaviour<kad::store::MemoryStore>>,
     pub service_req: cbor::Behaviour<service_protocol::Request, service_protocol::Response>,
+    pub service_req_pq: Toggle<cbor::Behaviour<PqRequest, PqResponse>>,
+    pub pq_identity: Toggle<cbor::Behaviour<(), PqIdentity>>,
     pub relay_server: relay::Behaviour,
     pub relay_client: relay::client::Behaviour,
 }
@@ -52,6 +58,8 @@ pub enum NetBehaviourEvent {
     Identify(identify::Event),
     Kademlia(kad::Event),
     ServiceReq(request_response::Event<service_protocol::Request, service_protocol::Response>),
+    ServiceReqPq(request_response::Event<PqRequest, PqResponse>),
+    PqIdentity(request_response::Event<(), PqIdentity>),
     Relay(relay::Event),
     RelayClient(relay::client::Event),
 }
@@ -80,6 +88,16 @@ impl From<request_response::Event<service_protocol::Request, service_protocol::R
         NetBehaviourEvent::ServiceReq(event)
     }
 }
+impl From<request_response::Event<PqRequest, PqResponse>> for NetBehaviourEvent {
+    fn from(event: request_response::Event<PqRequest, PqResponse>) -> Self {
+        NetBehaviourEvent::ServiceReqPq(event)
+    }
+}
+impl From<request_response::Event<(), PqIdentity>> for NetBehaviourEvent {
+    fn from(event: request_response::Event<(), PqIdentity>) -> Self {
+        NetBehaviourEvent::PqIdentity(event)
+    }
+}
 impl From<relay::Event> for NetBehaviourEvent {
     fn from(event: relay::Event) -> Self {
         NetBehaviourEvent::Relay(event)
@@ -89,6 +107,10 @@ impl From<relay::client::Event> for NetBehaviourEvent {
     fn from(event: relay::client::Event) -> Self {
         NetBehaviourEvent::RelayClient(event)
     }
+}
+
+fn request_response_config() -> request_response::Config {
+    request_response::Config::default().with_request_timeout(Duration::from_secs(30))
 }
 
 impl NetBehaviour {
@@ -152,6 +174,34 @@ impl NetBehaviour {
 
         let service_req = service_protocol::new_service_req_behaviour();
 
+        // PQ 行为：仅启用时注册
+        let pq_active = config.pq_enabled();
+        let service_req_pq: Toggle<cbor::Behaviour<PqRequest, PqResponse>> = if pq_active {
+            Toggle::from(Some(cbor::Behaviour::new(
+                vec![(
+                    StreamProtocol::new(pq::SERVICE_REQ_PQ_PROTOCOL),
+                    ProtocolSupport::Full,
+                )],
+                request_response_config(),
+            )))
+        } else {
+            Toggle::from(None)
+        };
+        let pq_identity: Toggle<cbor::Behaviour<(), PqIdentity>> = if pq_active {
+            Toggle::from(Some(cbor::Behaviour::new(
+                vec![(
+                    StreamProtocol::new(pq::PQ_IDENTITY_PROTOCOL),
+                    ProtocolSupport::Full,
+                )],
+                request_response_config(),
+            )))
+        } else {
+            Toggle::from(None)
+        };
+        if pq_active {
+            LogStruct::new(LogLevel::Preset, "PQ 已启用", "crypto.pq_* = true").emit();
+        }
+
         // Relay server — 双栈节点接受 reservation，单栈节点拒绝所有
         let is_dual_stack = {
             let cfg = config.read();
@@ -177,6 +227,8 @@ impl NetBehaviour {
             identify,
             kademlia,
             service_req,
+            service_req_pq,
+            pq_identity,
             relay_server,
             relay_client,
         }

@@ -17,6 +17,7 @@
 
 //! 节点身份的加载与保存：ED25519 主密钥，可选 PQ 辅助密钥。
 
+use crate::network::pq::PqKeys;
 use crate::{LogLevel, LogStruct};
 use libp2p::{PeerId, identity};
 use std::{
@@ -29,18 +30,18 @@ pub struct KeyManager {
     #[allow(dead_code)]
     path: PathBuf,
     pq_path: PathBuf,
-    pq_secret_key: Option<Vec<u8>>,
-    pq_public_key: Option<Vec<u8>>,
+    pq_keys: Option<PqKeys>,
 }
 
 impl KeyManager {
-    /// 从指定路径加载密钥，若不存在则生成并原子保存
+    /// 从指定路径加载密钥，若不存在则生成并原子保存。
+    ///
+    /// PQ 密钥（`keypair.pq.bin`）若存在则加载；不存在则留待 `ensure_pq_keys`。
     pub fn load_or_create(path: impl AsRef<Path>) -> Result<Self, Box<dyn std::error::Error>> {
         let path = path.as_ref();
         let pq_path = path.with_extension("pq.bin");
 
-        // 尝试读取并解析现有 ED25519 密钥文件
-        match fs::read(path) {
+        let keypair = match fs::read(path) {
             Ok(bytes) => match identity::Keypair::from_protobuf_encoding(&bytes) {
                 Ok(keypair) => {
                     LogStruct::new(
@@ -49,14 +50,7 @@ impl KeyManager {
                         path.display().to_string(),
                     )
                     .emit();
-                    let (pq_secret, pq_public) = KeyManager::load_pq_keys(&pq_path);
-                    return Ok(KeyManager {
-                        keypair,
-                        path: path.to_path_buf(),
-                        pq_secret_key: pq_secret,
-                        pq_public_key: pq_public,
-                        pq_path,
-                    });
+                    keypair
                 }
                 Err(e) => {
                     LogStruct::new(LogLevel::Error, "密钥文件解析失败", e.to_string()).emit();
@@ -70,56 +64,29 @@ impl KeyManager {
                     path.display().to_string(),
                 )
                 .emit();
+                let keypair = identity::Keypair::generate_ed25519();
+                let encoded = keypair.to_protobuf_encoding()?;
+                atomic_write(path, &encoded, "密钥文件")?;
+                LogStruct::new(
+                    LogLevel::Important,
+                    "新密钥生成并保存成功",
+                    path.display().to_string(),
+                )
+                .emit();
+                keypair
             }
             Err(e) => {
                 LogStruct::new(LogLevel::Error, "无法读取密钥文件", e.to_string()).emit();
                 return Err(e.into());
             }
-        }
+        };
 
-        // 生成新密钥对
-        let keypair = identity::Keypair::generate_ed25519();
-        let encoded = keypair.to_protobuf_encoding()?;
-
-        // 原子写入：先写临时文件，再重命名
-        let temp_path = path.with_extension("tmp");
-        if let Err(e) = fs::write(&temp_path, &encoded) {
-            LogStruct::new(
-                LogLevel::Critical,
-                "写入临时密钥文件失败",
-                format!("路径: {}, 错误: {}", temp_path.display(), e),
-            )
-            .emit();
-            return Err(e.into());
-        }
-        if let Err(e) = fs::rename(&temp_path, path) {
-            let _ = fs::remove_file(&temp_path);
-            LogStruct::new(
-                LogLevel::Critical,
-                "重命名密钥文件失败",
-                format!(
-                    "从 {} 到 {}, 错误: {}",
-                    temp_path.display(),
-                    path.display(),
-                    e
-                ),
-            )
-            .emit();
-            return Err(e.into());
-        }
-
-        LogStruct::new(
-            LogLevel::Important,
-            "新密钥生成并保存成功",
-            path.display().to_string(),
-        )
-        .emit();
+        let pq_keys = load_pq_keys(&pq_path);
 
         Ok(KeyManager {
             keypair,
             path: path.to_path_buf(),
-            pq_secret_key: None,
-            pq_public_key: None,
+            pq_keys,
             pq_path,
         })
     }
@@ -133,66 +100,83 @@ impl KeyManager {
         self.keypair.public().to_peer_id()
     }
 
-    /// 是否有 PQ 密钥
+    /// 是否已加载 PQ 密钥
     #[allow(dead_code)]
     pub fn has_pq_keys(&self) -> bool {
-        self.pq_secret_key.is_some() && self.pq_public_key.is_some()
+        self.pq_keys.is_some()
     }
 
-    /// 获取 PQ 公钥
-    #[allow(dead_code)]
-    pub fn pq_public_key(&self) -> Option<&[u8]> {
-        self.pq_public_key.as_deref()
+    /// 取出 PQ 密钥所有权（供网络层注入 Actor）。
+    pub fn take_pq_keys(&mut self) -> Option<PqKeys> {
+        self.pq_keys.take()
     }
 
-    /// 获取 PQ 私钥
-    #[allow(dead_code)]
-    pub fn pq_secret_key(&self) -> Option<&[u8]> {
-        self.pq_secret_key.as_deref()
-    }
-
-    /// 保存 PQ 密钥到 sidecar 文件
-    #[allow(dead_code)]
-    pub fn save_pq_keys(
-        &mut self,
-        secret: Vec<u8>,
-        public: Vec<u8>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let mut buf = Vec::with_capacity(8 + secret.len() + public.len());
-        buf.extend_from_slice(&(secret.len() as u32).to_be_bytes());
-        buf.extend_from_slice(&secret);
-        buf.extend_from_slice(&(public.len() as u32).to_be_bytes());
-        buf.extend_from_slice(&public);
-
-        let temp_path = self.pq_path.with_extension("tmp");
-        fs::write(&temp_path, &buf)?;
-        fs::rename(&temp_path, &self.pq_path)?;
-
-        self.pq_secret_key = Some(secret);
-        self.pq_public_key = Some(public);
+    /// 确保 PQ 密钥存在：缺失则生成并原子保存。
+    pub fn ensure_pq_keys(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.pq_keys.is_some() {
+            return Ok(());
+        }
+        let keys = PqKeys::generate();
+        atomic_write(&self.pq_path, &keys.to_bytes(), "PQ 密钥文件")?;
+        LogStruct::new(
+            LogLevel::Important,
+            "PQ 密钥生成并保存成功",
+            self.pq_path.display().to_string(),
+        )
+        .emit();
+        self.pq_keys = Some(keys);
         Ok(())
     }
+}
 
-    /// 从 sidecar 文件加载 PQ 密钥
-    fn load_pq_keys(pq_path: &Path) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
-        let bytes = match fs::read(pq_path) {
-            Ok(b) => b,
-            Err(_) => return (None, None),
-        };
-        if bytes.len() < 8 {
-            return (None, None);
+fn load_pq_keys(pq_path: &Path) -> Option<PqKeys> {
+    let bytes = match fs::read(pq_path) {
+        Ok(b) => b,
+        Err(_) => return None,
+    };
+    match PqKeys::from_bytes(&bytes) {
+        Ok(keys) => {
+            LogStruct::new(
+                LogLevel::Important,
+                "PQ 密钥加载成功",
+                pq_path.display().to_string(),
+            )
+            .emit();
+            Some(keys)
         }
-        let secret_len = u32::from_be_bytes(bytes[0..4].try_into().unwrap()) as usize;
-        if 4 + secret_len + 4 > bytes.len() {
-            return (None, None);
+        Err(e) => {
+            LogStruct::new(LogLevel::Warning, "PQ 密钥解析失败，将忽略", e.to_string()).emit();
+            None
         }
-        let secret = bytes[4..4 + secret_len].to_vec();
-        let public_len =
-            u32::from_be_bytes(bytes[4 + secret_len..8 + secret_len].try_into().unwrap()) as usize;
-        if 8 + secret_len + public_len > bytes.len() {
-            return (None, None);
-        }
-        let public = bytes[8 + secret_len..8 + secret_len + public_len].to_vec();
-        (Some(secret), Some(public))
     }
+}
+
+/// 原子写入：先写临时文件，再重命名。
+fn atomic_write(path: &Path, data: &[u8], what: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let temp_path = path.with_extension("tmp");
+    if let Err(e) = fs::write(&temp_path, data) {
+        LogStruct::new(
+            LogLevel::Critical,
+            format!("写入临时{}失败", what),
+            format!("路径: {}, 错误: {}", temp_path.display(), e),
+        )
+        .emit();
+        return Err(e.into());
+    }
+    if let Err(e) = fs::rename(&temp_path, path) {
+        let _ = fs::remove_file(&temp_path);
+        LogStruct::new(
+            LogLevel::Critical,
+            format!("重命名{}失败", what),
+            format!(
+                "从 {} 到 {}, 错误: {}",
+                temp_path.display(),
+                path.display(),
+                e
+            ),
+        )
+        .emit();
+        return Err(e.into());
+    }
+    Ok(())
 }

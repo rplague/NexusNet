@@ -42,6 +42,7 @@ mod addr;
 mod behaviour;
 mod builder;
 mod identity;
+pub mod pq;
 
 pub use actor::{NetworkEvent, NetworkHandle, NetworkStart};
 pub use addr::{dialable_addrs, update_config_with_public_ip};
@@ -93,8 +94,9 @@ impl Network {
     pub fn start(
         config: ConfigHandle,
         keypair: libp2p::identity::Keypair,
+        pq_keys: Option<pq::PqKeys>,
     ) -> Result<NetworkStart, NetworkError> {
-        actor::spawn(config, keypair)
+        actor::spawn(config, keypair, pq_keys)
     }
 }
 
