@@ -5,18 +5,35 @@ use crate::service_dispatcher::{Command, InboundServiceRequest};
 use crate::service_protocol;
 use libp2p::multiaddr::Protocol;
 use libp2p::{Multiaddr, PeerId, identify, kad, ping, relay};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::sync::watch;
+
+/// DHT provider 键：声明/发现 bootstrap 节点。
+const BOOTSTRAP_PROVIDER_KEY: &[u8] = b"/oahd/bootstrap";
+/// 中继预约目标数量（固定为 3，不可配置）。
+const RELAY_TARGET: usize = 3;
 
 pub struct NodeController {
     config: ConfigHandle,
     my_peer_id: PeerId,
     node_rtts: Arc<RwLock<HashMap<PeerId, Duration>>>,
     node_ping_failures: HashMap<PeerId, u32>,
+    /// 已确认可用的中继。
+    active_relays: HashSet<PeerId>,
+    /// 已发起、等待确认的中继预约，值为发起时间（用于超时判定）。
+    pending_relays: HashMap<PeerId, Instant>,
+    /// 中继连续失败计数。
+    relay_failures: HashMap<PeerId, u32>,
+    /// 中继退避截止时间。
+    relay_backoff: HashMap<PeerId, Instant>,
+    /// 缓存的 bootstrap 提供者集合，来自 DHT get_providers。
+    bootstrap_providers: HashSet<PeerId>,
+    /// 自身是否已成功声明为 bootstrap 提供者。
+    is_bootstrap_provider: bool,
     cmd_rx: mpsc::UnboundedReceiver<Command>,
     inbound_req_tx: mpsc::UnboundedSender<InboundServiceRequest>,
     swarm: NetworkHandle,
@@ -49,6 +66,12 @@ impl NodeController {
             my_peer_id,
             node_rtts,
             node_ping_failures: HashMap::new(),
+            active_relays: HashSet::new(),
+            pending_relays: HashMap::new(),
+            relay_failures: HashMap::new(),
+            relay_backoff: HashMap::new(),
+            bootstrap_providers: HashSet::new(),
+            is_bootstrap_provider: false,
             cmd_rx,
             inbound_req_tx,
             swarm,
@@ -59,6 +82,11 @@ impl NodeController {
 
     /// 运行节点编排循环，接收 SwarmActor 转发的事件 + backend 命令
     pub async fn run(mut self) -> Result<(), Box<dyn Error>> {
+        // 周期补约：即使 bootstrap 未完成或中继掉线，也会持续尝试补足目标数量。
+        let retry = Duration::from_secs(self.config.relay_retry_interval().max(1) as u64);
+        let mut relay_tick = tokio::time::interval_at(tokio::time::Instant::now() + retry, retry);
+        relay_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
         loop {
             tokio::select! {
                 Some(event) = self.event_rx.recv() => {
@@ -66,6 +94,11 @@ impl NodeController {
                 }
                 Some(cmd) = self.cmd_rx.recv() => {
                     self.handle_command(cmd).await;
+                }
+                _ = relay_tick.tick() => {
+                    self.announce_bootstrap_provider().await;
+                    self.refresh_bootstrap_providers().await;
+                    self.reconcile_relays().await;
                 }
                 _ = self.shutdown_rx.changed() => {
                     self.swarm.shutdown();
@@ -81,7 +114,9 @@ impl NodeController {
             NetworkEvent::Identify(event) => self.handle_identify(event).await?,
             NetworkEvent::BootstrapCompleted => {
                 self.announce_local_services().await?;
-                self.request_relay_reservation_if_needed().await?;
+                self.announce_bootstrap_provider().await;
+                self.refresh_bootstrap_providers().await;
+                self.reconcile_relays().await;
             }
             NetworkEvent::InboundServiceRequest {
                 request_id,
@@ -104,6 +139,12 @@ impl NodeController {
             }
             NetworkEvent::Relay(event) => self.handle_relay(event).await?,
             NetworkEvent::RelayClient(event) => self.handle_relay_client(event).await?,
+            NetworkEvent::ListenerClosed { addresses } => {
+                // 中继掉线：立即尝试补足目标数量。
+                if self.handle_listener_closed(addresses).await {
+                    self.reconcile_relays().await;
+                }
+            }
         }
         Ok(())
     }
@@ -212,11 +253,28 @@ impl NodeController {
         event: relay::client::Event,
     ) -> Result<(), Box<dyn Error>> {
         match event {
-            relay::client::Event::ReservationReqAccepted { relay_peer_id, .. } => {
+            relay::client::Event::ReservationReqAccepted {
+                relay_peer_id,
+                renewal,
+                ..
+            } => {
+                self.pending_relays.remove(&relay_peer_id);
+                self.active_relays.insert(relay_peer_id);
+                self.relay_failures.remove(&relay_peer_id);
+                self.relay_backoff.remove(&relay_peer_id);
                 LogStruct::new(
                     LogLevel::Preset,
-                    "中继预约成功",
-                    format!("中继节点: {}", relay_peer_id),
+                    if renewal {
+                        "中继预约续期"
+                    } else {
+                        "中继预约成功"
+                    },
+                    format!(
+                        "{}/{}: {}",
+                        self.active_relays.len(),
+                        RELAY_TARGET,
+                        relay_peer_id
+                    ),
                 )
                 .emit();
             }
@@ -308,88 +366,232 @@ impl NodeController {
         Ok(())
     }
 
-    async fn request_relay_reservation_if_needed(&self) -> Result<(), Box<dyn Error>> {
+    /// 消费者侧中继补约：尽力把可用中继补足到目标数量。
+    ///
+    /// 触发点：bootstrap 完成、中继监听器关闭、周期 tick。软目标，不强求。
+    async fn reconcile_relays(&mut self) {
         let need_relay = {
             let cfg = self.config.read();
             !(cfg.network.ipv4_enabled && cfg.network.ipv6_enabled)
         };
         if !need_relay {
-            return Ok(());
+            return;
         }
 
-        let candidates = self.config.bootstrap_nodes();
-        for addr in &candidates {
-            if let Some(peer_id) = extract_peer_id_from_multiaddr(addr) {
-                if peer_id == self.my_peer_id {
+        let target = RELAY_TARGET;
+        if target == 0 {
+            return;
+        }
+
+        let now = Instant::now();
+        self.expire_pending_relays(now);
+
+        // 去重候选：peer_id -> 首个地址
+        let mut candidates: Vec<(PeerId, Multiaddr)> = Vec::new();
+        let mut seen = HashSet::new();
+        for addr in self.config.bootstrap_nodes() {
+            if let Some(peer_id) = extract_peer_id_from_multiaddr(&addr) {
+                if peer_id == self.my_peer_id || !seen.insert(peer_id) {
                     continue;
                 }
-                let mut relay_listen_addr = addr.clone();
-                relay_listen_addr.push(Protocol::P2pCircuit);
-                match self.swarm.listen_on(relay_listen_addr).await {
-                    Ok(_) => {
-                        LogStruct::new(
-                            LogLevel::Preset,
-                            "请求中继预约",
-                            format!("中继节点: {}", peer_id),
-                        )
-                        .emit();
-                        return Ok(());
-                    }
-                    Err(e) => {
-                        LogStruct::new(
-                            LogLevel::Warning,
-                            "中继预约失败",
-                            format!("{}: {}", peer_id, e),
-                        )
-                        .emit();
-                    }
+                candidates.push((peer_id, addr));
+            }
+        }
+
+        let desired = target.min(candidates.len());
+        for (peer_id, addr) in candidates {
+            if self.active_relays.len() + self.pending_relays.len() >= desired {
+                break;
+            }
+            if self.active_relays.contains(&peer_id) || self.pending_relays.contains_key(&peer_id) {
+                continue;
+            }
+            if self
+                .relay_backoff
+                .get(&peer_id)
+                .is_some_and(|until| *until > now)
+            {
+                continue;
+            }
+
+            let mut relay_listen_addr = addr.clone();
+            relay_listen_addr.push(Protocol::P2pCircuit);
+            match self.swarm.listen_on(relay_listen_addr).await {
+                Ok(_) => {
+                    self.pending_relays.insert(peer_id, now);
+                }
+                Err(e) => {
+                    LogStruct::new(
+                        LogLevel::Warning,
+                        "中继预约请求失败",
+                        format!("{}: {}", peer_id, e),
+                    )
+                    .emit();
+                    self.record_relay_failure(peer_id, now);
                 }
             }
         }
-        LogStruct::new(
-            LogLevel::Warning,
-            "无可用中继",
-            "未找到可用的中继节点，部分跨 IP 族通信不可用",
-        )
-        .emit();
-        Ok(())
     }
 
+    /// 处理中继监听器关闭。返回是否有被跟踪的中继因此失效。
+    async fn handle_listener_closed(&mut self, addresses: Vec<Multiaddr>) -> bool {
+        let mut lost = false;
+        for addr in addresses {
+            if !addr.iter().any(|p| matches!(p, Protocol::P2pCircuit)) {
+                continue;
+            }
+            let Some(peer_id) = extract_peer_id_from_multiaddr(&addr) else {
+                continue;
+            };
+            let was_active = self.active_relays.remove(&peer_id);
+            let was_pending = self.pending_relays.remove(&peer_id).is_some();
+            if !was_active && !was_pending {
+                // 非本次跟踪的预约，忽略。
+                continue;
+            }
+            lost = true;
+            if was_active {
+                LogStruct::new(LogLevel::Warning, "中继连接断开", peer_id.to_string()).emit();
+            }
+            self.record_relay_failure(peer_id, Instant::now());
+        }
+        lost
+    }
+
+    /// 超过一定时间仍未确认的预约视为失败，避免 pending 永久占用名额。
+    fn expire_pending_relays(&mut self, now: Instant) {
+        let timeout = Duration::from_secs(
+            (self.config.relay_retry_interval() as u64)
+                .saturating_mul(3)
+                .max(180),
+        );
+        let expired: Vec<PeerId> = self
+            .pending_relays
+            .iter()
+            .filter(|(_, since)| now.duration_since(**since) >= timeout)
+            .map(|(peer, _)| *peer)
+            .collect();
+        for peer_id in expired {
+            self.pending_relays.remove(&peer_id);
+            self.record_relay_failure(peer_id, now);
+        }
+    }
+
+    /// 记录一次中继失败并设置指数退避；达到阈值则从 bootstrap 剔除该节点。
+    fn record_relay_failure(&mut self, peer_id: PeerId, now: Instant) {
+        let count = {
+            let c = self.relay_failures.entry(peer_id).or_insert(0);
+            *c += 1;
+            *c
+        };
+
+        let backoff = Duration::from_secs(relay_backoff_secs(count));
+        self.relay_backoff.insert(peer_id, now + backoff);
+
+        let max = self.config.relay_max_failures();
+        if max > 0 && count >= max {
+            self.evict_bootstrap(peer_id);
+        }
+    }
+
+    /// 从 bootstrap 列表移除失效节点并持久化（不保底）。
+    fn evict_bootstrap(&mut self, peer_id: PeerId) {
+        let nodes = self.config.bootstrap_nodes();
+        let filtered: Vec<Multiaddr> = nodes
+            .into_iter()
+            .filter(|addr| extract_peer_id_from_multiaddr(addr) != Some(peer_id))
+            .collect();
+        self.config.set_bootstrap_nodes(filtered);
+        self.config.save_to_default();
+
+        self.active_relays.remove(&peer_id);
+        self.pending_relays.remove(&peer_id);
+        self.relay_failures.remove(&peer_id);
+        self.relay_backoff.remove(&peer_id);
+
+        LogStruct::new(
+            LogLevel::Warning,
+            "移除失效中继",
+            format!("已从 bootstrap 列表移除: {}", peer_id),
+        )
+        .emit();
+    }
+
+    /// 声明自身为 bootstrap 提供者（仅双栈 + allow_bootstrap 时）。
+    async fn announce_bootstrap_provider(&mut self) {
+        if self.is_bootstrap_provider || !self.config.allow_bootstrap() {
+            return;
+        }
+        let dual_stack = {
+            let cfg = self.config.read();
+            cfg.network.ipv4_enabled && cfg.network.ipv6_enabled
+        };
+        if !dual_stack {
+            return;
+        }
+
+        let key = kad::RecordKey::new(&BOOTSTRAP_PROVIDER_KEY);
+        match self.swarm.start_providing(key).await {
+            Ok(_) => {
+                self.is_bootstrap_provider = true;
+                LogStruct::new(LogLevel::Preset, "已声明为 bootstrap 节点", "").emit();
+            }
+            Err(e) => {
+                LogStruct::new(LogLevel::Warning, "声明 bootstrap 失败", e.to_string()).emit();
+            }
+        }
+    }
+
+    /// 刷新缓存的 bootstrap 提供者集合（失败则保留旧缓存）。
+    async fn refresh_bootstrap_providers(&mut self) {
+        let key = kad::RecordKey::new(&BOOTSTRAP_PROVIDER_KEY);
+        match self.swarm.get_providers(key).await {
+            Ok(providers) => {
+                self.bootstrap_providers = providers.into_iter().collect();
+            }
+            Err(e) => {
+                LogStruct::new(LogLevel::Debug, "刷新 bootstrap 提供者失败", e.to_string()).emit();
+            }
+        }
+    }
+
+    /// Identify 命中后，按「先双栈、再 bootstrap」判定是否加入本地 bootstrap 列表。
+    ///
+    /// 地址一律取自 Identify 信息，无需 DHT 存地址。
     async fn add_bootstrap_node_if_new(
         &self,
         info: &identify::Info,
         peer_id: PeerId,
     ) -> Result<(), Box<dyn Error>> {
-        let full_addr = info
-            .listen_addrs
-            .iter()
-            .find(|addr| addr.iter().any(|proto| matches!(proto, Protocol::P2p(_))))
-            .cloned()
-            .unwrap_or_else(|| {
-                let mut addr = info
-                    .listen_addrs
-                    .first()
-                    .cloned()
-                    .unwrap_or_else(Multiaddr::empty);
-                addr.push(Protocol::P2p(peer_id));
-                addr
-            });
+        // ① 先校验双栈
+        if !is_dual_stack_addrs(&info.listen_addrs) {
+            return Ok(());
+        }
+        // ② 再确认对方是 bootstrap 提供者
+        if !self.bootstrap_providers.contains(&peer_id) {
+            return Ok(());
+        }
+        // ③ 用 Identify 地址写入（v4、v6 各一个）
+        let candidates = bootstrap_addrs_from(&info.listen_addrs, peer_id);
+        if candidates.is_empty() {
+            return Ok(());
+        }
 
-        let current_nodes = self.config.bootstrap_nodes();
-        let known_peer_ids: std::collections::HashSet<PeerId> = current_nodes
-            .iter()
-            .filter_map(extract_peer_id_from_multiaddr)
-            .collect();
-
-        if !known_peer_ids.contains(&peer_id) {
-            let mut new_nodes = current_nodes;
-            new_nodes.push(full_addr);
-            self.config.set_bootstrap_nodes(new_nodes);
+        let mut nodes = self.config.bootstrap_nodes();
+        let mut changed = false;
+        for addr in candidates {
+            if !nodes.contains(&addr) {
+                nodes.push(addr);
+                changed = true;
+            }
+        }
+        if changed {
+            self.config.set_bootstrap_nodes(nodes);
             self.config.save_to_default();
             LogStruct::new(
                 LogLevel::Debug,
                 "配置更新",
-                format!("添加新 bootstrap 节点: {}", peer_id),
+                format!("添加 bootstrap 节点: {}", peer_id),
             )
             .emit();
         }
@@ -460,11 +662,37 @@ impl NodeController {
                 "reload_config" => {
                     // 用当前 config.toml 重建 Swarm。注意：会瞬断连接并清空 DHT 本地存储。
                     let result = match self.swarm.reload().await {
-                        Ok(_) => serde_json::json!({"success": true}),
+                        Ok(_) => {
+                            // 旧 Swarm 已丢弃，中继预约与 bootstrap 声明随之失效，清空本地跟踪。
+                            self.active_relays.clear();
+                            self.pending_relays.clear();
+                            self.relay_failures.clear();
+                            self.relay_backoff.clear();
+                            self.bootstrap_providers.clear();
+                            self.is_bootstrap_provider = false;
+                            serde_json::json!({"success": true})
+                        }
                         Err(e) => {
                             serde_json::json!({"success": false, "error": e.to_string()})
                         }
                     };
+                    Some(Ok(serde_json::to_vec(&result).unwrap()))
+                }
+                "relay_status" => {
+                    let need_relay = {
+                        let cfg = self.config.read();
+                        !(cfg.network.ipv4_enabled && cfg.network.ipv6_enabled)
+                    };
+                    let active: Vec<String> =
+                        self.active_relays.iter().map(|p| p.to_string()).collect();
+                    let pending: Vec<String> =
+                        self.pending_relays.keys().map(|p| p.to_string()).collect();
+                    let result = serde_json::json!({
+                        "need_relay": need_relay,
+                        "target": RELAY_TARGET,
+                        "active": active,
+                        "pending": pending,
+                    });
                     Some(Ok(serde_json::to_vec(&result).unwrap()))
                 }
                 "add_key" => match serde_json::from_slice::<serde_json::Value>(&payload) {
@@ -647,4 +875,113 @@ fn extract_peer_id_from_multiaddr(addr: &Multiaddr) -> Option<PeerId> {
         }
     }
     None
+}
+
+/// 连续失败次数 → 退避秒数（指数退避，上限 10 分钟）。
+fn relay_backoff_secs(count: u32) -> u64 {
+    let shift = count.saturating_sub(1).min(5);
+    (30u64 << shift).min(600)
+}
+
+/// 地址列表是否同时包含 IPv4 与 IPv6（双栈）。
+fn is_dual_stack_addrs(addrs: &[Multiaddr]) -> bool {
+    let mut v4 = false;
+    let mut v6 = false;
+    for addr in addrs {
+        for proto in addr.iter() {
+            match proto {
+                Protocol::Ip4(_) => v4 = true,
+                Protocol::Ip6(_) => v6 = true,
+                _ => {}
+            }
+        }
+    }
+    v4 && v6
+}
+
+/// 从 Identify 的监听地址中为每个 IP 族各取一个，补上 `/p2p/<peer_id>`。
+fn bootstrap_addrs_from(addrs: &[Multiaddr], peer_id: PeerId) -> Vec<Multiaddr> {
+    let mut v4: Option<Multiaddr> = None;
+    let mut v6: Option<Multiaddr> = None;
+    for addr in addrs {
+        let has_p2p = addr.iter().any(|p| matches!(p, Protocol::P2p(_)));
+        let full = if has_p2p {
+            addr.clone()
+        } else {
+            let mut a = addr.clone();
+            a.push(Protocol::P2p(peer_id));
+            a
+        };
+        let is_v4 = addr.iter().any(|p| matches!(p, Protocol::Ip4(_)));
+        let is_v6 = addr.iter().any(|p| matches!(p, Protocol::Ip6(_)));
+        if is_v4 && v4.is_none() {
+            v4 = Some(full);
+        } else if is_v6 && v6.is_none() {
+            v6 = Some(full);
+        }
+    }
+    [v4, v6].into_iter().flatten().collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{bootstrap_addrs_from, is_dual_stack_addrs, relay_backoff_secs};
+    use libp2p::multiaddr::Protocol;
+    use libp2p::{Multiaddr, PeerId};
+    use std::str::FromStr;
+
+    fn peer() -> PeerId {
+        libp2p::identity::Keypair::generate_ed25519()
+            .public()
+            .to_peer_id()
+    }
+
+    #[test]
+    fn backoff_grows_exponentially_and_caps() {
+        assert_eq!(relay_backoff_secs(1), 30);
+        assert_eq!(relay_backoff_secs(2), 60);
+        assert_eq!(relay_backoff_secs(3), 120);
+        assert_eq!(relay_backoff_secs(4), 240);
+        assert_eq!(relay_backoff_secs(5), 480);
+        assert_eq!(relay_backoff_secs(6), 600);
+        assert_eq!(relay_backoff_secs(100), 600);
+    }
+
+    #[test]
+    fn dual_stack_detection() {
+        let v4 = Multiaddr::from_str("/ip4/1.2.3.4/tcp/5000").unwrap();
+        let v6 = Multiaddr::from_str("/ip6/2001:db8::1/tcp/5000").unwrap();
+        assert!(!is_dual_stack_addrs(&[v4.clone()]));
+        assert!(!is_dual_stack_addrs(&[v6.clone()]));
+        assert!(is_dual_stack_addrs(&[v4, v6]));
+    }
+
+    #[test]
+    fn bootstrap_addrs_picks_one_per_family_with_peer_id() {
+        let pid = peer();
+        let v4 = Multiaddr::from_str("/ip4/1.2.3.4/tcp/5000").unwrap();
+        let v6a = Multiaddr::from_str("/ip6/2001:db8::1/tcp/5000").unwrap();
+        let v6b = Multiaddr::from_str("/ip6/2001:db8::2/tcp/5000").unwrap();
+
+        let addrs = bootstrap_addrs_from(&[v4, v6a, v6b], pid);
+        assert_eq!(addrs.len(), 2);
+        assert!(addrs.iter().all(|a| {
+            a.iter()
+                .any(|p| matches!(p, Protocol::P2p(id) if id == pid))
+        }));
+        assert_eq!(
+            addrs
+                .iter()
+                .filter(|a| a.iter().any(|p| matches!(p, Protocol::Ip4(_))))
+                .count(),
+            1
+        );
+        assert_eq!(
+            addrs
+                .iter()
+                .filter(|a| a.iter().any(|p| matches!(p, Protocol::Ip6(_))))
+                .count(),
+            1
+        );
+    }
 }

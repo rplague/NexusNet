@@ -18,7 +18,8 @@
 //! 本地公网地址探测与 Multiaddr 转换。
 
 use crate::{LogLevel, LogStruct, config::ConfigHandle};
-use libp2p::Multiaddr;
+use libp2p::multiaddr::Protocol;
+use libp2p::{Multiaddr, PeerId};
 use std::net::IpAddr;
 
 /// 获取本机所有公网 IP
@@ -65,6 +66,24 @@ pub fn to_multiaddr(ip: IpAddr, port: u16) -> Multiaddr {
     }
     addr.push(libp2p::multiaddr::Protocol::Tcp(port));
     addr
+}
+
+/// 构造可直接拨号的 bootstrap 格式地址：公告地址 + `/p2p/<peer_id>`。
+///
+/// 用于启动时告知使用者如何让其他人拨入本机。已带 `/p2p` 的地址不会重复追加。
+pub fn dialable_addrs(config: &ConfigHandle, peer_id: PeerId) -> Vec<Multiaddr> {
+    let cfg = config.read();
+    cfg.network
+        .announce_addresses
+        .iter()
+        .map(|addr| {
+            let mut a = addr.clone();
+            if !a.iter().any(|p| matches!(p, Protocol::P2p(_))) {
+                a.push(Protocol::P2p(peer_id));
+            }
+            a
+        })
+        .collect()
 }
 
 /// 探测公网 IP 并写回配置，同时更新 announce_addresses。
@@ -142,4 +161,54 @@ pub fn update_config_with_public_ip(
     )
     .emit();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dialable_addrs;
+    use crate::config::{ConfigHandle, NodeConfig};
+    use libp2p::Multiaddr;
+    use std::str::FromStr;
+
+    fn peer() -> libp2p::PeerId {
+        libp2p::identity::Keypair::generate_ed25519()
+            .public()
+            .to_peer_id()
+    }
+
+    #[test]
+    fn appends_peer_id_to_announce_addresses() {
+        let mut cfg = NodeConfig::default();
+        cfg.network.announce_addresses = vec![
+            Multiaddr::from_str("/ip6/2001:db8::1/tcp/5000").unwrap(),
+            Multiaddr::from_str("/ip4/1.2.3.4/tcp/5000").unwrap(),
+        ];
+        let handle = ConfigHandle::new(cfg);
+        let pid = peer();
+
+        let addrs = dialable_addrs(&handle, pid);
+        assert_eq!(addrs.len(), 2);
+        for addr in &addrs {
+            assert!(
+                addr.to_string().ends_with(&format!("/p2p/{pid}")),
+                "missing peer id suffix: {addr}"
+            );
+        }
+    }
+
+    #[test]
+    fn does_not_duplicate_existing_peer_id() {
+        let pid = peer();
+        let mut cfg = NodeConfig::default();
+        cfg.network.announce_addresses =
+            vec![Multiaddr::from_str(&format!("/ip6/2001:db8::1/tcp/5000/p2p/{pid}")).unwrap()];
+        let handle = ConfigHandle::new(cfg);
+
+        let addrs = dialable_addrs(&handle, pid);
+        assert_eq!(addrs.len(), 1);
+        assert_eq!(
+            addrs[0].to_string(),
+            format!("/ip6/2001:db8::1/tcp/5000/p2p/{pid}")
+        );
+    }
 }

@@ -44,7 +44,7 @@ mod builder;
 mod identity;
 
 pub use actor::{NetworkEvent, NetworkHandle, NetworkStart};
-pub use addr::update_config_with_public_ip;
+pub use addr::{dialable_addrs, update_config_with_public_ip};
 pub use identity::KeyManager;
 
 use crate::config::ConfigHandle;

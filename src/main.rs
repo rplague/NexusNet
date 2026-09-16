@@ -42,12 +42,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
     let key_manager = KeyManager::load_or_create(paths::keypair_path())?;
     let peer_id = key_manager.peer_id();
-    LogStruct::new(
-        LogLevel::Important,
-        "节点身份",
-        format!("PeerId: {}", peer_id),
-    )
-    .emit();
+    let dial: Vec<String> = network::dialable_addrs(&config_handle, peer_id)
+        .iter()
+        .map(|a| a.to_string())
+        .collect();
+    let identity = if dial.is_empty() {
+        format!("PeerId: {}", peer_id)
+    } else {
+        format!("PeerId: {}\n    {}", peer_id, dial.join("\n    "))
+    };
+    LogStruct::new(LogLevel::Important, "节点身份", identity).emit();
 
     // 构建网络并启动 Swarm Actor
     let network = Network::start(config_handle.clone(), key_manager.keypair().clone())?;

@@ -94,6 +94,7 @@ apt install -y ./nexusnet_<version>_amd64.deb
 [node]
 name = "未设置的p2p节点"
 description = "无详细描述"
+allow_bootstrap = true
 
 [network]
 ipv4_enabled = false
@@ -126,6 +127,10 @@ name = "cmd"
 host = "127.0.0.1"
 port = 5014
 
+[services.relay]
+retry_interval_secs = 60
+max_failures = 3
+
 [crypto]
 pq_transport_enabled = false
 pq_identity_enabled = false
@@ -156,10 +161,6 @@ boot::init()
             shutdown→ SIGTERM/Ctrl-C 优雅退出
         }
 ```
-
-路径由 `paths.rs` 解析；收到 SIGTERM/Ctrl-C 时 NodeController 与 ServiceDispatcher
-收到共享关闭信号并结束循环，进程干净退出。收到 SIGHUP 时经 `@reload_config`
-用当前配置重建 Swarm（配合 systemd `ExecReload`）。
 
 ## 模块清单
 

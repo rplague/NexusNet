@@ -112,6 +112,11 @@ pub enum NetworkEvent {
     },
     Relay(relay::Event),
     RelayClient(relay::client::Event),
+    /// 某个监听器关闭。`addresses` 含该监听器曾监听的全部地址；
+    /// 中继预约失败或掉线会以带 `p2p-circuit` 的地址出现在这里。
+    ListenerClosed {
+        addresses: Vec<Multiaddr>,
+    },
 }
 
 /// 对外异步门面。所有方法通过命令通道与 Actor 通信，内部使用 oneshot 回执。
@@ -392,6 +397,11 @@ impl SwarmActor {
                 // 连接关闭后其挂起的入站请求无法再回复，清理避免泄漏。
                 self.pending_inbound
                     .retain(|_, (cid, _)| *cid != connection_id);
+            }
+            SwarmEvent::ListenerClosed { addresses, .. } => {
+                let _ = self
+                    .event_tx
+                    .send(NetworkEvent::ListenerClosed { addresses });
             }
             _ => {}
         }
