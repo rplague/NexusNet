@@ -52,8 +52,10 @@ default_u32_fn!(default_max_failures, 2);
 default_u32_fn!(default_record_ttl_seconds, hours(1));
 default_u32_fn!(default_replication_factor, 20);
 default_u32_fn!(default_query_timeout_seconds, 60);
+default_u32_fn!(default_relay_retry_interval, 60);
+default_u32_fn!(default_relay_max_failures, 3);
 
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, Default)]
 pub struct NodeConfig {
     #[serde(default)]
     pub node: NodeInfo,
@@ -63,17 +65,6 @@ pub struct NodeConfig {
     pub services: ServicesConfig,
     #[serde(default)]
     pub crypto: CryptoConfig,
-}
-
-impl Default for NodeConfig {
-    fn default() -> Self {
-        NodeConfig {
-            node: NodeInfo::default(),
-            network: NetworkConfig::default(),
-            services: ServicesConfig::default(),
-            crypto: CryptoConfig::default(),
-        }
-    }
 }
 
 impl NodeConfig {
@@ -164,6 +155,9 @@ pub struct NodeInfo {
     pub name: String,
     #[serde(default = "default_description")]
     pub description: String,
+    /// 是否允许在自身双栈的前提下成为 bootstrap 节点（发布 DHT provider 记录）。
+    #[serde(default = "bool_true")]
+    pub allow_bootstrap: bool,
 }
 
 impl Default for NodeInfo {
@@ -171,6 +165,7 @@ impl Default for NodeInfo {
         NodeInfo {
             name: default_name(),
             description: default_description(),
+            allow_bootstrap: bool_true(),
         }
     }
 }
@@ -216,6 +211,8 @@ pub struct ServicesConfig {
     pub kademlia: KademliaService,
     #[serde(default)]
     pub dispatcher: DispatcherConfig,
+    #[serde(default)]
+    pub relay: RelayService,
 }
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
@@ -267,6 +264,31 @@ impl Default for KademliaService {
     }
 }
 
+/// 中继预约（消费者侧）配置。
+///
+/// 单栈节点通过向 bootstrap 节点（概念上必须是双栈中继）预约 `p2p-circuit`
+/// 来获得跨 IP 族的可达性。目标数量固定为 3，尽力而为，不强求。
+///
+/// 是否需要预约由「自身是否双栈」决定：非双栈即消费者，无需开关。
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct RelayService {
+    /// 补约检查间隔（秒）。
+    #[serde(default = "default_relay_retry_interval")]
+    pub retry_interval_secs: u32,
+    /// 连续预约失败多少次后，将节点从 bootstrap 列表剔除。
+    #[serde(default = "default_relay_max_failures")]
+    pub max_failures: u32,
+}
+
+impl Default for RelayService {
+    fn default() -> Self {
+        RelayService {
+            retry_interval_secs: default_relay_retry_interval(),
+            max_failures: default_relay_max_failures(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct LocalServiceEntry {
     pub name: String,
@@ -297,7 +319,7 @@ impl Default for DispatcherConfig {
     }
 }
 
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, Default)]
 pub struct CryptoConfig {
     #[serde(default = "bool_false")]
     pub pq_transport_enabled: bool,
@@ -305,16 +327,6 @@ pub struct CryptoConfig {
     pub pq_identity_enabled: bool,
     #[serde(default = "bool_false")]
     pub pq_required: bool,
-}
-
-impl Default for CryptoConfig {
-    fn default() -> Self {
-        CryptoConfig {
-            pq_transport_enabled: false,
-            pq_identity_enabled: false,
-            pq_required: false,
-        }
-    }
 }
 
 #[derive(Clone)]
@@ -397,6 +409,10 @@ impl ConfigHandle {
     }
 
     // ========== 便捷只读方法 ==========
+    pub fn allow_bootstrap(&self) -> bool {
+        self.read().node.allow_bootstrap
+    }
+
     pub fn ping_enabled(&self) -> bool {
         self.read().services.ping.enabled
     }
@@ -407,6 +423,44 @@ impl ConfigHandle {
 
     pub fn ping_timeout(&self) -> u32 {
         self.read().services.ping.with_timeout
+    }
+
+    pub fn ping_max_failures(&self) -> u32 {
+        self.read().services.ping.max_failures
+    }
+
+    pub fn dispatcher_enabled(&self) -> bool {
+        self.read().services.dispatcher.enabled
+    }
+
+    pub fn dispatcher_query_timeout(&self) -> u32 {
+        self.read().services.dispatcher.query_timeout_secs
+    }
+
+    pub fn relay_retry_interval(&self) -> u32 {
+        self.read().services.relay.retry_interval_secs
+    }
+
+    pub fn relay_max_failures(&self) -> u32 {
+        self.read().services.relay.max_failures
+    }
+
+    pub fn pq_transport_enabled(&self) -> bool {
+        self.read().crypto.pq_transport_enabled
+    }
+
+    pub fn pq_identity_enabled(&self) -> bool {
+        self.read().crypto.pq_identity_enabled
+    }
+
+    pub fn pq_required(&self) -> bool {
+        self.read().crypto.pq_required
+    }
+
+    /// PQ 是否启用（传输或身份任一）。
+    pub fn pq_enabled(&self) -> bool {
+        let c = self.read();
+        c.crypto.pq_transport_enabled || c.crypto.pq_identity_enabled
     }
 
     pub fn kademlia_enabled(&self) -> bool {

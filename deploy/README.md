@@ -3,17 +3,17 @@
 NexusNet 以原生的 Debian 打包（`.deb`）分发，由 `dpkg`/`apt` 管理安装、升级与卸载生命周期。
 服务以专用用户 `nexusnet` 运行，路径与 systemd 单元由包内声明。
 
-## 目录布局（方案 A）
+## 目录布局
 
 | 文件 | 路径 | 属主/权限 | 说明 |
 |---|---|---|---|
 | 配置 | `/etc/nexusnet/config.toml` | `nexusnet:nexusnet 0640` | **首启由程序自动生成**（不随包分发） |
 | 数据 | `/var/lib/nexusnet/keypair.bin` | `nexusnet:nexusnet 0600` | 节点身份，不可丢失 |
-| 日志 | `/var/log/nexusnet/nexusnet.log` | `nexusnet:nexusnet 0640` | 追加写 + 自动 gz 轮转（归档保留） |
+| 日志 | journald | — | 由 systemd 采集/轮转/压缩/保留 |
 | 二进制 | `/usr/bin/NexusNet` | `root:root 0755` | 主程序 |
 | 单元 | `/lib/systemd/system/nexusnet.service` | `root:root 0644` | systemd 单元 |
 
-路径由 `NEXUSNET_HOME` / `NEXUSNET_LOG_FILE` 环境变量锚定，见 `src/paths.rs`。
+路径由 `NEXUSNET_HOME` 等环境变量锚定，见 `src/paths.rs`。
 本地 `cargo run`（不设任何环境变量）仍回退当前目录 `./config.toml / ./keypair.bin / ./log`。
 
 ## 安装
@@ -24,14 +24,15 @@ NexusNet 以原生的 Debian 打包（`.deb`）分发，由 `dpkg`/`apt` 管理�
 apt install -y ./nexusnet_<version>_amd64.deb
 ```
 
-安装过程（postinst）自动：创建专用用户 `nexusnet`、创建数据/日志目录、`daemon-reload`、`enable + start`。
+安装过程（postinst）自动：创建专用用户 `nexusnet`、创建数据目录、确保 journald 持久化
+（创建 `/var/log/journal`）、`daemon-reload`、`enable + start`。
 
 ```bash
 systemctl status nexusnet        # active (running)
-journalctl -u nexusnet -f        # 查看运行日志（已去除 ANSI 彩色）
+journalctl -u nexusnet -f        # 查看运行日志（单行、带日志级别，已去除 ANSI 彩色）
 ```
 
-日志同时在 `/var/log/nexusnet/nexusnet.log` 持久记录。
+日志按 syslog 级别写入 journald，可用 `journalctl -u nexusnet -p err` 过滤错误及以上。
 
 ## 升级
 
@@ -39,7 +40,7 @@ journalctl -u nexusnet -f        # 查看运行日志（已去除 ANSI 彩色）
 apt install -y ./nexusnet_<新版本>.deb
 ```
 
-升级时 postinst 执行 `try-restart`（服务在运行则重启应用新二进制），**保留** `keypair.bin` 身份与日志归档。
+升级时 postinst 执行 `try-restart`，**保留** `keypair.bin` 身份。
 
 ## 卸载
 
@@ -48,8 +49,8 @@ apt remove nexusnet             # 移除包、停服务
 apt purge nexusnet              # 彻底清除（移除专用用户）
 ```
 
-无论 `remove` 还是 `purge`，**都不会删除** `/var/lib/nexusnet/keypair.bin` 与 `/var/log/nexusnet` 归档，
-以免丢失 PeerId 与历史日志。（如需清理请手动处理。）
+无论 `remove` 还是 `purge`，**都不会删除** `/var/lib/nexusnet/keypair.bin`，
+以免丢失 PeerId。
 
 ## 目录内容
 
@@ -83,7 +84,7 @@ systemctl show nexusnet            # 查看运行状态详情
 ## 说明
 
 - 服务以 `nexusnet` 专用用户运行（`NoNewPrivileges`、`ProtectSystem=strict` 等加固），
-  通过 `ReadWritePaths` 放行三个目录的写权限。
+  通过 `ReadWritePaths` 放行配置与数据目录的写权限；日志经 stdout/stderr 交给 journald。
 - 收到 `SIGTERM` 时程序优雅关闭（`NodeController`/`ServiceDispatcher` 收到共享 shutdown 信号），
   `TimeoutStopSec=15` 防止卡死被强杀。
 - 后端边车（CLI / OCR 等）仍由外部独立管理，本服务不管理其生命周期；

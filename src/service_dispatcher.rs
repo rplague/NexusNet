@@ -37,6 +37,13 @@ pub struct Command {
     pub resp_tx: oneshot::Sender<Result<Vec<u8>, String>>,
 }
 
+/// 单个后端的「UUID → 响应等待者」挂起表。
+type PendingMap = Arc<Mutex<HashMap<String, oneshot::Sender<Result<Vec<u8>, String>>>>>;
+/// 单个后端的写半连接。
+type BackendWriter = Arc<Mutex<OwnedWriteHalf>>;
+/// 服务名 → 写半连接。
+type BackendWriters = Arc<Mutex<HashMap<String, BackendWriter>>>;
+
 pub struct InboundServiceRequest {
     pub service: String,
     pub payload: Vec<u8>,
@@ -49,9 +56,9 @@ pub struct ServiceDispatcher {
     config: ConfigHandle,
     local_services: Vec<LocalServiceEntry>,
     shutdown_rx: watch::Receiver<bool>,
-    pending_requests:
-        HashMap<String, Arc<Mutex<HashMap<String, oneshot::Sender<Result<Vec<u8>, String>>>>>>,
-    backend_writers: Arc<Mutex<HashMap<String, Arc<Mutex<OwnedWriteHalf>>>>>,
+    pending_requests: HashMap<String, PendingMap>,
+    backend_writers: BackendWriters,
+    query_timeout: Duration,
 }
 
 impl ServiceDispatcher {
@@ -62,6 +69,7 @@ impl ServiceDispatcher {
         shutdown_rx: watch::Receiver<bool>,
     ) -> Self {
         let local_services = config.read().services.dispatcher.local_services.clone();
+        let query_timeout = Duration::from_secs(config.dispatcher_query_timeout().into());
         let mut pending_requests = HashMap::new();
         for svc in &local_services {
             pending_requests.insert(svc.name.clone(), Arc::new(Mutex::new(HashMap::new())));
@@ -74,11 +82,21 @@ impl ServiceDispatcher {
             shutdown_rx,
             pending_requests,
             backend_writers: Arc::new(Mutex::new(HashMap::new())),
+            query_timeout,
         }
     }
 
     pub async fn run(mut self) {
-        self.init_backend_connections().await;
+        if self.config.dispatcher_enabled() {
+            self.init_backend_connections().await;
+        } else {
+            LogStruct::new(
+                LogLevel::Warning,
+                "ServiceDispatcher 已禁用",
+                "services.dispatcher.enabled = false",
+            )
+            .emit();
+        }
 
         loop {
             tokio::select! {
@@ -94,9 +112,15 @@ impl ServiceDispatcher {
                     };
 
                     if let (Some(pending_map), Some(writer)) = (pending_map, writer) {
+                        let query_timeout = self.query_timeout;
                         tokio::spawn(async move {
-                            let response =
-                                Self::handle_request_with_backend(req.payload, pending_map, writer).await;
+                            let response = Self::handle_request_with_backend(
+                                req.payload,
+                                pending_map,
+                                writer,
+                                query_timeout,
+                            )
+                            .await;
                             let _ = req.response_tx.send(response);
                         });
                     } else {
@@ -115,6 +139,7 @@ impl ServiceDispatcher {
 
     async fn init_backend_connections(&mut self) {
         let backend_writers = self.backend_writers.clone();
+        let query_timeout = self.query_timeout;
         for service in &self.local_services {
             let addr = format!("127.0.0.1:{}", service.port);
             let service_name = service.name.clone();
@@ -127,16 +152,18 @@ impl ServiceDispatcher {
                 cmd_tx,
                 backend_writers.clone(),
                 addr,
+                query_timeout,
             ));
         }
     }
 
     async fn backend_read_loop(
         service_name: String,
-        pending_map: Arc<Mutex<HashMap<String, oneshot::Sender<Result<Vec<u8>, String>>>>>,
+        pending_map: PendingMap,
         cmd_tx: mpsc::UnboundedSender<Command>,
-        backend_writers: Arc<Mutex<HashMap<String, Arc<Mutex<OwnedWriteHalf>>>>>,
+        backend_writers: BackendWriters,
         addr: String,
+        query_timeout: Duration,
     ) {
         let mut backoff = 1u64;
 
@@ -165,6 +192,7 @@ impl ServiceDispatcher {
                         &pending_map,
                         &cmd_tx,
                         &writer,
+                        query_timeout,
                     )
                     .await;
 
@@ -195,9 +223,10 @@ impl ServiceDispatcher {
     async fn read_loop_inner(
         mut read_half: OwnedReadHalf,
         service_name: &str,
-        pending_map: &Arc<Mutex<HashMap<String, oneshot::Sender<Result<Vec<u8>, String>>>>>,
+        pending_map: &PendingMap,
         cmd_tx: &mpsc::UnboundedSender<Command>,
-        writer: &Arc<Mutex<OwnedWriteHalf>>,
+        writer: &BackendWriter,
+        query_timeout: Duration,
     ) -> Result<(), ()> {
         loop {
             let mut len_buf = [0u8; 4];
@@ -260,7 +289,7 @@ impl ServiceDispatcher {
                             )
                             .await;
                         } else {
-                            match timeout(Duration::from_secs(30), resp_rx).await {
+                            match timeout(query_timeout, resp_rx).await {
                                 Ok(Ok(Ok(result_data))) => {
                                     Self::write_response(writer, &result_data).await;
                                 }
@@ -361,7 +390,7 @@ impl ServiceDispatcher {
         }
     }
 
-    async fn write_response(writer: &Arc<Mutex<OwnedWriteHalf>>, data: &[u8]) {
+    async fn write_response(writer: &BackendWriter, data: &[u8]) {
         let mut response = Vec::new();
         response.extend_from_slice(&0u32.to_be_bytes());
         response.extend_from_slice(&(data.len() as u32).to_be_bytes());
@@ -389,11 +418,11 @@ impl ServiceDispatcher {
         out.extend_from_slice(payload);
         out
     }
-
     async fn handle_request_with_backend(
         payload: Vec<u8>,
-        pending_map: Arc<Mutex<HashMap<String, oneshot::Sender<Result<Vec<u8>, String>>>>>,
-        writer: Arc<Mutex<OwnedWriteHalf>>,
+        pending_map: PendingMap,
+        writer: BackendWriter,
+        query_timeout: Duration,
     ) -> Result<service_protocol::Response, String> {
         let uuid = Uuid::new_v4().to_string();
         let (resp_tx, resp_rx) = oneshot::channel();
@@ -414,7 +443,7 @@ impl ServiceDispatcher {
             let _ = writer.flush().await;
         } // MutexGuard 在此释放
 
-        match timeout(Duration::from_secs(30), resp_rx).await {
+        match timeout(query_timeout, resp_rx).await {
             Ok(Ok(Ok(resp_data))) => Ok(service_protocol::Response {
                 success: true,
                 data: resp_data,
@@ -428,5 +457,33 @@ impl ServiceDispatcher {
                 Err("Backend request timeout".to_string())
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ServiceDispatcher;
+
+    #[test]
+    fn encode_request_frames_uuid_and_payload_big_endian() {
+        let frame = ServiceDispatcher::encode_request("abc", b"xy");
+        // uuid_len (4B BE) = 3
+        assert_eq!(&frame[0..4], &3u32.to_be_bytes());
+        // uuid = "abc"
+        assert_eq!(&frame[4..7], b"abc");
+        // payload_len (4B BE) = 2
+        assert_eq!(&frame[7..11], &2u32.to_be_bytes());
+        // payload = "xy"
+        assert_eq!(&frame[11..13], b"xy");
+        assert_eq!(frame.len(), 13);
+    }
+
+    #[test]
+    fn encode_request_empty_payload() {
+        let frame = ServiceDispatcher::encode_request("id", b"");
+        assert_eq!(&frame[0..4], &2u32.to_be_bytes());
+        assert_eq!(&frame[4..6], b"id");
+        assert_eq!(&frame[6..10], &0u32.to_be_bytes());
+        assert_eq!(frame.len(), 10);
     }
 }

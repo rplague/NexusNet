@@ -27,36 +27,65 @@ use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::spawn;
+use std::time::{Duration, Instant};
 
 static LOG_MUTEX: Mutex<()> = Mutex::new(());
 static ROLLING: AtomicBool = AtomicBool::new(false);
+static LAST_ROLL_CHECK: Mutex<Option<Instant>> = Mutex::new(None);
 
 const MAX_SIZE_BYTES: u64 = 10 * 1024 * 1024; // 10MB
+const ROLL_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 
 /// 系统日志文件路径。
 ///
-/// 由 `paths::log_path()` 解析（`NEXUSNET_LOG_FILE` → `$NEXUSNET_HOME/log` → `./log`），
+/// 由 `paths::log_path()` 解析
 /// 惰性初始化一次。轮转所用临时路径为在其上追加 `.tmp`。
-fn log_file_path() -> &'static str {
+fn log_filepath() -> &'static str {
+    static PATH: OnceLock<String> = OnceLock::new();
+    PATH.get_or_init(|| format!("{}/log", paths::log_path().to_string_lossy().into_owned()))
+}
+
+/// 轮转临时路径
+fn logtmp_filepath() -> &'static str {
+    static PATH: OnceLock<String> = OnceLock::new();
+    PATH.get_or_init(|| format!("{}.tmp", log_filepath()))
+}
+
+fn gz_path() -> &'static str {
     static PATH: OnceLock<String> = OnceLock::new();
     PATH.get_or_init(|| paths::log_path().to_string_lossy().into_owned())
 }
 
-/// 轮转临时路径（`<log 路径>.tmp`）。
-fn tmp_log_file_path() -> &'static str {
-    static PATH: OnceLock<String> = OnceLock::new();
-    PATH.get_or_init(|| format!("{}.tmp", log_file_path()))
-}
-
 /// 是否在终端输出 ANSI 彩色。
 ///
-/// 非 TTY（如 systemd journald 捕获 stdout/stderr）或设置了 `NO_COLOR` 时输出纯文本，
+/// 非 TTY 或设置了 `NO_COLOR` 时输出纯文本
 /// 避免日志被转义序列污染。
 fn use_color() -> bool {
     if std::env::var("NO_COLOR").is_ok() {
         return false;
     }
     std::io::stdout().is_terminal()
+}
+
+/// 日志输出模式。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LogMode {
+    Journald,
+    File,
+}
+
+/// 判定日志模式
+///
+/// `JOURNAL_STREAM` 存在表示 stdout/stderr 被 journald 捕获，此时完全交由 journald 管理。
+fn log_mode() -> LogMode {
+    static MODE: OnceLock<LogMode> = OnceLock::new();
+    *MODE.get_or_init(|| {
+        if std::env::var_os("JOURNAL_STREAM").is_some_and(|v| !v.is_empty()) {
+            LogMode::Journald
+        } else {
+            LogMode::File
+        }
+    })
 }
 
 pub enum LogLevel {
@@ -90,6 +119,18 @@ impl LogLevel {
             LogLevel::Critical => "[CRITICAL]".on_red().bold().blink(),
         }
     }
+
+    /// 映射到 syslog priority（journald 会解析并剥离行首 `<N>`）。
+    fn syslog_priority(&self) -> u8 {
+        match self {
+            LogLevel::Critical => 2,
+            LogLevel::Error => 3,
+            LogLevel::Warning => 4,
+            LogLevel::Important => 5,
+            LogLevel::Preset => 6,
+            LogLevel::Debug => 7,
+        }
+    }
 }
 
 pub struct LogStruct {
@@ -106,18 +147,14 @@ impl LogStruct {
             content: content.into(),
         }
     }
-}
-
-impl LogStruct {
     pub fn emit(&self) {
-        if !ROLLING.swap(true, Ordering::AcqRel) {
-            check_and_roll();
+        if log_mode() == LogMode::File {
+            maybe_check_and_roll();
         }
         log(self)
     }
 }
 
-// 内部错误日志助手，直接输出到终端，不绕路文件
 fn error_entry(topic: &str, content: &str) {
     let entry = LogStruct::new(LogLevel::Error, topic, content);
     log_onlycli(&entry);
@@ -161,7 +198,7 @@ fn archive_and_cleanup(tmp_file: String, output_file_name: String) {
 }
 
 fn repair_tmp_file() {
-    let tmp_metadata = match fs::metadata(tmp_log_file_path()) {
+    let tmp_metadata = match fs::metadata(logtmp_filepath()) {
         Ok(meta) => meta,
         Err(_) => return,
     };
@@ -175,15 +212,15 @@ fn repair_tmp_file() {
         .unwrap_or_else(|_| "XXXX_XXXX".to_string());
 
     let fine_now = Local::now().timestamp_nanos_opt().unwrap_or(0);
-    let output_filename = format!("REPAIR-{}-{}.gz", tmp_time, fine_now);
-    archive_and_cleanup(tmp_log_file_path().to_owned(), output_filename);
+    let output_filepath = format!("{}/REPAIR-{}-{}.gz", gz_path(), tmp_time, fine_now);
+    archive_and_cleanup(logtmp_filepath().to_owned(), output_filepath);
 }
 
 fn perform_roll(file_metadata: fs::Metadata) {
     {
         let _guard = LOG_MUTEX.lock().unwrap();
         // 重命名
-        match fs::rename(log_file_path(), tmp_log_file_path()) {
+        match fs::rename(log_filepath(), logtmp_filepath()) {
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 drop(_guard);
                 let warning = LogStruct::new(LogLevel::Warning, "修复错误tmp文件", "");
@@ -191,7 +228,7 @@ fn perform_roll(file_metadata: fs::Metadata) {
                 repair_tmp_file();
                 // 清理后重试
                 let _guard = LOG_MUTEX.lock().unwrap();
-                if let Err(e) = fs::rename(log_file_path(), tmp_log_file_path()) {
+                if let Err(e) = fs::rename(log_filepath(), logtmp_filepath()) {
                     let critical =
                         LogStruct::new(LogLevel::Critical, "无法重命名log文件", e.to_string());
                     log_onlycli(&critical);
@@ -217,13 +254,34 @@ fn perform_roll(file_metadata: fs::Metadata) {
         .unwrap_or_else(|_| "XXXX_XXXX".to_string());
     let current_time = Local::now().format("%m%d_%H%M").to_string();
     let fine_now = Local::now().timestamp_nanos_opt().unwrap_or(0);
-    let output_filename = format!("{}-{}-{}.gz", timestamp, current_time, fine_now);
+    let output_filepath = format!(
+        "{}/{}-{}-{}.gz",
+        gz_path(),
+        timestamp,
+        current_time,
+        fine_now
+    );
 
-    archive_and_cleanup(tmp_log_file_path().to_owned(), output_filename);
+    archive_and_cleanup(logtmp_filepath().to_owned(), output_filepath);
+}
+
+/// 节流后的轮转检查：File 模式下每 `ROLL_CHECK_INTERVAL` 最多 stat 一次。
+fn maybe_check_and_roll() {
+    {
+        let mut last = LAST_ROLL_CHECK.lock().unwrap();
+        let now = Instant::now();
+        if last.is_some_and(|prev| now.duration_since(prev) < ROLL_CHECK_INTERVAL) {
+            return;
+        }
+        *last = Some(now);
+    }
+    if !ROLLING.swap(true, Ordering::AcqRel) {
+        check_and_roll();
+    }
 }
 
 fn check_and_roll() {
-    let metadata = match fs::metadata(log_file_path()) {
+    let metadata = match fs::metadata(log_filepath()) {
         Ok(m) => m,
         Err(_) => {
             ROLLING.store(false, Ordering::Release);
@@ -238,7 +296,7 @@ fn check_and_roll() {
 
     spawn(|| {
         defer! { ROLLING.store(false, Ordering::Release); }
-        let metadata = match fs::metadata(log_file_path()) {
+        let metadata = match fs::metadata(log_filepath()) {
             Ok(m) => m,
             Err(_) => return,
         };
@@ -246,48 +304,75 @@ fn check_and_roll() {
     });
 }
 
-fn format_colored(level: &LogLevel, time: &str, topic: &str, content: &str) -> String {
-    let prefix = level.color();
-    if content.is_empty() {
-        format!("{} {}\n    {}", prefix, time, topic)
-    } else {
-        format!("{} {}\n    {}\n    {}", prefix, time, topic, content)
+fn format_entry(
+    prefix: impl std::fmt::Display,
+    time: Option<&str>,
+    topic: &str,
+    content: &str,
+) -> String {
+    match (time, content.is_empty()) {
+        (Some(t), true) => format!("{} {}\n    {}", prefix, t, topic),
+        (Some(t), false) => format!("{} {}\n    {}\n    {}", prefix, t, topic, content),
+        (None, true) => format!("{} {}", prefix, topic),
+        (None, false) => format!("{} {}\n    {}", prefix, topic, content),
     }
 }
 
-fn format_plain(level: &LogLevel, time: &str, topic: &str, content: &str) -> String {
-    let prefix = level.as_str();
-    if content.is_empty() {
-        format!("{} {}\n    {}", prefix, time, topic)
+/// 按是否彩色渲染流输出（File 模式，多行）。
+fn render_stream(info: &LogStruct, time: Option<&str>) -> String {
+    if use_color() {
+        format_entry(info.level.color(), time, &info.topic, &info.content)
     } else {
-        format!("{} {}\n    {}\n    {}", prefix, time, topic, content)
+        format_entry(info.level.as_str(), time, &info.topic, &info.content)
+    }
+}
+
+/// journald 模式：单行 + `<N>` 优先级前缀（journald 会解析并剥离该前缀）。
+fn render_journald(info: &LogStruct) -> String {
+    let content = info
+        .content
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let body = if content.is_empty() {
+        format!("{} {}", info.level.as_str(), info.topic)
+    } else {
+        format!("{} {}: {}", info.level.as_str(), info.topic, content)
+    };
+    format!("<{}>{}", info.level.syslog_priority(), body)
+}
+
+/// 写一行到流（错误类走 stderr，其余 stdout）。
+fn write_stream(level: &LogLevel, text: &str) {
+    match level {
+        LogLevel::Error | LogLevel::Critical | LogLevel::Warning => eprintln!("{}", text),
+        _ => println!("{}", text),
     }
 }
 
 fn log(info: &LogStruct) {
-    let time = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-
-    let cli_text = if use_color() {
-        format_colored(&info.level, &time, &info.topic, &info.content)
-    } else {
-        format_plain(&info.level, &time, &info.topic, &info.content)
-    };
-    let file_text = format_plain(&info.level, &time, &info.topic, &info.content);
-
-    match info.level {
-        LogLevel::Error | LogLevel::Critical | LogLevel::Warning => {
-            eprintln!("{}", cli_text);
+    match log_mode() {
+        LogMode::Journald => {
+            write_stream(&info.level, &render_journald(info));
         }
-        _ => {
-            println!("{}", cli_text);
+        LogMode::File => {
+            let time = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+            write_stream(&info.level, &render_stream(info, Some(&time)));
+
+            let file_text =
+                format_entry(info.level.as_str(), Some(&time), &info.topic, &info.content);
+            append_file(&file_text);
         }
     }
+}
 
+/// 追加写入日志文件（File 模式）。
+fn append_file(text: &str) {
     let _guard = LOG_MUTEX.lock().unwrap();
     let mut log_file = match fs::OpenOptions::new()
         .append(true)
         .create(true)
-        .open(log_file_path())
+        .open(log_filepath())
     {
         Ok(file) => file,
         Err(_) => {
@@ -297,25 +382,49 @@ fn log(info: &LogStruct) {
         }
     };
 
-    if writeln!(log_file, "{}", file_text).is_err() {
+    if writeln!(log_file, "{}", text).is_err() {
         let err = LogStruct::new(LogLevel::Error, "无法录入日志", "log文件无法被追加写入");
         log_onlycli(&err);
     }
 }
 
 fn log_onlycli(info: &LogStruct) {
-    let time = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-    let text = if use_color() {
-        format_colored(&info.level, &time, &info.topic, &info.content)
-    } else {
-        format_plain(&info.level, &time, &info.topic, &info.content)
-    };
-    match info.level {
-        LogLevel::Error | LogLevel::Critical | LogLevel::Warning => {
-            eprintln!("{}", text);
+    match log_mode() {
+        LogMode::Journald => {
+            write_stream(&info.level, &render_journald(info));
         }
-        _ => {
-            println!("{}", text);
+        LogMode::File => {
+            let time = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+            write_stream(&info.level, &render_stream(info, Some(&time)));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn syslog_priority_mapping() {
+        assert_eq!(LogLevel::Critical.syslog_priority(), 2);
+        assert_eq!(LogLevel::Error.syslog_priority(), 3);
+        assert_eq!(LogLevel::Warning.syslog_priority(), 4);
+        assert_eq!(LogLevel::Important.syslog_priority(), 5);
+        assert_eq!(LogLevel::Preset.syslog_priority(), 6);
+        assert_eq!(LogLevel::Debug.syslog_priority(), 7);
+    }
+
+    #[test]
+    fn journald_single_line_with_prefix_and_collapsed_newlines() {
+        let entry = LogStruct::new(LogLevel::Error, "topic", "line1\nline2");
+        let line = render_journald(&entry);
+        assert_eq!(line, "<3>[!] topic: line1 line2");
+        assert!(!line.contains('\n'));
+    }
+
+    #[test]
+    fn journald_empty_content() {
+        let entry = LogStruct::new(LogLevel::Debug, "topic", "");
+        assert_eq!(render_journald(&entry), "<7>[+] topic");
     }
 }

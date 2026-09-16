@@ -82,7 +82,7 @@ apt install -y ./nexusnet_<version>_amd64.deb
 |---|---|---|
 | 配置 | `/etc/nexusnet/config.toml` | 首启自动生成 |
 | 节点身份 | `/var/lib/nexusnet/keypair.bin` | 不可丢失，升级/卸载保留 |
-| 日志 | `/var/log/nexusnet/nexusnet.log` | 追加写 + gz 轮转（归档保留） |
+| 日志 | journald | systemd 采集/轮转/压缩/保留 |
 
 查看运行状态：`systemctl status nexusnet`；日志：`journalctl -u nexusnet -f`。
 
@@ -94,6 +94,7 @@ apt install -y ./nexusnet_<version>_amd64.deb
 [node]
 name = "未设置的p2p节点"
 description = "无详细描述"
+allow_bootstrap = true
 
 [network]
 ipv4_enabled = false
@@ -126,6 +127,10 @@ name = "cmd"
 host = "127.0.0.1"
 port = 5014
 
+[services.relay]
+retry_interval_secs = 60
+max_failures = 3
+
 [crypto]
 pq_transport_enabled = false
 pq_identity_enabled = false
@@ -135,7 +140,8 @@ pq_required = false
 所有字段均有 `#[serde(default)]`，省略即默认值。
 
 配置路径由环境变量决定（见 `src/paths.rs`）：`NEXUSNET_CONFIG`、`NEXUSNET_KEYPAIR`、
-`NEXUSNET_LOG_FILE`、`NEXUSNET_HOME`；未设置时回退当前目录。
+`NEXUSNET_LOG_PATH`（仅文件输出模式用；systemd 下日志走 journald）、`NEXUSNET_HOME`；
+未设置时回退当前目录。
 
 ## 启动流程
 
@@ -146,7 +152,7 @@ boot::init()
   ├─ 更新公网 IP 到配置
   ├─ 加载/生成 keypair.bin（ED25519 节点身份）
   ├─ 尝试加载 keypair.pq.bin（PQ 密钥，可选，不存在则跳过）
-  ├─ NetHandle::start() → 绑定端口，组建 Swarm
+  ├─ Network::start() → 构建 Swarm 并启动 SwarmActor
   ├─ 拨号所有 bootstrap 节点
   ├─ 启动 ServiceDispatcher（后台 tokio::spawn）
    └─ NodeController::run()（主协程）
@@ -157,9 +163,6 @@ boot::init()
         }
 ```
 
-路径由 `paths.rs` 解析；收到 SIGTERM/Ctrl-C 时 NodeController 与 ServiceDispatcher
-收到共享关闭信号并结束循环，进程干净退出。
-
 ## 模块清单
 
 | 模块 | 职责 |
@@ -169,11 +172,10 @@ boot::init()
 | **paths** | 统一路径解析（环境变量锚定，本地回退当前目录） |
 | **node_controller** | 事件循环统一处理、服务自动宣告，处理远程查询和内部命令 |
 | **service_dispatcher** | 后端连接管理 |
-| **net** | KeyManager、Swarm 构建、地址检测 |
+| **network** | 网络层门面：身份、地址探测、行为装配、Swarm Actor（`network/identity`、`network/addr`、`network/behaviour`、`network/builder`、`network/actor`） |
 | **config** | 提供ConfigHandle |
 | **service_protocol** | 提供通讯协议 |
-| **log** | 终端 + 文件输出、日志轮转（路径可配，非 TTY 去彩色） |
-| **swarm_actor** | Swarm 分发封装 |
+| **log** | 自动检测输出模式：systemd 下交 journald，其余终端+文件轮转 |
 
 ## 后端帧协议（TCP）
 
@@ -232,21 +234,40 @@ NexusNet 与后端进程之间使用**持久 TCP 连接**，由节点主动发�
 - `@discover_providers` → DHT get_providers 获取提供者列表
 - `call_service()` → 查询提供者，RTT 排序选优，P2P 调用
 
+## 抗量子加密
+
+应用层混合 PQ 加密，用于服务请求/响应的机密性。关闭时协议不注册、行为与旧版本完全一致。
+
+- **算法**：ML-KEM-768+ X25519 混合 KEM、ChaCha20-Poly1305 AEAD、可选 ML-DSA-65（FIPS 204）签名。
+- **协议**：`/oahd/service_req/2.0.0`与 `/oahd/pq_identity/1.0.0`，仅在启用时注册。
+- **流程**：请求方 encaps 到响应方 KEM 公钥，响应方 decaps 后双方共享同一密钥，响应复用该密钥加密——无需第二次 KEM，也不在请求里携带请求方公钥。
+- **回退**：对端不支持 PQ 时回退明文 `/oahd/service_req/1.0.0`；`crypto.pq_required = true` 则拒绝非 PQ 对端。
+- **密钥**：`keypair.pq.bin`。
+- `@pq_status` → 查看启用状态。
+
+| 配置 | 含义 |
+|---|---|
+| `crypto.pq_transport_enabled` | 启用加密服务调用 |
+| `crypto.pq_identity_enabled` | 附带并校验 ML-DSA 签名 |
+| `crypto.pq_required` | 强制 PQ，拒绝非 PQ 对端 |
+
 ## 日志
 
-- 双输出：终端+ 文本文件
-- 格式：`[LEVEL] 时间\n    主题\n    内容`
-- 等级：`Critical | Error | Warning | Important | Preset | Debug`
+输出模式**自动检测**：
+
+- **systemd**：只写 stdout/stderr，**不写文件**；轮转、压缩、保留、检索全部交给 journald。输出为**单行**并带 syslog 级别前缀，可用 `journalctl -u nexusnet -p err` 过滤。
+- **其他**：终端 + 文本文件双输出，文件 10MB 触发 gz 轮转。
+- 等级：`Critical | Error | Warning | Important | Preset | Debug`；非 TTY 自动去彩色。
 
 ## 节点身份
 
 - **ED25519 主身份** — `keypair.bin`，Protobuf 编码，派生 `PeerId`
-- **PQ 辅助密钥**（可选）— `keypair.pq.bin`
+- **PQ 辅助密钥**— `keypair.pq.bin`
 - **keypair.bin 不可丢失** — 丢失后节点身份变更
 
 ## 开发状态
 
-当前版本：**0.3.0** — 完成度 **5.5/10**
+当前版本：**0.3.1** — 完成度 **5.5/10**
 
 ## 许可
 
