@@ -227,7 +227,13 @@ fn perform_roll(file_metadata: fs::Metadata) {
         .unwrap_or_else(|_| "XXXX_XXXX".to_string());
     let current_time = Local::now().format("%m%d_%H%M").to_string();
     let fine_now = Local::now().timestamp_nanos_opt().unwrap_or(0);
-    let output_filepath = format!("{}/{}-{}-{}.gz", gz_path(), timestamp, current_time, fine_now);
+    let output_filepath = format!(
+        "{}/{}-{}-{}.gz",
+        gz_path(),
+        timestamp,
+        current_time,
+        fine_now
+    );
 
     archive_and_cleanup(logtmp_filepath().to_owned(), output_filepath);
 }

@@ -53,7 +53,7 @@ default_u32_fn!(default_record_ttl_seconds, hours(1));
 default_u32_fn!(default_replication_factor, 20);
 default_u32_fn!(default_query_timeout_seconds, 60);
 
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, Default)]
 pub struct NodeConfig {
     #[serde(default)]
     pub node: NodeInfo,
@@ -63,17 +63,6 @@ pub struct NodeConfig {
     pub services: ServicesConfig,
     #[serde(default)]
     pub crypto: CryptoConfig,
-}
-
-impl Default for NodeConfig {
-    fn default() -> Self {
-        NodeConfig {
-            node: NodeInfo::default(),
-            network: NetworkConfig::default(),
-            services: ServicesConfig::default(),
-            crypto: CryptoConfig::default(),
-        }
-    }
 }
 
 impl NodeConfig {
@@ -297,7 +286,7 @@ impl Default for DispatcherConfig {
     }
 }
 
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, Default)]
 pub struct CryptoConfig {
     #[serde(default = "bool_false")]
     pub pq_transport_enabled: bool,
@@ -305,16 +294,6 @@ pub struct CryptoConfig {
     pub pq_identity_enabled: bool,
     #[serde(default = "bool_false")]
     pub pq_required: bool,
-}
-
-impl Default for CryptoConfig {
-    fn default() -> Self {
-        CryptoConfig {
-            pq_transport_enabled: false,
-            pq_identity_enabled: false,
-            pq_required: false,
-        }
-    }
 }
 
 #[derive(Clone)]
