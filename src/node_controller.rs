@@ -1,9 +1,8 @@
 use crate::config::ConfigHandle;
 use crate::log::{LogLevel, LogStruct};
-use crate::net::NetHandle;
+use crate::network::{NetworkEvent, NetworkHandle, NetworkStart};
 use crate::service_dispatcher::{Command, InboundServiceRequest};
 use crate::service_protocol;
-use crate::swarm_actor::{ControllerEvent, SwarmHandle};
 use libp2p::multiaddr::Protocol;
 use libp2p::{Multiaddr, PeerId, identify, kad, ping, relay};
 use std::collections::HashMap;
@@ -17,10 +16,11 @@ pub struct NodeController {
     config: ConfigHandle,
     my_peer_id: PeerId,
     node_rtts: Arc<RwLock<HashMap<PeerId, Duration>>>,
+    node_ping_failures: HashMap<PeerId, u32>,
     cmd_rx: mpsc::UnboundedReceiver<Command>,
     inbound_req_tx: mpsc::UnboundedSender<InboundServiceRequest>,
-    swarm: SwarmHandle,
-    event_rx: mpsc::UnboundedReceiver<ControllerEvent>,
+    swarm: NetworkHandle,
+    event_rx: mpsc::UnboundedReceiver<NetworkEvent>,
     shutdown_rx: watch::Receiver<bool>,
 }
 
@@ -30,7 +30,7 @@ impl NodeController {
         my_peer_id: PeerId,
         cmd_rx: mpsc::UnboundedReceiver<Command>,
         inbound_req_tx: mpsc::UnboundedSender<InboundServiceRequest>,
-        net_handle: NetHandle,
+        network: NetworkStart,
         shutdown_rx: watch::Receiver<bool>,
     ) -> Self {
         let node_rtts = Arc::new(RwLock::new(HashMap::new()));
@@ -38,12 +38,17 @@ impl NodeController {
             map.insert(my_peer_id, Duration::ZERO);
         }
 
-        let (swarm, event_rx, _actor_handle) = net_handle.spawn_actor();
+        let NetworkStart {
+            handle: swarm,
+            events: event_rx,
+            task: _network_task,
+        } = network;
 
         Self {
             config,
             my_peer_id,
             node_rtts,
+            node_ping_failures: HashMap::new(),
             cmd_rx,
             inbound_req_tx,
             swarm,
@@ -63,24 +68,22 @@ impl NodeController {
                     self.handle_command(cmd).await;
                 }
                 _ = self.shutdown_rx.changed() => {
+                    self.swarm.shutdown();
                     return Ok(());
                 }
             }
         }
     }
 
-    async fn handle_controller_event(
-        &mut self,
-        event: ControllerEvent,
-    ) -> Result<(), Box<dyn Error>> {
+    async fn handle_controller_event(&mut self, event: NetworkEvent) -> Result<(), Box<dyn Error>> {
         match event {
-            ControllerEvent::Ping(event) => self.handle_ping(event).await?,
-            ControllerEvent::Identify(event) => self.handle_identify(event).await?,
-            ControllerEvent::BootstrapCompleted => {
+            NetworkEvent::Ping(event) => self.handle_ping(event).await?,
+            NetworkEvent::Identify(event) => self.handle_identify(event).await?,
+            NetworkEvent::BootstrapCompleted => {
                 self.announce_local_services().await?;
                 self.request_relay_reservation_if_needed().await?;
             }
-            ControllerEvent::InboundServiceRequest {
+            NetworkEvent::InboundServiceRequest {
                 request_id,
                 service,
                 payload,
@@ -99,8 +102,8 @@ impl NodeController {
                     self.swarm.send_response(request_id, err_resp);
                 }
             }
-            ControllerEvent::Relay(event) => self.handle_relay(event).await?,
-            ControllerEvent::RelayClient(event) => self.handle_relay_client(event).await?,
+            NetworkEvent::Relay(event) => self.handle_relay(event).await?,
+            NetworkEvent::RelayClient(event) => self.handle_relay_client(event).await?,
         }
         Ok(())
     }
@@ -115,10 +118,21 @@ impl NodeController {
                 if let Ok(mut map) = self.node_rtts.write() {
                     map.insert(peer, rtt);
                 }
+                self.node_ping_failures.remove(&peer);
             }
             ping::Event { peer, .. } => {
                 if let Ok(mut map) = self.node_rtts.write() {
                     map.remove(&peer);
+                }
+                // 连续失败达 max_failures 时主动断开。阈值每次读配置，支持热调；0 表示不断连。
+                let max = self.config.ping_max_failures();
+                if max > 0 {
+                    let count = self.node_ping_failures.entry(peer).or_insert(0);
+                    *count += 1;
+                    if *count >= max {
+                        self.node_ping_failures.remove(&peer);
+                        self.swarm.disconnect_peer(peer);
+                    }
                 }
             }
         }
@@ -285,10 +299,10 @@ impl NodeController {
             }
         }
 
-        if let Ok(types_json) = serde_json::to_vec(&all_types) {
-            if let Err(e) = self.swarm.put_record(types_key, types_json).await {
-                LogStruct::new(LogLevel::Warning, "更新服务类型列表失败", e).emit();
-            }
+        if let Ok(types_json) = serde_json::to_vec(&all_types)
+            && let Err(e) = self.swarm.put_record(types_key, types_json).await
+        {
+            LogStruct::new(LogLevel::Warning, "更新服务类型列表失败", e.to_string()).emit();
         }
 
         Ok(())
@@ -443,6 +457,16 @@ impl NodeController {
                     };
                     Some(Ok(serde_json::to_vec(&result).unwrap()))
                 }
+                "reload_config" => {
+                    // 用当前 config.toml 重建 Swarm。注意：会瞬断连接并清空 DHT 本地存储。
+                    let result = match self.swarm.reload().await {
+                        Ok(_) => serde_json::json!({"success": true}),
+                        Err(e) => {
+                            serde_json::json!({"success": false, "error": e.to_string()})
+                        }
+                    };
+                    Some(Ok(serde_json::to_vec(&result).unwrap()))
+                }
                 "add_key" => match serde_json::from_slice::<serde_json::Value>(&payload) {
                     Ok(json) => {
                         let key_str = json["key"].as_str().unwrap_or_default().to_string();
@@ -582,7 +606,7 @@ impl NodeController {
                             };
                             match self.swarm.send_request(&best_peer, request).await {
                                 Ok(resp) => Some(Ok(resp.data)),
-                                Err(e) => Some(Err(e)),
+                                Err(e) => Some(Err(e.to_string())),
                             }
                         }
                     }
@@ -600,7 +624,7 @@ impl NodeController {
                             let request = service_protocol::Request { service, payload };
                             match self.swarm.send_request(&peer_id, request).await {
                                 Ok(resp) => Some(Ok(resp.data)),
-                                Err(e) => Some(Err(e)),
+                                Err(e) => Some(Err(e.to_string())),
                             }
                         }
                         Err(e) => Some(Err(format!("invalid peer id: {e}"))),
@@ -610,7 +634,8 @@ impl NodeController {
             _ => Some(Err("command not supported".to_string())),
         };
 
-        let _ = resp_tx.send(result.unwrap());
+        let _ =
+            resp_tx.send(result.unwrap_or_else(|| Err("command produced no result".to_string())));
     }
 }
 

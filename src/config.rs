@@ -388,6 +388,18 @@ impl ConfigHandle {
         self.read().services.ping.with_timeout
     }
 
+    pub fn ping_max_failures(&self) -> u32 {
+        self.read().services.ping.max_failures
+    }
+
+    pub fn dispatcher_enabled(&self) -> bool {
+        self.read().services.dispatcher.enabled
+    }
+
+    pub fn dispatcher_query_timeout(&self) -> u32 {
+        self.read().services.dispatcher.query_timeout_secs
+    }
+
     pub fn kademlia_enabled(&self) -> bool {
         self.read().services.kademlia.enabled
     }

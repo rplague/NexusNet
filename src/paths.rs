@@ -43,10 +43,10 @@ fn data_home() -> PathBuf {
 ///
 /// 优先级：`NEXUSNET_CONFIG` → `$NEXUSNET_HOME/config.toml` → `./config.toml`。
 pub fn config_path() -> PathBuf {
-    if let Some(path) = env::var_os("NEXUSNET_CONFIG") {
-        if !path.is_empty() {
-            return PathBuf::from(path);
-        }
+    if let Some(path) = env::var_os("NEXUSNET_CONFIG")
+        && !path.is_empty()
+    {
+        return PathBuf::from(path);
     }
     if has_data_home() {
         return data_home().join("config.toml");
@@ -58,10 +58,10 @@ pub fn config_path() -> PathBuf {
 ///
 /// 优先级：`NEXUSNET_KEYPAIR` → `$NEXUSNET_HOME/keypair.bin` → `./keypair.bin`。
 pub fn keypair_path() -> PathBuf {
-    if let Some(path) = env::var_os("NEXUSNET_KEYPAIR") {
-        if !path.is_empty() {
-            return PathBuf::from(path);
-        }
+    if let Some(path) = env::var_os("NEXUSNET_KEYPAIR")
+        && !path.is_empty()
+    {
+        return PathBuf::from(path);
     }
     if has_data_home() {
         return data_home().join("keypair.bin");
@@ -73,10 +73,10 @@ pub fn keypair_path() -> PathBuf {
 ///
 /// 优先级：`NEXUSNET_LOG_PATH` → `$NEXUSNET_HOME/log` → `./log`。
 pub fn log_path() -> PathBuf {
-    if let Some(path) = env::var_os("NEXUSNET_LOG_PATH") {
-        if !path.is_empty() {
-            return PathBuf::from(path);
-        }
+    if let Some(path) = env::var_os("NEXUSNET_LOG_PATH")
+        && !path.is_empty()
+    {
+        return PathBuf::from(path);
     }
     if has_data_home() {
         return data_home();

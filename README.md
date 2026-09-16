@@ -135,7 +135,7 @@ pq_required = false
 所有字段均有 `#[serde(default)]`，省略即默认值。
 
 配置路径由环境变量决定（见 `src/paths.rs`）：`NEXUSNET_CONFIG`、`NEXUSNET_KEYPAIR`、
-`NEXUSNET_LOG_FILE`、`NEXUSNET_HOME`；未设置时回退当前目录。
+`NEXUSNET_LOG_PATH`、`NEXUSNET_HOME`；未设置时回退当前目录。
 
 ## 启动流程
 
@@ -146,7 +146,7 @@ boot::init()
   ├─ 更新公网 IP 到配置
   ├─ 加载/生成 keypair.bin（ED25519 节点身份）
   ├─ 尝试加载 keypair.pq.bin（PQ 密钥，可选，不存在则跳过）
-  ├─ NetHandle::start() → 绑定端口，组建 Swarm
+  ├─ Network::start() → 构建 Swarm 并启动 SwarmActor
   ├─ 拨号所有 bootstrap 节点
   ├─ 启动 ServiceDispatcher（后台 tokio::spawn）
    └─ NodeController::run()（主协程）
@@ -158,7 +158,8 @@ boot::init()
 ```
 
 路径由 `paths.rs` 解析；收到 SIGTERM/Ctrl-C 时 NodeController 与 ServiceDispatcher
-收到共享关闭信号并结束循环，进程干净退出。
+收到共享关闭信号并结束循环，进程干净退出。收到 SIGHUP 时经 `@reload_config`
+用当前配置重建 Swarm（配合 systemd `ExecReload`）。
 
 ## 模块清单
 
@@ -169,11 +170,10 @@ boot::init()
 | **paths** | 统一路径解析（环境变量锚定，本地回退当前目录） |
 | **node_controller** | 事件循环统一处理、服务自动宣告，处理远程查询和内部命令 |
 | **service_dispatcher** | 后端连接管理 |
-| **net** | KeyManager、Swarm 构建、地址检测 |
+| **network** | 网络层门面：身份、地址探测、行为装配、Swarm Actor（`network/identity`、`network/addr`、`network/behaviour`、`network/builder`、`network/actor`） |
 | **config** | 提供ConfigHandle |
 | **service_protocol** | 提供通讯协议 |
 | **log** | 终端 + 文件输出、日志轮转（路径可配，非 TTY 去彩色） |
-| **swarm_actor** | Swarm 分发封装 |
 
 ## 后端帧协议（TCP）
 
