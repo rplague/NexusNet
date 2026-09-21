@@ -26,6 +26,7 @@ use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use tokio::time::{Duration, timeout};
 use uuid::Uuid;
 
+use crate::auth;
 use crate::config::{ConfigHandle, LocalServiceEntry};
 use crate::log::{LogLevel, LogStruct};
 use crate::service_protocol;
@@ -68,7 +69,29 @@ impl ServiceDispatcher {
         config: ConfigHandle,
         shutdown_rx: watch::Receiver<bool>,
     ) -> Self {
-        let local_services = config.read().services.dispatcher.local_services.clone();
+        let configured = config.read().services.dispatcher.local_services.clone();
+        // 名称非法（保留名 "service" 或含非法字符）的服务不建立后端连接
+        let mut local_services = Vec::with_capacity(configured.len());
+        let mut rejected = Vec::new();
+        for svc in configured {
+            if auth::is_valid_service_name(&svc.name) {
+                local_services.push(svc);
+            } else {
+                rejected.push(svc.name);
+            }
+        }
+        if !rejected.is_empty() {
+            LogStruct::new(
+                LogLevel::Warning,
+                "服务名非法，已跳过",
+                format!(
+                    "{}（保留名 'service' 或含非法字符，不会建立后端连接）",
+                    rejected.join(", ")
+                ),
+            )
+            .emit();
+        }
+
         let query_timeout = Duration::from_secs(config.dispatcher_query_timeout().into());
         let mut pending_requests = HashMap::new();
         for svc in &local_services {
@@ -462,7 +485,8 @@ impl ServiceDispatcher {
 
 #[cfg(test)]
 mod tests {
-    use super::ServiceDispatcher;
+    use super::*;
+    use crate::config::NodeConfig;
 
     #[test]
     fn encode_request_frames_uuid_and_payload_big_endian() {
@@ -485,5 +509,36 @@ mod tests {
         assert_eq!(&frame[4..6], b"id");
         assert_eq!(&frame[6..10], &0u32.to_be_bytes());
         assert_eq!(frame.len(), 10);
+    }
+
+    #[test]
+    fn reserved_and_invalid_service_names_are_skipped() {
+        let mut cfg = NodeConfig::default();
+        cfg.services.dispatcher.local_services = vec![
+            LocalServiceEntry {
+                name: "service".to_string(),
+                host: "127.0.0.1".to_string(),
+                port: 1,
+                require_auth: false,
+            },
+            LocalServiceEntry {
+                name: "cmd".to_string(),
+                host: "127.0.0.1".to_string(),
+                port: 2,
+                require_auth: false,
+            },
+        ];
+        let handle = ConfigHandle::new(cfg);
+
+        let (_in_tx, in_rx) = mpsc::unbounded_channel();
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let dispatcher = ServiceDispatcher::new(in_rx, cmd_tx, handle, shutdown_rx);
+
+        assert_eq!(dispatcher.local_services.len(), 1);
+        assert_eq!(dispatcher.local_services[0].name, "cmd");
+        assert!(dispatcher.pending_requests.contains_key("cmd"));
+        assert!(!dispatcher.pending_requests.contains_key("service"));
     }
 }

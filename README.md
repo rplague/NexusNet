@@ -126,6 +126,7 @@ record_ttl_secs = 3600
 name = "cmd"
 host = "127.0.0.1"
 port = 5014
+require_auth = false
 
 [services.relay]
 retry_interval_secs = 60
@@ -135,6 +136,14 @@ max_failures = 3
 pq_transport_enabled = false
 pq_identity_enabled = false
 pq_required = false
+
+[auth]
+network = "none"                 # "none" = 不鉴权
+cache_ttl_secs = 300
+refresh_interval_secs = 60
+
+[auth.networks.myorg]            # 每个鉴权网络的信任锚
+authority = "<base64 ed25519 公钥>"
 ```
 
 所有字段均有 `#[serde(default)]`，省略即默认值。
@@ -155,6 +164,7 @@ boot::init()
   ├─ Network::start() → 构建 Swarm 并启动 SwarmActor
   ├─ 拨号所有 bootstrap 节点
   ├─ 启动 ServiceDispatcher（后台 tokio::spawn）
+  ├─ 启动 auth_refresher（后台鉴权缓存刷新）
    └─ NodeController::run()（主协程）
         tokio::select! {
             event_rx → 网络事件
@@ -175,6 +185,7 @@ boot::init()
 | **network** | 网络层门面：身份、地址探测、行为装配、Swarm Actor（`network/identity`、`network/addr`、`network/behaviour`、`network/builder`、`network/actor`） |
 | **config** | 提供ConfigHandle |
 | **service_protocol** | 提供通讯协议 |
+| **auth** | 鉴权记录层：COSE_Sign1 验签、TUF-lite 一致性防护、内存缓存与判定 |
 | **log** | 自动检测输出模式：systemd 下交 journald，其余终端+文件轮转 |
 
 ## 后端帧协议（TCP）
@@ -250,6 +261,31 @@ NexusNet 与后端进程之间使用**持久 TCP 连接**，由节点主动发�
 | `crypto.pq_transport_enabled` | 启用加密服务调用 |
 | `crypto.pq_identity_enabled` | 附带并校验 ML-DSA 签名 |
 | `crypto.pq_required` | 强制 PQ，拒绝非 PQ 对端 |
+
+## 鉴权
+
+可选的服务级访问控制。节点加入一个**鉴权网络**，权威方（边车）把签名白名单发布到 DHT；
+节点收到服务请求时按「DHT 为准 + fail-closed」判定，通过才转发给本地后端。
+
+- **信任模型**：记录由权威 ed25519 私钥签名，DHT 仅作传输；接收方验签后才信任（防伪造、防回滚与重放）。
+- **记录**：`/oahd/auth/<net_hash>/service`（索引）与 `/oahd/auth/<net_hash>/<service>`（白名单），
+  值为 COSE_Sign1；`net_hash = base64url_nopad(SHA-256(network))`。
+- **服务开关**：`services.dispatcher.local_services[].require_auth`。
+- **判定**：鉴权关闭或服务未要求鉴权 → 放行；索引/白名单缺失、过期、验签失败 → 拒绝；
+  服务不在索引 → 放行并自动把本地 `require_auth` 置为 `false`（网络同步）。
+- **边车发布**：签名记录 → 标准 base64 → 本地后端 `@add_key {"key":"...","value_b64":"..."}`；
+  在 `expires_at` 前重发续期。
+- **状态查询**：`@auth_status`。
+
+完整记录格式、发布流程与验证算法见 [docs/auth.md](./docs/auth.md)。
+
+| 配置 | 含义 |
+|---|---|
+| `auth.network` | 鉴权网络名；`"none"` 表示不鉴权 |
+| `auth.networks.<name>.authority` | 该网络权威 ed25519 公钥（base64） |
+| `auth.cache_ttl_secs` | 白名单/索引本地缓存有效期（默认 300s） |
+| `auth.refresh_interval_secs` | 后台刷新间隔（默认 60s） |
+| `require_auth` | 单个本地服务是否要求鉴权 |
 
 ## 日志
 

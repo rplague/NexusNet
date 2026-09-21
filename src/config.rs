@@ -18,6 +18,7 @@
 use crate::paths;
 use crate::{LogLevel, LogStruct};
 use libp2p::Multiaddr;
+use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::net::IpAddr;
@@ -54,6 +55,12 @@ default_u32_fn!(default_replication_factor, 20);
 default_u32_fn!(default_query_timeout_seconds, 60);
 default_u32_fn!(default_relay_retry_interval, 60);
 default_u32_fn!(default_relay_max_failures, 3);
+default_u32_fn!(default_auth_cache_ttl, 300);
+default_u32_fn!(default_auth_refresh_interval, 60);
+
+fn default_auth_network() -> String {
+    "none".to_string()
+}
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize, Default)]
 pub struct NodeConfig {
@@ -65,6 +72,8 @@ pub struct NodeConfig {
     pub services: ServicesConfig,
     #[serde(default)]
     pub crypto: CryptoConfig,
+    #[serde(default)]
+    pub auth: AuthConfig,
 }
 
 impl NodeConfig {
@@ -294,6 +303,9 @@ pub struct LocalServiceEntry {
     pub name: String,
     pub host: String,
     pub port: u16,
+    /// 该服务是否要求鉴权
+    #[serde(default = "bool_false")]
+    pub require_auth: bool,
 }
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
@@ -327,6 +339,52 @@ pub struct CryptoConfig {
     pub pq_identity_enabled: bool,
     #[serde(default = "bool_false")]
     pub pq_required: bool,
+}
+
+/// 节点级鉴权配置
+///
+/// `network = "none"` 表示不鉴权；其余取值需在 `networks` 中有对应的权威公钥
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct AuthConfig {
+    /// 当前节点所属鉴权网络名；"none" 表示不鉴权
+    #[serde(default = "default_auth_network")]
+    pub network: String,
+    /// 鉴权索引/白名单的本地缓存有效期（秒）；索引另有 `expires_at`
+    #[serde(default = "default_auth_cache_ttl")]
+    pub cache_ttl_secs: u32,
+    /// 后台刷新间隔
+    #[serde(default = "default_auth_refresh_interval")]
+    pub refresh_interval_secs: u32,
+    /// 网络名 → 信任锚
+    #[serde(default)]
+    pub networks: HashMap<String, AuthNetworkConfig>,
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        AuthConfig {
+            network: default_auth_network(),
+            cache_ttl_secs: default_auth_cache_ttl(),
+            refresh_interval_secs: default_auth_refresh_interval(),
+            networks: HashMap::new(),
+        }
+    }
+}
+
+/// 单个鉴权网络的信任锚
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct AuthNetworkConfig {
+    /// 权威 ed25519 公钥（base64），由 `auth` 模块解析
+    #[serde(default)]
+    pub authority: String,
+}
+
+impl Default for AuthNetworkConfig {
+    fn default() -> Self {
+        AuthNetworkConfig {
+            authority: String::new(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -463,6 +521,49 @@ impl ConfigHandle {
         c.crypto.pq_transport_enabled || c.crypto.pq_identity_enabled
     }
 
+    // ========== 鉴权 ==========
+    pub fn auth_network(&self) -> String {
+        self.read().auth.network.clone()
+    }
+
+    pub fn auth_cache_ttl(&self) -> u32 {
+        self.read().auth.cache_ttl_secs
+    }
+
+    pub fn auth_refresh_interval(&self) -> u32 {
+        self.read().auth.refresh_interval_secs
+    }
+
+    /// 返回指定网络的权威公钥（base64 原文），解析由 `auth` 模块负责
+    pub fn auth_authority(&self, network: &str) -> Option<String> {
+        self.read()
+            .auth
+            .networks
+            .get(network)
+            .map(|n| n.authority.clone())
+    }
+
+    /// 本地配置中要求鉴权的服务名（用于定向刷新白名单）
+    pub fn auth_required_services(&self) -> Vec<String> {
+        self.read()
+            .services
+            .dispatcher
+            .local_services
+            .iter()
+            .filter(|s| s.require_auth)
+            .map(|s| s.name.clone())
+            .collect()
+    }
+
+    pub fn service_requires_auth(&self, name: &str) -> bool {
+        self.read()
+            .services
+            .dispatcher
+            .local_services
+            .iter()
+            .any(|s| s.name == name && s.require_auth)
+    }
+
     pub fn kademlia_enabled(&self) -> bool {
         self.read().services.kademlia.enabled
     }
@@ -530,6 +631,25 @@ impl ConfigHandle {
         cfg.network.ipv4_address = address;
     }
 
+    /// 设置指定本地服务是否要求鉴权；返回是否命中且发生了修改
+    pub fn set_service_require_auth(&self, name: &str, require_auth: bool) -> bool {
+        let mut cfg = self.write();
+        match cfg
+            .services
+            .dispatcher
+            .local_services
+            .iter_mut()
+            .find(|s| s.name == name)
+        {
+            Some(svc) => {
+                let changed = svc.require_auth != require_auth;
+                svc.require_auth = require_auth;
+                changed
+            }
+            None => false,
+        }
+    }
+
     /// 替换整个 NodeConfig
     pub fn replace_config(&self, new_config: NodeConfig) {
         *self.write() = new_config;
@@ -538,5 +658,101 @@ impl ConfigHandle {
     /// 获取配置的快照
     pub fn snapshot(&self) -> NodeConfig {
         self.read().clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_auth_config() {
+        let cfg = AuthConfig::default();
+        assert_eq!(cfg.network, "none");
+        assert_eq!(cfg.cache_ttl_secs, 300);
+        assert_eq!(cfg.refresh_interval_secs, 60);
+        assert!(cfg.networks.is_empty());
+    }
+
+    #[test]
+    fn parse_auth_section() {
+        let toml = r#"
+            [auth]
+            network = "myorg"
+            [auth.networks.myorg]
+            authority = "AAAA"
+        "#;
+        let node: NodeConfig = toml::from_str(toml).unwrap();
+        let handle = ConfigHandle::new(node);
+        assert_eq!(handle.auth_network(), "myorg");
+        assert_eq!(handle.auth_authority("myorg"), Some("AAAA".to_string()));
+        assert_eq!(handle.auth_authority("other"), None);
+        assert_eq!(handle.auth_cache_ttl(), 300);
+        assert_eq!(handle.auth_refresh_interval(), 60);
+    }
+
+    #[test]
+    fn local_service_require_auth_defaults_false() {
+        let toml = r#"
+            [[services.dispatcher.local_services]]
+            name = "cmd"
+            host = "127.0.0.1"
+            port = 5014
+        "#;
+        let node: NodeConfig = toml::from_str(toml).unwrap();
+        assert!(!node.services.dispatcher.local_services[0].require_auth);
+    }
+
+    #[test]
+    fn auth_required_services_filters() {
+        let toml = r#"
+            [[services.dispatcher.local_services]]
+            name = "cmd"
+            host = "127.0.0.1"
+            port = 5014
+            require_auth = true
+            [[services.dispatcher.local_services]]
+            name = "ocr"
+            host = "127.0.0.1"
+            port = 5013
+            require_auth = false
+        "#;
+        let node: NodeConfig = toml::from_str(toml).unwrap();
+        let handle = ConfigHandle::new(node);
+        assert_eq!(handle.auth_required_services(), vec!["cmd".to_string()]);
+        assert!(handle.service_requires_auth("cmd"));
+        assert!(!handle.service_requires_auth("ocr"));
+        assert!(!handle.service_requires_auth("missing"));
+    }
+
+    #[test]
+    fn auth_config_round_trip() {
+        let toml = r#"
+            [auth]
+            network = "myorg"
+            cache_ttl_secs = 120
+            refresh_interval_secs = 30
+            [auth.networks.myorg]
+            authority = "BBBB"
+        "#;
+        let node: NodeConfig = toml::from_str(toml).unwrap();
+        let s = toml::to_string_pretty(&node).unwrap();
+        let back: NodeConfig = toml::from_str(&s).unwrap();
+        assert_eq!(back.auth.network, "myorg");
+        assert_eq!(back.auth.cache_ttl_secs, 120);
+        assert_eq!(back.auth.refresh_interval_secs, 30);
+        assert_eq!(back.auth.networks.get("myorg").unwrap().authority, "BBBB");
+    }
+
+    #[test]
+    fn legacy_config_without_auth_is_default() {
+        let toml = r#"
+            [node]
+            name = "old"
+        "#;
+        let node: NodeConfig = toml::from_str(toml).unwrap();
+        let handle = ConfigHandle::new(node);
+        assert_eq!(handle.auth_network(), "none");
+        assert!(handle.auth_required_services().is_empty());
     }
 }

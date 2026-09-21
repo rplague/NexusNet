@@ -15,6 +15,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+mod auth;
 mod boot;
 mod config;
 mod log;
@@ -26,12 +27,15 @@ mod service_protocol;
 
 use log::{LogLevel, LogStruct};
 use network::{KeyManager, Network};
-use node_controller::NodeController;
+use node_controller::{NodeController, auth_refresher};
 use std::error::Error;
+use std::sync::{Arc, RwLock};
+use tokio::sync::Notify;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::sync::watch;
 
+use crate::auth::AuthCache;
 use crate::service_dispatcher::{Command, ServiceDispatcher};
 
 #[tokio::main]
@@ -105,6 +109,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let _ = shutdown_tx.send(true);
     });
 
+    // 鉴权缓存与后台刷新任务
+    let auth_cache = Arc::new(RwLock::new(AuthCache::default()));
+    let auth_notify = Arc::new(Notify::new());
+    tokio::spawn(auth_refresher(
+        config_handle.clone(),
+        network.handle.clone(),
+        auth_cache.clone(),
+        auth_notify.clone(),
+        shutdown_rx.clone(),
+    ));
+
     let dispatcher = ServiceDispatcher::new(
         inbound_req_rx,
         cmd_tx,
@@ -122,6 +137,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         inbound_req_tx,
         network,
         shutdown_rx,
+        auth_cache,
+        auth_notify,
     );
     if let Err(e) = controller.run().await {
         LogStruct::new(LogLevel::Critical, "节点运行错误", e.to_string()).emit();

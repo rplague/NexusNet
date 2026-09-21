@@ -1,21 +1,58 @@
+use crate::auth::{self, AuthCache};
 use crate::config::ConfigHandle;
 use crate::log::{LogLevel, LogStruct};
 use crate::network::{NetworkEvent, NetworkHandle, NetworkStart};
 use crate::service_dispatcher::{Command, InboundServiceRequest};
 use crate::service_protocol;
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use libp2p::multiaddr::Protocol;
 use libp2p::{Multiaddr, PeerId, identify, kad, ping, relay};
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
-use tokio::sync::watch;
+use tokio::sync::{Notify, mpsc, oneshot, watch};
 
 /// DHT provider 键：声明/发现 bootstrap 节点。
 const BOOTSTRAP_PROVIDER_KEY: &[u8] = b"/oahd/bootstrap";
 /// 中继预约目标数量（固定为 3，不可配置）。
 const RELAY_TARGET: usize = 3;
+/// 鉴权缓存两次刷新之间的最小间隔，避免缓存失效时高频触发 DHT 查询
+const AUTH_MIN_REFRESH: Duration = Duration::from_secs(5);
+
+/// 节点鉴权运行状态
+enum AuthState {
+    /// `auth.network == "none"`，不鉴权
+    Disabled,
+    /// 鉴权启用且权威公钥有效
+    Active(auth::AuthNetwork),
+    /// 已设网络但权威公钥缺失/非法：失败即拒绝（fail-closed）
+    Misconfigured(String),
+}
+
+/// 单次入站请求的鉴权结论
+enum Decision {
+    Allow,
+    /// 服务不在鉴权索引中：放行，并将本地该服务的鉴权要求同步为关闭
+    AllowUnprotected,
+    Deny(String),
+}
+
+/// 由配置解析鉴权状态
+fn resolve_auth_state(config: &ConfigHandle) -> AuthState {
+    let network = config.auth_network();
+    if network == "none" {
+        return AuthState::Disabled;
+    }
+    match config.auth_authority(&network) {
+        Some(authority) => match auth::AuthNetwork::new(&network, &authority) {
+            Ok(net) => AuthState::Active(net),
+            Err(e) => AuthState::Misconfigured(format!("鉴权网络 '{network}' 权威公钥无效: {e}")),
+        },
+        None => AuthState::Misconfigured(format!("鉴权网络 '{network}' 未配置权威公钥")),
+    }
+}
 
 pub struct NodeController {
     config: ConfigHandle,
@@ -39,6 +76,12 @@ pub struct NodeController {
     swarm: NetworkHandle,
     event_rx: mpsc::UnboundedReceiver<NetworkEvent>,
     shutdown_rx: watch::Receiver<bool>,
+    /// 鉴权运行状态（构造与 reload 时解析）
+    auth_state: AuthState,
+    /// 与后台刷新任务共享的鉴权缓存
+    auth_cache: Arc<RwLock<AuthCache>>,
+    /// 唤醒后台刷新任务
+    auth_notify: Arc<Notify>,
 }
 
 impl NodeController {
@@ -49,10 +92,17 @@ impl NodeController {
         inbound_req_tx: mpsc::UnboundedSender<InboundServiceRequest>,
         network: NetworkStart,
         shutdown_rx: watch::Receiver<bool>,
+        auth_cache: Arc<RwLock<AuthCache>>,
+        auth_notify: Arc<Notify>,
     ) -> Self {
         let node_rtts = Arc::new(RwLock::new(HashMap::new()));
         if let Ok(mut map) = node_rtts.write() {
             map.insert(my_peer_id, Duration::ZERO);
+        }
+
+        let auth_state = resolve_auth_state(&config);
+        if let AuthState::Misconfigured(reason) = &auth_state {
+            LogStruct::new(LogLevel::Warning, "鉴权网络配置错误", reason.clone()).emit();
         }
 
         let NetworkStart {
@@ -77,6 +127,9 @@ impl NodeController {
             swarm,
             event_rx,
             shutdown_rx,
+            auth_state,
+            auth_cache,
+            auth_notify,
         }
     }
 
@@ -117,26 +170,44 @@ impl NodeController {
                 self.announce_bootstrap_provider().await;
                 self.refresh_bootstrap_providers().await;
                 self.reconcile_relays().await;
+                self.auth_notify.notify_one();
             }
             NetworkEvent::InboundServiceRequest {
+                peer,
                 request_id,
                 service,
                 payload,
                 response_tx,
-            } => {
-                let inbound = InboundServiceRequest {
-                    service,
-                    payload,
-                    response_tx,
-                };
-                if let Err(e) = self.inbound_req_tx.send(inbound) {
-                    let err_resp = service_protocol::Response {
-                        success: false,
-                        data: format!("service unavailable: {}", e).into_bytes(),
-                    };
-                    self.swarm.send_response(request_id, err_resp);
+            } => match self.authorize(&peer, &service) {
+                Decision::Allow => {
+                    self.forward_inbound(request_id, service, payload, response_tx);
                 }
-            }
+                Decision::AllowUnprotected => {
+                    if self.config.set_service_require_auth(&service, false) {
+                        self.config.save_to_default();
+                        LogStruct::new(
+                            LogLevel::Warning,
+                            "鉴权网络同步",
+                            format!("{}在网络中已经无需鉴权，已经进行网络同步", service),
+                        )
+                        .emit();
+                    }
+                    self.forward_inbound(request_id, service, payload, response_tx);
+                }
+                Decision::Deny(reason) => {
+                    LogStruct::new(
+                        LogLevel::Warning,
+                        "鉴权拒绝",
+                        format!("{} -> {}: {}", peer, service, reason),
+                    )
+                    .emit();
+                    let _ = response_tx.send(Ok(service_protocol::Response {
+                        success: false,
+                        data: format!("unauthorized: {}", reason).into_bytes(),
+                    }));
+                    self.auth_notify.notify_one();
+                }
+            },
             NetworkEvent::Relay(event) => self.handle_relay(event).await?,
             NetworkEvent::RelayClient(event) => self.handle_relay_client(event).await?,
             NetworkEvent::ListenerClosed { addresses } => {
@@ -147,6 +218,69 @@ impl NodeController {
             }
         }
         Ok(())
+    }
+
+    /// 鉴权判定：只读本地缓存，同步返回，不阻塞事件循环
+    fn authorize(&self, peer: &PeerId, service: &str) -> Decision {
+        match &self.auth_state {
+            AuthState::Disabled => return Decision::Allow,
+            AuthState::Misconfigured(reason) => return Decision::Deny(reason.clone()),
+            AuthState::Active(_) => {}
+        }
+        if !self.config.service_requires_auth(service) {
+            return Decision::Allow;
+        }
+
+        let now = auth::now_unix();
+        let ttl = Duration::from_secs(self.config.auth_cache_ttl() as u64);
+        let Ok(cache) = self.auth_cache.read() else {
+            return Decision::Deny("auth cache poisoned".to_string());
+        };
+        let Some(index) = cache.fresh_index(now, ttl) else {
+            return Decision::Deny("auth index unavailable".to_string());
+        };
+        if !index.services.contains_key(service) {
+            return Decision::AllowUnprotected;
+        }
+        let Some(whitelist) = cache.fresh_whitelist(service, ttl) else {
+            return Decision::Deny("whitelist unavailable".to_string());
+        };
+        if whitelist.is_member(peer) {
+            Decision::Allow
+        } else {
+            Decision::Deny("peer not authorized".to_string())
+        }
+    }
+
+    /// 将入站请求转发给 ServiceDispatcher
+    fn forward_inbound(
+        &self,
+        request_id: String,
+        service: String,
+        payload: Vec<u8>,
+        response_tx: oneshot::Sender<Result<service_protocol::Response, String>>,
+    ) {
+        let inbound = InboundServiceRequest {
+            service,
+            payload,
+            response_tx,
+        };
+        if let Err(e) = self.inbound_req_tx.send(inbound) {
+            let err_resp = service_protocol::Response {
+                success: false,
+                data: format!("service unavailable: {}", e).into_bytes(),
+            };
+            self.swarm.send_response(request_id, err_resp);
+        }
+    }
+
+    /// 声明提供某 key，返回错误字符串
+    async fn start_providing_record(&self, key_str: &str) -> Result<(), String> {
+        self.swarm
+            .start_providing(kad::RecordKey::new(&key_str))
+            .await
+            .map(|_| ())
+            .map_err(|e| format!("start_providing failed: {e}"))
     }
 
     async fn handle_ping(&mut self, event: ping::Event) -> Result<(), Box<dyn Error>> {
@@ -308,13 +442,16 @@ impl NodeController {
     }
 
     async fn announce_local_services(&mut self) -> Result<(), Box<dyn Error>> {
-        let local_services = self
+        let local_services: Vec<_> = self
             .config
             .read()
             .services
             .dispatcher
             .local_services
-            .clone();
+            .iter()
+            .filter(|s| auth::is_valid_service_name(&s.name))
+            .cloned()
+            .collect();
         if local_services.is_empty() {
             return Ok(());
         }
@@ -670,6 +807,20 @@ impl NodeController {
                             self.relay_backoff.clear();
                             self.bootstrap_providers.clear();
                             self.is_bootstrap_provider = false;
+                            // 鉴权状态随配置重算，缓存清空后由刷新任务重建
+                            self.auth_state = resolve_auth_state(&self.config);
+                            if let AuthState::Misconfigured(reason) = &self.auth_state {
+                                LogStruct::new(
+                                    LogLevel::Warning,
+                                    "鉴权网络配置错误",
+                                    reason.clone(),
+                                )
+                                .emit();
+                            }
+                            if let Ok(mut cache) = self.auth_cache.write() {
+                                cache.clear();
+                            }
+                            self.auth_notify.notify_one();
                             serde_json::json!({"success": true})
                         }
                         Err(e) => {
@@ -704,70 +855,109 @@ impl NodeController {
                     });
                     Some(Ok(serde_json::to_vec(&result).unwrap()))
                 }
+                "auth_status" => {
+                    let network = self.config.auth_network();
+                    let (state, detail) = match &self.auth_state {
+                        AuthState::Disabled => ("disabled", None),
+                        AuthState::Active(_) => ("active", None),
+                        AuthState::Misconfigured(r) => ("misconfigured", Some(r.clone())),
+                    };
+                    let now = auth::now_unix();
+                    let ttl = Duration::from_secs(self.config.auth_cache_ttl() as u64);
+                    let local_required: Vec<String> = self
+                        .config
+                        .auth_required_services()
+                        .into_iter()
+                        .filter(|n| auth::is_valid_service_name(n))
+                        .collect();
+
+                    let mut report = serde_json::json!({
+                        "network": network,
+                        "state": state,
+                        "local_required": local_required.clone(),
+                    });
+                    if let Some(d) = detail {
+                        report["detail"] = serde_json::json!(d);
+                    }
+
+                    if let Ok(cache) = self.auth_cache.read() {
+                        if let Some(idx) = cache.index() {
+                            report["index"] = serde_json::json!({
+                                "version": idx.version,
+                                "expires_at": idx.expires_at,
+                                "age_secs": idx.fetched_at.elapsed().as_secs(),
+                                "services": idx.services.len(),
+                                "fresh": idx.is_fresh(now, ttl),
+                            });
+                        }
+                        let mut whitelists = serde_json::Map::new();
+                        for name in &local_required {
+                            if let Some(w) = cache.whitelist(name) {
+                                whitelists.insert(
+                                    name.clone(),
+                                    serde_json::json!({
+                                        "version": w.version,
+                                        "members": w.members.len(),
+                                        "age_secs": w.fetched_at.elapsed().as_secs(),
+                                    }),
+                                );
+                            }
+                        }
+                        report["cached_whitelists"] = serde_json::Value::Object(whitelists);
+
+                        let not_in_index: Vec<String> = match cache.index() {
+                            Some(idx) => local_required
+                                .iter()
+                                .filter(|n| !idx.services.contains_key(*n))
+                                .cloned()
+                                .collect(),
+                            None => local_required.clone(),
+                        };
+                        report["required_but_not_in_index"] = serde_json::json!(not_in_index);
+                    }
+
+                    Some(Ok(serde_json::to_vec(&report).unwrap()))
+                }
                 "add_key" => match serde_json::from_slice::<serde_json::Value>(&payload) {
                     Ok(json) => {
                         let key_str = json["key"].as_str().unwrap_or_default().to_string();
                         if key_str.is_empty() {
                             Some(Err("missing 'key' field".to_string()))
                         } else {
-                            let key = kad::RecordKey::new(&key_str);
-                            let has_value = json.get("value").and_then(|v| v.as_str());
                             let providing = json
                                 .get("providing")
                                 .and_then(|v| v.as_bool())
                                 .unwrap_or(false);
+                            let ack = || {
+                                serde_json::to_vec(&serde_json::json!({
+                                    "success": true,
+                                    "key": key_str.clone(),
+                                }))
+                                .unwrap()
+                            };
 
-                            if has_value.is_none() && !providing {
-                                Some(Err("at least one of 'value' or 'providing' is required"
-                                    .to_string()))
-                            } else if let Some(value_str) = has_value {
-                                match self
-                                    .swarm
-                                    .put_record(key, value_str.as_bytes().to_vec())
-                                    .await
-                                {
-                                    Ok(_) => {
-                                        if providing {
-                                            match self
-                                                .swarm
-                                                .start_providing(kad::RecordKey::new(&key_str))
-                                                .await
-                                            {
-                                                Ok(_) => {
-                                                    let json = serde_json::json!({
-                                                        "success": true,
-                                                        "key": key_str,
-                                                    });
-                                                    Some(Ok(serde_json::to_vec(&json).unwrap()))
-                                                }
-                                                Err(e) => Some(Err(format!(
-                                                    "start_providing failed: {e}"
-                                                ))),
+                            match parse_add_key_value(&json) {
+                                Err(e) => Some(Err(e)),
+                                Ok(None) if !providing => Some(Err(
+                                    "at least one of 'value', 'value_b64' or 'providing' is required"
+                                        .to_string(),
+                                )),
+                                Ok(None) => match self.start_providing_record(&key_str).await {
+                                    Ok(_) => Some(Ok(ack())),
+                                    Err(e) => Some(Err(e)),
+                                },
+                                Ok(Some(bytes)) => {
+                                    let key = kad::RecordKey::new(&key_str);
+                                    match self.swarm.put_record(key, bytes).await {
+                                        Ok(_) if providing => {
+                                            match self.start_providing_record(&key_str).await {
+                                                Ok(_) => Some(Ok(ack())),
+                                                Err(e) => Some(Err(e)),
                                             }
-                                        } else {
-                                            let json = serde_json::json!({
-                                                "success": true,
-                                                "key": key_str,
-                                            });
-                                            Some(Ok(serde_json::to_vec(&json).unwrap()))
                                         }
+                                        Ok(_) => Some(Ok(ack())),
+                                        Err(e) => Some(Err(format!("put_record failed: {e}"))),
                                     }
-                                    Err(e) => Some(Err(format!("put_record failed: {e}"))),
-                                }
-                            } else {
-                                match self
-                                    .swarm
-                                    .start_providing(kad::RecordKey::new(&key_str))
-                                    .await
-                                {
-                                    Ok(_) => {
-                                        let json = serde_json::json!({
-                                            "success": true,
-                                            "key": key_str,
-                                        });
-                                        Some(Ok(serde_json::to_vec(&json).unwrap()))
-                                    }
-                                    Err(e) => Some(Err(format!("start_providing failed: {e}"))),
                                 }
                             }
                         }
@@ -784,12 +974,14 @@ impl NodeController {
                             Ok(kad::GetRecordOk::FoundRecord(peer_record)) => {
                                 let value =
                                     String::from_utf8_lossy(&peer_record.record.value).into_owned();
+                                let value_b64 = STANDARD.encode(&peer_record.record.value);
                                 let record_key = kad::RecordKey::new(&key_str);
                                 match self.swarm.get_providers(record_key).await {
                                     Ok(providers) => {
                                         let mut resp = serde_json::json!({
                                             "key": key_str,
                                             "value": value,
+                                            "value_b64": value_b64,
                                         });
                                         if !providers.is_empty() {
                                             resp["providers"] = serde_json::json!(providers);
@@ -800,6 +992,7 @@ impl NodeController {
                                         let resp = serde_json::json!({
                                             "key": key_str,
                                             "value": value,
+                                            "value_b64": value_b64,
                                         });
                                         Some(Ok(serde_json::to_vec(&resp).unwrap()))
                                     }
@@ -876,6 +1069,144 @@ impl NodeController {
     }
 }
 
+/// 鉴权缓存后台刷新任务：周期刷新，并在被 `Notify` 唤醒时刷新
+pub async fn auth_refresher(
+    config: ConfigHandle,
+    swarm: NetworkHandle,
+    cache: Arc<RwLock<AuthCache>>,
+    notify: Arc<Notify>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let interval = Duration::from_secs(config.auth_refresh_interval().max(1) as u64);
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut last = Instant::now()
+        .checked_sub(AUTH_MIN_REFRESH)
+        .unwrap_or_else(Instant::now);
+
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {}
+            _ = notify.notified() => {}
+            _ = shutdown.changed() => break,
+        }
+        if last.elapsed() < AUTH_MIN_REFRESH {
+            tokio::time::sleep(AUTH_MIN_REFRESH - last.elapsed()).await;
+        }
+        refresh_auth_once(&config, &swarm, &cache).await;
+        last = Instant::now();
+    }
+}
+
+/// 取回并校验索引与所需白名单并写入缓存；失败保留旧缓存（自然过期后失败即拒绝）
+async fn refresh_auth_once(
+    config: &ConfigHandle,
+    swarm: &NetworkHandle,
+    cache: &Arc<RwLock<AuthCache>>,
+) {
+    let net = match resolve_auth_state(config) {
+        AuthState::Disabled => return,
+        AuthState::Active(net) => net,
+        AuthState::Misconfigured(_) => return,
+    };
+
+    let index_key = kad::RecordKey::new(&net.index_key());
+    let doc = match swarm.get_record(index_key).await {
+        Ok(kad::GetRecordOk::FoundRecord(peer_record)) => {
+            let now = auth::now_unix();
+            match auth::verify_index(&net, &peer_record.record.value, now) {
+                Ok(doc) => doc,
+                Err(e) => {
+                    LogStruct::new(LogLevel::Warning, "鉴权索引校验失败", e.to_string()).emit();
+                    return;
+                }
+            }
+        }
+        Ok(_) => {
+            LogStruct::new(LogLevel::Warning, "鉴权索引未找到", net.name.clone()).emit();
+            return;
+        }
+        Err(e) => {
+            LogStruct::new(LogLevel::Warning, "鉴权索引查询失败", e.to_string()).emit();
+            return;
+        }
+    };
+
+    let services = doc.services.clone();
+    if let Ok(mut c) = cache.write()
+        && let Err(e) = c.insert_index(doc)
+    {
+        LogStruct::new(LogLevel::Warning, "鉴权索引写入缓存失败", e.to_string()).emit();
+    }
+
+    for entry in services {
+        if !config.service_requires_auth(&entry.name) {
+            continue;
+        }
+        let key = match net.service_key(&entry.name) {
+            Ok(k) => kad::RecordKey::new(&k),
+            Err(_) => continue,
+        };
+        match swarm.get_record(key).await {
+            Ok(kad::GetRecordOk::FoundRecord(peer_record)) => {
+                match auth::verify_whitelist(&net, &entry.name, &peer_record.record.value, &entry) {
+                    Ok(doc) => {
+                        if let Ok(mut c) = cache.write()
+                            && let Err(e) = c.insert_whitelist(&entry.name, doc)
+                        {
+                            LogStruct::new(
+                                LogLevel::Warning,
+                                "白名单写入缓存失败",
+                                format!("{}: {}", entry.name, e),
+                            )
+                            .emit();
+                        }
+                    }
+                    Err(e) => {
+                        LogStruct::new(
+                            LogLevel::Warning,
+                            "白名单校验失败",
+                            format!("{}: {}", entry.name, e),
+                        )
+                        .emit();
+                    }
+                }
+            }
+            Ok(_) => {}
+            Err(e) => {
+                LogStruct::new(
+                    LogLevel::Warning,
+                    "白名单查询失败",
+                    format!("{}: {}", entry.name, e),
+                )
+                .emit();
+            }
+        }
+    }
+}
+
+/// 解析 `add_key` 的 `value` / `value_b64`，返回待写入字节
+///
+/// 二者都存在时优先 `value`（UTF-8 文本）；均缺省返回 `Ok(None)`
+fn parse_add_key_value(json: &serde_json::Value) -> Result<Option<Vec<u8>>, String> {
+    if let Some(v) = json.get("value") {
+        return v
+            .as_str()
+            .map(|s| Some(s.as_bytes().to_vec()))
+            .ok_or_else(|| "'value' must be a string".to_string());
+    }
+    if let Some(v) = json.get("value_b64") {
+        let s = v
+            .as_str()
+            .ok_or_else(|| "'value_b64' must be a string".to_string())?;
+        return STANDARD
+            .decode(s)
+            .map(Some)
+            .map_err(|e| format!("invalid base64 in 'value_b64': {e}"));
+    }
+    Ok(None)
+}
+
 fn extract_peer_id_from_multiaddr(addr: &Multiaddr) -> Option<PeerId> {
     let iter = addr.iter();
     for proto in iter {
@@ -934,7 +1265,9 @@ fn bootstrap_addrs_from(addrs: &[Multiaddr], peer_id: PeerId) -> Vec<Multiaddr> 
 
 #[cfg(test)]
 mod tests {
-    use super::{bootstrap_addrs_from, is_dual_stack_addrs, relay_backoff_secs};
+    use super::{
+        bootstrap_addrs_from, is_dual_stack_addrs, parse_add_key_value, relay_backoff_secs,
+    };
     use libp2p::multiaddr::Protocol;
     use libp2p::{Multiaddr, PeerId};
     use std::str::FromStr;
@@ -992,5 +1325,35 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn parse_add_key_value_prefers_text() {
+        let v = serde_json::json!({"value": "hi", "value_b64": "aGk="});
+        assert_eq!(parse_add_key_value(&v).unwrap(), Some(b"hi".to_vec()));
+    }
+
+    #[test]
+    fn parse_add_key_value_decodes_b64() {
+        let v = serde_json::json!({"value_b64": "aGk="});
+        assert_eq!(parse_add_key_value(&v).unwrap(), Some(b"hi".to_vec()));
+    }
+
+    #[test]
+    fn parse_add_key_value_none() {
+        let v = serde_json::json!({"key": "k"});
+        assert_eq!(parse_add_key_value(&v).unwrap(), None);
+    }
+
+    #[test]
+    fn parse_add_key_value_rejects_bad_base64() {
+        let v = serde_json::json!({"value_b64": "!!!"});
+        assert!(parse_add_key_value(&v).is_err());
+    }
+
+    #[test]
+    fn parse_add_key_value_rejects_non_string() {
+        let v = serde_json::json!({"value": 123});
+        assert!(parse_add_key_value(&v).is_err());
     }
 }
