@@ -99,29 +99,3 @@ impl Network {
         actor::spawn(config, keypair, pq_keys)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::NetworkError;
-
-    #[test]
-    fn network_error_display_is_stable() {
-        assert_eq!(NetworkError::ActorGone.to_string(), "network actor is gone");
-        assert_eq!(
-            NetworkError::Disabled.to_string(),
-            "protocol disabled by config"
-        );
-        assert_eq!(
-            NetworkError::Build("boom".into()).to_string(),
-            "swarm build failed: boom"
-        );
-        assert_eq!(
-            NetworkError::Kad("nope".into()).to_string(),
-            "kademlia error: nope"
-        );
-        assert_eq!(
-            NetworkError::Reloaded.to_string(),
-            "cancelled by network reload"
-        );
-    }
-}

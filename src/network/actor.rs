@@ -110,6 +110,7 @@ pub enum NetworkEvent {
     /// 本轮 Swarm 生命周期内首次 bootstrap 成功。
     BootstrapCompleted,
     InboundServiceRequest {
+        peer: PeerId,
         request_id: String,
         service: String,
         payload: Vec<u8>,
@@ -552,6 +553,7 @@ impl SwarmActor {
     ) {
         match event {
             request_response::Event::Message {
+                peer,
                 connection_id,
                 message,
                 ..
@@ -579,6 +581,7 @@ impl SwarmActor {
                     );
 
                     let _ = self.event_tx.send(NetworkEvent::InboundServiceRequest {
+                        peer,
                         request_id: request_id.clone(),
                         service: request.service,
                         payload: request.payload,
@@ -633,6 +636,7 @@ impl SwarmActor {
     ) {
         match event {
             request_response::Event::Message {
+                peer,
                 connection_id,
                 message,
                 ..
@@ -661,6 +665,7 @@ impl SwarmActor {
                         (connection_id, PendingInbound::Pq { channel, inbound }),
                     );
                     let _ = self.event_tx.send(NetworkEvent::InboundServiceRequest {
+                        peer,
                         request_id: request_id.clone(),
                         service: req.service,
                         payload: req.payload,

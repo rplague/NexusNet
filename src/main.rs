@@ -15,6 +15,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+mod auth;
 mod boot;
 mod config;
 mod log;
@@ -23,16 +24,21 @@ mod node_controller;
 mod paths;
 mod service_dispatcher;
 mod service_protocol;
+mod sidecar_protocol;
 
 use log::{LogLevel, LogStruct};
 use network::{KeyManager, Network};
-use node_controller::NodeController;
+use node_controller::{NodeController, auth_refresher};
 use std::error::Error;
+use std::sync::{Arc, RwLock};
+use tokio::sync::Notify;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::sync::watch;
 
-use crate::service_dispatcher::{Command, ServiceDispatcher};
+use crate::auth::AuthCache;
+use crate::service_dispatcher::{ControlRequest, ServiceDispatcher};
+use crate::sidecar_protocol::Message;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -92,10 +98,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 _ = sighup.recv() => {
                     LogStruct::new(LogLevel::Warning, "收到 SIGHUP", "重新加载配置并重建网络...").emit();
                     let (resp_tx, _resp_rx) = oneshot::channel();
-                    let _ = reload_tx.send(Command {
-                        prefix: "@".to_string(),
-                        content: "reload_config".to_string(),
-                        payload: Vec::new(),
+                    let _ = reload_tx.send(ControlRequest {
+                        msg: Message::ReloadConfig {
+                            id: uuid::Uuid::new_v4(),
+                        },
                         resp_tx,
                     });
                 }
@@ -104,6 +110,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
         LogStruct::new(LogLevel::Warning, "收到退出信号", "正在优雅关闭...").emit();
         let _ = shutdown_tx.send(true);
     });
+
+    // 鉴权缓存与后台刷新任务
+    let auth_cache = Arc::new(RwLock::new(AuthCache::default()));
+    let auth_notify = Arc::new(Notify::new());
+    tokio::spawn(auth_refresher(
+        config_handle.clone(),
+        network.handle.clone(),
+        auth_cache.clone(),
+        auth_notify.clone(),
+        shutdown_rx.clone(),
+    ));
 
     let dispatcher = ServiceDispatcher::new(
         inbound_req_rx,
@@ -122,6 +139,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         inbound_req_tx,
         network,
         shutdown_rx,
+        auth_cache,
+        auth_notify,
     );
     if let Err(e) = controller.run().await {
         LogStruct::new(LogLevel::Critical, "节点运行错误", e.to_string()).emit();

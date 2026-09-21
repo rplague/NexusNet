@@ -126,6 +126,7 @@ record_ttl_secs = 3600
 name = "cmd"
 host = "127.0.0.1"
 port = 5014
+require_auth = false
 
 [services.relay]
 retry_interval_secs = 60
@@ -135,6 +136,14 @@ max_failures = 3
 pq_transport_enabled = false
 pq_identity_enabled = false
 pq_required = false
+
+[auth]
+network = "none"                 # "none" = 不鉴权
+cache_ttl_secs = 300
+refresh_interval_secs = 60
+
+[auth.networks.myorg]            # 每个鉴权网络的信任锚
+authority = "<base64 ed25519 公钥>"
 ```
 
 所有字段均有 `#[serde(default)]`，省略即默认值。
@@ -155,6 +164,7 @@ boot::init()
   ├─ Network::start() → 构建 Swarm 并启动 SwarmActor
   ├─ 拨号所有 bootstrap 节点
   ├─ 启动 ServiceDispatcher（后台 tokio::spawn）
+  ├─ 启动 auth_refresher（后台鉴权缓存刷新）
    └─ NodeController::run()（主协程）
         tokio::select! {
             event_rx → 网络事件
@@ -175,54 +185,50 @@ boot::init()
 | **network** | 网络层门面：身份、地址探测、行为装配、Swarm Actor（`network/identity`、`network/addr`、`network/behaviour`、`network/builder`、`network/actor`） |
 | **config** | 提供ConfigHandle |
 | **service_protocol** | 提供通讯协议 |
+| **auth** | 鉴权记录层：COSE_Sign1 验签、TUF-lite 一致性防护、内存缓存与判定 |
 | **log** | 自动检测输出模式：systemd 下交 journald，其余终端+文件轮转 |
 
-## 后端帧协议（TCP）
+## 后端协议（TCP，v2）
 
-NexusNet 与后端进程之间使用**持久 TCP 连接**，由节点主动发起连接。
+NexusNet 与后端进程之间使用**持久 TCP 连接**，由节点主动发起连接。协议为 **CBOR + CDDL** 契约，规范见 [docs/sidecar.cddl](./docs/sidecar.cddl)。
 
-### 普通响应帧
-
-```text
-[4B uuid_len: u32 BE][uuid_str: N bytes][4B payload_len: u32 BE][payload: N bytes]
-```
-
-- `uuid_len = 0` 时表示控制指令（见下节）
-- `uuid_len > 0` 时：读取 UUID 字符串，在 pending_map 中匹配并唤醒等待者
-- 响应以 UUID 关联回原始请求
-
-### 控制指令帧（uuid_len = 0）
+### 帧
 
 ```text
-[4B 0x00000000][4B payload_len: u32 BE][payload: "prefix|content|rest"]
+u32_be(len) || cbor(message)      # len <= 16 MiB
 ```
 
-节点收到后解析为 `Command { prefix, content, payload }`，经 `cmd_tx` 发送给 NodeController，结果写回后端。
+连接建立后双方首帧必须是 `hello { version }`，版本不兼容则断开。
 
-### 节点→后端请求帧
+### 消息
 
-```text
-[4B uuid_len: u32 BE][uuid_str: N bytes][4B payload_len: u32 BE][payload: N bytes]
-```
+判别字段为文本 `t`：
 
-- UUID 由 `Uuid::new_v4()` 生成
-- 发送前将 `(uuid, oneshot::Sender)` 存入 `pending_map`
-- 默认超时 30 秒，超时自动清理 pending 条目
+| `t` | 方向 | 说明 |
+|---|---|---|
+| `hello` | 双向 | 握手与版本协商 |
+| `request` | 节点→后端 | 转发入站服务请求 `{ id, service, payload }` |
+| `reply` | 双向 | 关联回复 `{ id, ok, result?, error? }` |
+| `list_services` / `discover_providers` / `query_public_ip` / `reconnect_bootstrap` / `reannounce_services` / `reload_config` / `relay_status` / `pq_status` / `auth_status` / `query_key` / `add_key` / `service_request` / `service_request_to` | 后端→节点 | 控制指令，节点以 `reply` 应答 |
+
+- 关联 id 为 UUID；`reply.result` 是该 op 自定的 **CBOR** 字节。
+- `add_key` 的 `value` 为 `bstr`，二进制安全（无需 base64）。
+- 默认超时 30 秒，超时以 `error{code:"timeout"}` 应答。
 
 ## P2P 服务调用流程
 
 ```text
-后端进程 → 控制指令(uuid_len=0, "prefix|content|payload")
+后端进程 → 控制消息(service_request, CBOR)
   → ServiceDispatcher.backend_read_loop
-  → Command(cmd_tx) → NodeController.handle_command()
+  → ControlRequest(cmd_tx) → NodeController.handle_command()
   → discover_providers(service) → DHT get_providers
   → RTT 排序选最优点
   → send_request_to_peer(peer, service, payload)
   → CBOR Request-Response (libp2p)
   → 远程 NodeController → InboundServiceRequest(inbound_req_tx)
   → 远程 ServiceDispatcher.handle_request_with_backend()
-  → UUID 帧 → 远程后端进程
-  → 响应沿原路返回
+  → request 帧 → 远程后端进程
+  → reply 沿原路返回
 ```
 
 ## 服务注册与发现
@@ -230,9 +236,9 @@ NexusNet 与后端进程之间使用**持久 TCP 连接**，由节点主动发�
 - 本地服务列表由 `config.services.dispatcher.local_services` 定义
 - Bootstrap 成功（首次 DHT 查询完成）后自动调用 `start_providing`，key 为 `/oahd/service/<name>`
 - 同步 `/oahd/service/types` 全局服务类型记录（put_record/get_record）
-- `@list_services` → 查询全局服务类型
-- `@discover_providers` → DHT get_providers 获取提供者列表
-- `call_service()` → 查询提供者，RTT 排序选优，P2P 调用
+- `list_services` → 查询全局服务类型
+- `discover_providers` → DHT get_providers 获取提供者列表
+- `service_request` → 查询提供者，RTT 排序选优，P2P 调用
 
 ## 抗量子加密
 
@@ -251,6 +257,31 @@ NexusNet 与后端进程之间使用**持久 TCP 连接**，由节点主动发�
 | `crypto.pq_identity_enabled` | 附带并校验 ML-DSA 签名 |
 | `crypto.pq_required` | 强制 PQ，拒绝非 PQ 对端 |
 
+## 鉴权
+
+可选的服务级访问控制。节点加入一个**鉴权网络**，权威方（边车）把签名白名单发布到 DHT；
+节点收到服务请求时按「DHT 为准 + fail-closed」判定，通过才转发给本地后端。
+
+- **信任模型**：记录由权威 ed25519 私钥签名，DHT 仅作传输；接收方验签后才信任（防伪造、防回滚与重放）。
+- **记录**：`/oahd/auth/<net_hash>/service`（索引）与 `/oahd/auth/<net_hash>/<service>`（白名单），
+  值为 COSE_Sign1；`net_hash = base64url_nopad(SHA-256(network))`。
+- **服务开关**：`services.dispatcher.local_services[].require_auth`。
+- **判定**：鉴权关闭或服务未要求鉴权 → 放行；索引/白名单缺失、过期、验签失败 → 拒绝；
+  服务不在索引 → 放行并自动把本地 `require_auth` 置为 `false`（网络同步）。
+- **边车发布**：签名记录经本地后端控制消息 `add_key { key, value }` 发布（`value` 为 `bstr`，二进制安全）；
+  在 `expires_at` 前重发续期。
+- **状态查询**：`auth_status`。
+
+完整记录格式、发布流程与验证算法见 [docs/auth.md](./docs/auth.md)。
+
+| 配置 | 含义 |
+|---|---|
+| `auth.network` | 鉴权网络名；`"none"` 表示不鉴权 |
+| `auth.networks.<name>.authority` | 该网络权威 ed25519 公钥（base64） |
+| `auth.cache_ttl_secs` | 白名单/索引本地缓存有效期（默认 300s） |
+| `auth.refresh_interval_secs` | 后台刷新间隔（默认 60s） |
+| `require_auth` | 单个本地服务是否要求鉴权 |
+
 ## 日志
 
 输出模式**自动检测**：
@@ -267,7 +298,7 @@ NexusNet 与后端进程之间使用**持久 TCP 连接**，由节点主动发�
 
 ## 开发状态
 
-当前版本：**0.4.0** — 完成度 **5.5/10**
+当前版本：**0.4.1** — 完成度 **5.5/10**
 
 ## 许可
 
