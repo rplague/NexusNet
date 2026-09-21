@@ -754,7 +754,11 @@ impl NodeController {
                 let key = format!("/oahd/service/{}", service);
                 let record_key = kad::RecordKey::new(&key);
                 match self.swarm.get_providers(record_key).await {
-                    Ok(providers) => Some(Ok(to_cbor(&providers))),
+                    Ok(providers) => {
+                        let providers: Vec<String> =
+                            providers.into_iter().map(|p| p.to_string()).collect();
+                        Some(Ok(to_cbor(&providers)))
+                    }
                     Err(e) => Some(Err(format!("{e:?}"))),
                 }
             }
