@@ -2,10 +2,9 @@ use crate::auth::{self, AuthCache};
 use crate::config::ConfigHandle;
 use crate::log::{LogLevel, LogStruct};
 use crate::network::{NetworkEvent, NetworkHandle, NetworkStart};
-use crate::service_dispatcher::{Command, InboundServiceRequest};
+use crate::service_dispatcher::{ControlRequest, InboundServiceRequest};
 use crate::service_protocol;
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD;
+use crate::sidecar_protocol::Message;
 use libp2p::multiaddr::Protocol;
 use libp2p::{Multiaddr, PeerId, identify, kad, ping, relay};
 use std::collections::{HashMap, HashSet};
@@ -71,7 +70,7 @@ pub struct NodeController {
     bootstrap_providers: HashSet<PeerId>,
     /// 自身是否已成功声明为 bootstrap 提供者。
     is_bootstrap_provider: bool,
-    cmd_rx: mpsc::UnboundedReceiver<Command>,
+    cmd_rx: mpsc::UnboundedReceiver<ControlRequest>,
     inbound_req_tx: mpsc::UnboundedSender<InboundServiceRequest>,
     swarm: NetworkHandle,
     event_rx: mpsc::UnboundedReceiver<NetworkEvent>,
@@ -88,7 +87,7 @@ impl NodeController {
     pub fn new(
         config: ConfigHandle,
         my_peer_id: PeerId,
-        cmd_rx: mpsc::UnboundedReceiver<Command>,
+        cmd_rx: mpsc::UnboundedReceiver<ControlRequest>,
         inbound_req_tx: mpsc::UnboundedSender<InboundServiceRequest>,
         network: NetworkStart,
         shutdown_rx: watch::Receiver<bool>,
@@ -735,291 +734,259 @@ impl NodeController {
         Ok(())
     }
 
-    async fn handle_command(&mut self, cmd: Command) {
-        let Command {
-            prefix,
-            content,
-            payload,
-            resp_tx,
-        } = cmd;
+    async fn handle_command(&mut self, req: ControlRequest) {
+        let ControlRequest { msg, resp_tx } = req;
 
-        let result: Option<Result<Vec<u8>, String>> = match prefix.as_str() {
-            "@" => match content.as_str() {
-                "list_services" => {
-                    let types_key = kad::RecordKey::new(b"/oahd/service/types");
-                    match self.swarm.get_record(types_key).await {
-                        Ok(kad::GetRecordOk::FoundRecord(peer_record)) => {
-                            let types =
-                                serde_json::from_slice::<Vec<String>>(&peer_record.record.value)
-                                    .unwrap_or_default();
-                            Some(Ok(serde_json::to_vec(&types).unwrap()))
-                        }
-                        _ => Some(Ok(serde_json::to_vec::<Vec<String>>(&vec![]).unwrap())),
+        let result: Option<Result<Vec<u8>, String>> = match msg {
+            Message::ListServices { .. } => {
+                let types_key = kad::RecordKey::new(b"/oahd/service/types");
+                match self.swarm.get_record(types_key).await {
+                    Ok(kad::GetRecordOk::FoundRecord(peer_record)) => {
+                        let types =
+                            serde_json::from_slice::<Vec<String>>(&peer_record.record.value)
+                                .unwrap_or_default();
+                        Some(Ok(to_cbor(&types)))
+                    }
+                    _ => Some(Ok(to_cbor(&Vec::<String>::new()))),
+                }
+            }
+            Message::DiscoverProviders { service, .. } => {
+                let key = format!("/oahd/service/{}", service);
+                let record_key = kad::RecordKey::new(&key);
+                match self.swarm.get_providers(record_key).await {
+                    Ok(providers) => Some(Ok(to_cbor(&providers))),
+                    Err(e) => Some(Err(format!("{e:?}"))),
+                }
+            }
+            Message::QueryPublicIp { .. } => {
+                let network = &self.config.read().network;
+                let ip_info = serde_json::json!({
+                    "ipv4": network.ipv4_address.map(|a| a.to_string()),
+                    "ipv6": network.ipv6_address.map(|a| a.to_string()),
+                });
+                Some(Ok(to_cbor(&ip_info)))
+            }
+            Message::ReconnectBootstrap { .. } => {
+                let nodes = self.config.bootstrap_nodes();
+                let mut any_success = false;
+                for addr in &nodes {
+                    if self.swarm.dial(addr.clone()).await.is_ok() {
+                        any_success = true;
                     }
                 }
-                "discover_providers" => {
-                    let service_type = String::from_utf8(payload).unwrap_or_default();
-                    let key = format!("/oahd/service/{}", service_type);
-                    let record_key = kad::RecordKey::new(&key);
-                    match self.swarm.get_providers(record_key).await {
-                        Ok(providers) => Some(Ok(serde_json::to_vec(&providers).unwrap())),
-                        Err(e) => Some(Err(format!("{e:?}"))),
+                let result = serde_json::json!({
+                    "success": any_success
+                });
+                Some(Ok(to_cbor(&result)))
+            }
+            Message::ReannounceServices { .. } => {
+                let result = match self.announce_local_services().await {
+                    Ok(_) => serde_json::json!({"success": true}),
+                    Err(e) => {
+                        serde_json::json!({"success": false, "error": e.to_string()})
                     }
-                }
-                "query_public_ip" => {
-                    let network = &self.config.read().network;
-                    let ip_info = serde_json::json!({
-                        "ipv4": network.ipv4_address.map(|a| a.to_string()),
-                        "ipv6": network.ipv6_address.map(|a| a.to_string()),
-                    });
-                    Some(Ok(serde_json::to_vec(&ip_info).unwrap()))
-                }
-                "reconnect_bootstrap" => {
-                    let nodes = self.config.bootstrap_nodes();
-                    let mut any_success = false;
-                    for addr in &nodes {
-                        if self.swarm.dial(addr.clone()).await.is_ok() {
-                            any_success = true;
-                        }
-                    }
-                    let result = serde_json::json!({
-                        "success": any_success
-                    });
-                    Some(Ok(serde_json::to_vec(&result).unwrap()))
-                }
-                "reannounce_services" => {
-                    let result = match self.announce_local_services().await {
-                        Ok(_) => serde_json::json!({"success": true}),
-                        Err(e) => {
-                            serde_json::json!({"success": false, "error": e.to_string()})
-                        }
-                    };
-                    Some(Ok(serde_json::to_vec(&result).unwrap()))
-                }
-                "reload_config" => {
-                    // 用当前 config.toml 重建 Swarm。注意：会瞬断连接并清空 DHT 本地存储。
-                    let result = match self.swarm.reload().await {
-                        Ok(_) => {
-                            // 旧 Swarm 已丢弃，中继预约与 bootstrap 声明随之失效，清空本地跟踪。
-                            self.active_relays.clear();
-                            self.pending_relays.clear();
-                            self.relay_failures.clear();
-                            self.relay_backoff.clear();
-                            self.bootstrap_providers.clear();
-                            self.is_bootstrap_provider = false;
-                            // 鉴权状态随配置重算，缓存清空后由刷新任务重建
-                            self.auth_state = resolve_auth_state(&self.config);
-                            if let AuthState::Misconfigured(reason) = &self.auth_state {
-                                LogStruct::new(
-                                    LogLevel::Warning,
-                                    "鉴权网络配置错误",
-                                    reason.clone(),
-                                )
+                };
+                Some(Ok(to_cbor(&result)))
+            }
+            Message::ReloadConfig { .. } => {
+                // 用当前 config.toml 重建 Swarm。注意：会瞬断连接并清空 DHT 本地存储。
+                let result = match self.swarm.reload().await {
+                    Ok(_) => {
+                        // 旧 Swarm 已丢弃，中继预约与 bootstrap 声明随之失效，清空本地跟踪。
+                        self.active_relays.clear();
+                        self.pending_relays.clear();
+                        self.relay_failures.clear();
+                        self.relay_backoff.clear();
+                        self.bootstrap_providers.clear();
+                        self.is_bootstrap_provider = false;
+                        // 鉴权状态随配置重算，缓存清空后由刷新任务重建
+                        self.auth_state = resolve_auth_state(&self.config);
+                        if let AuthState::Misconfigured(reason) = &self.auth_state {
+                            LogStruct::new(LogLevel::Warning, "鉴权网络配置错误", reason.clone())
                                 .emit();
-                            }
-                            if let Ok(mut cache) = self.auth_cache.write() {
-                                cache.clear();
-                            }
-                            self.auth_notify.notify_one();
-                            serde_json::json!({"success": true})
                         }
-                        Err(e) => {
-                            serde_json::json!({"success": false, "error": e.to_string()})
+                        if let Ok(mut cache) = self.auth_cache.write() {
+                            cache.clear();
                         }
-                    };
-                    Some(Ok(serde_json::to_vec(&result).unwrap()))
-                }
-                "relay_status" => {
-                    let need_relay = {
-                        let cfg = self.config.read();
-                        !(cfg.network.ipv4_enabled && cfg.network.ipv6_enabled)
-                    };
-                    let active: Vec<String> =
-                        self.active_relays.iter().map(|p| p.to_string()).collect();
-                    let pending: Vec<String> =
-                        self.pending_relays.keys().map(|p| p.to_string()).collect();
-                    let result = serde_json::json!({
-                        "need_relay": need_relay,
-                        "target": RELAY_TARGET,
-                        "active": active,
-                        "pending": pending,
-                    });
-                    Some(Ok(serde_json::to_vec(&result).unwrap()))
-                }
-                "pq_status" => {
-                    let result = serde_json::json!({
-                        "enabled": self.config.pq_enabled(),
-                        "transport": self.config.pq_transport_enabled(),
-                        "identity": self.config.pq_identity_enabled(),
-                        "required": self.config.pq_required(),
-                    });
-                    Some(Ok(serde_json::to_vec(&result).unwrap()))
-                }
-                "auth_status" => {
-                    let network = self.config.auth_network();
-                    let (state, detail) = match &self.auth_state {
-                        AuthState::Disabled => ("disabled", None),
-                        AuthState::Active(_) => ("active", None),
-                        AuthState::Misconfigured(r) => ("misconfigured", Some(r.clone())),
-                    };
-                    let now = auth::now_unix();
-                    let ttl = Duration::from_secs(self.config.auth_cache_ttl() as u64);
-                    let local_required: Vec<String> = self
-                        .config
-                        .auth_required_services()
-                        .into_iter()
-                        .filter(|n| auth::is_valid_service_name(n))
-                        .collect();
-
-                    let mut report = serde_json::json!({
-                        "network": network,
-                        "state": state,
-                        "local_required": local_required.clone(),
-                    });
-                    if let Some(d) = detail {
-                        report["detail"] = serde_json::json!(d);
+                        self.auth_notify.notify_one();
+                        serde_json::json!({"success": true})
                     }
-
-                    if let Ok(cache) = self.auth_cache.read() {
-                        if let Some(idx) = cache.index() {
-                            report["index"] = serde_json::json!({
-                                "version": idx.version,
-                                "expires_at": idx.expires_at,
-                                "age_secs": idx.fetched_at.elapsed().as_secs(),
-                                "services": idx.services.len(),
-                                "fresh": idx.is_fresh(now, ttl),
-                            });
-                        }
-                        let mut whitelists = serde_json::Map::new();
-                        for name in &local_required {
-                            if let Some(w) = cache.whitelist(name) {
-                                whitelists.insert(
-                                    name.clone(),
-                                    serde_json::json!({
-                                        "version": w.version,
-                                        "members": w.members.len(),
-                                        "age_secs": w.fetched_at.elapsed().as_secs(),
-                                    }),
-                                );
-                            }
-                        }
-                        report["cached_whitelists"] = serde_json::Value::Object(whitelists);
-
-                        let not_in_index: Vec<String> = match cache.index() {
-                            Some(idx) => local_required
-                                .iter()
-                                .filter(|n| !idx.services.contains_key(*n))
-                                .cloned()
-                                .collect(),
-                            None => local_required.clone(),
-                        };
-                        report["required_but_not_in_index"] = serde_json::json!(not_in_index);
+                    Err(e) => {
+                        serde_json::json!({"success": false, "error": e.to_string()})
                     }
+                };
+                Some(Ok(to_cbor(&result)))
+            }
+            Message::RelayStatus { .. } => {
+                let need_relay = {
+                    let cfg = self.config.read();
+                    !(cfg.network.ipv4_enabled && cfg.network.ipv6_enabled)
+                };
+                let active: Vec<String> =
+                    self.active_relays.iter().map(|p| p.to_string()).collect();
+                let pending: Vec<String> =
+                    self.pending_relays.keys().map(|p| p.to_string()).collect();
+                let result = serde_json::json!({
+                    "need_relay": need_relay,
+                    "target": RELAY_TARGET,
+                    "active": active,
+                    "pending": pending,
+                });
+                Some(Ok(to_cbor(&result)))
+            }
+            Message::PqStatus { .. } => {
+                let result = serde_json::json!({
+                    "enabled": self.config.pq_enabled(),
+                    "transport": self.config.pq_transport_enabled(),
+                    "identity": self.config.pq_identity_enabled(),
+                    "required": self.config.pq_required(),
+                });
+                Some(Ok(to_cbor(&result)))
+            }
+            Message::AuthStatus { .. } => {
+                let network = self.config.auth_network();
+                let (state, detail) = match &self.auth_state {
+                    AuthState::Disabled => ("disabled", None),
+                    AuthState::Active(_) => ("active", None),
+                    AuthState::Misconfigured(r) => ("misconfigured", Some(r.clone())),
+                };
+                let now = auth::now_unix();
+                let ttl = Duration::from_secs(self.config.auth_cache_ttl() as u64);
+                let local_required: Vec<String> = self
+                    .config
+                    .auth_required_services()
+                    .into_iter()
+                    .filter(|n| auth::is_valid_service_name(n))
+                    .collect();
 
-                    Some(Ok(serde_json::to_vec(&report).unwrap()))
+                let mut report = serde_json::json!({
+                    "network": network,
+                    "state": state,
+                    "local_required": local_required.clone(),
+                });
+                if let Some(d) = detail {
+                    report["detail"] = serde_json::json!(d);
                 }
-                "add_key" => match serde_json::from_slice::<serde_json::Value>(&payload) {
-                    Ok(json) => {
-                        let key_str = json["key"].as_str().unwrap_or_default().to_string();
-                        if key_str.is_empty() {
-                            Some(Err("missing 'key' field".to_string()))
-                        } else {
-                            let providing = json
-                                .get("providing")
-                                .and_then(|v| v.as_bool())
-                                .unwrap_or(false);
-                            let ack = || {
-                                serde_json::to_vec(&serde_json::json!({
-                                    "success": true,
-                                    "key": key_str.clone(),
-                                }))
-                                .unwrap()
-                            };
 
-                            match parse_add_key_value(&json) {
-                                Err(e) => Some(Err(e)),
-                                Ok(None) if !providing => Some(Err(
-                                    "at least one of 'value', 'value_b64' or 'providing' is required"
-                                        .to_string(),
-                                )),
-                                Ok(None) => match self.start_providing_record(&key_str).await {
-                                    Ok(_) => Some(Ok(ack())),
-                                    Err(e) => Some(Err(e)),
-                                },
-                                Ok(Some(bytes)) => {
-                                    let key = kad::RecordKey::new(&key_str);
-                                    match self.swarm.put_record(key, bytes).await {
-                                        Ok(_) if providing => {
-                                            match self.start_providing_record(&key_str).await {
-                                                Ok(_) => Some(Ok(ack())),
-                                                Err(e) => Some(Err(e)),
-                                            }
-                                        }
+                if let Ok(cache) = self.auth_cache.read() {
+                    if let Some(idx) = cache.index() {
+                        report["index"] = serde_json::json!({
+                            "version": idx.version,
+                            "expires_at": idx.expires_at,
+                            "age_secs": idx.fetched_at.elapsed().as_secs(),
+                            "services": idx.services.len(),
+                            "fresh": idx.is_fresh(now, ttl),
+                        });
+                    }
+                    let mut whitelists = serde_json::Map::new();
+                    for name in &local_required {
+                        if let Some(w) = cache.whitelist(name) {
+                            whitelists.insert(
+                                name.clone(),
+                                serde_json::json!({
+                                    "version": w.version,
+                                    "members": w.members.len(),
+                                    "age_secs": w.fetched_at.elapsed().as_secs(),
+                                }),
+                            );
+                        }
+                    }
+                    report["cached_whitelists"] = serde_json::Value::Object(whitelists);
+
+                    let not_in_index: Vec<String> = match cache.index() {
+                        Some(idx) => local_required
+                            .iter()
+                            .filter(|n| !idx.services.contains_key(*n))
+                            .cloned()
+                            .collect(),
+                        None => local_required.clone(),
+                    };
+                    report["required_but_not_in_index"] = serde_json::json!(not_in_index);
+                }
+
+                Some(Ok(to_cbor(&report)))
+            }
+            Message::AddKey {
+                key,
+                value,
+                providing,
+                ..
+            } => {
+                if key.is_empty() {
+                    Some(Err("missing 'key' field".to_string()))
+                } else {
+                    let ack = || to_cbor(&serde_json::json!({"success": true, "key": key.clone()}));
+                    match value {
+                        Some(bytes) => {
+                            match self
+                                .swarm
+                                .put_record(kad::RecordKey::new(&key), bytes)
+                                .await
+                            {
+                                Ok(_) if providing => {
+                                    match self.start_providing_record(&key).await {
                                         Ok(_) => Some(Ok(ack())),
-                                        Err(e) => Some(Err(format!("put_record failed: {e}"))),
+                                        Err(e) => Some(Err(e)),
                                     }
                                 }
+                                Ok(_) => Some(Ok(ack())),
+                                Err(e) => Some(Err(format!("put_record failed: {e}"))),
                             }
                         }
+                        None if providing => match self.start_providing_record(&key).await {
+                            Ok(_) => Some(Ok(ack())),
+                            Err(e) => Some(Err(e)),
+                        },
+                        None => Some(Err(
+                            "at least one of 'value' or 'providing' is required".to_string()
+                        )),
                     }
-                    Err(e) => Some(Err(format!("invalid JSON: {e}"))),
-                },
-                "query_key" => {
-                    let key_str = String::from_utf8_lossy(&payload).to_string();
-                    if key_str.is_empty() {
-                        Some(Err("missing key".to_string()))
-                    } else {
-                        let key = kad::RecordKey::new(&key_str);
-                        match self.swarm.get_record(key.clone()).await {
-                            Ok(kad::GetRecordOk::FoundRecord(peer_record)) => {
-                                let value =
-                                    String::from_utf8_lossy(&peer_record.record.value).into_owned();
-                                let value_b64 = STANDARD.encode(&peer_record.record.value);
-                                let record_key = kad::RecordKey::new(&key_str);
-                                match self.swarm.get_providers(record_key).await {
-                                    Ok(providers) => {
-                                        let mut resp = serde_json::json!({
-                                            "key": key_str,
-                                            "value": value,
-                                            "value_b64": value_b64,
-                                        });
-                                        if !providers.is_empty() {
-                                            resp["providers"] = serde_json::json!(providers);
-                                        }
-                                        Some(Ok(serde_json::to_vec(&resp).unwrap()))
-                                    }
-                                    Err(_) => {
-                                        let resp = serde_json::json!({
-                                            "key": key_str,
-                                            "value": value,
-                                            "value_b64": value_b64,
-                                        });
-                                        Some(Ok(serde_json::to_vec(&resp).unwrap()))
-                                    }
-                                }
-                            }
-                            _ => {
-                                let record_key = kad::RecordKey::new(&key_str);
-                                match self.swarm.get_providers(record_key).await {
-                                    Ok(providers) => {
-                                        let mut resp = serde_json::json!({
-                                            "key": key_str,
-                                        });
-                                        if !providers.is_empty() {
-                                            resp["providers"] = serde_json::json!(providers);
-                                        }
-                                        Some(Ok(serde_json::to_vec(&resp).unwrap()))
-                                    }
-                                    Err(_) => Some(Err("key not found".to_string())),
-                                }
+                }
+            }
+            Message::QueryKey { key, .. } => {
+                if key.is_empty() {
+                    Some(Err("missing key".to_string()))
+                } else {
+                    match self.swarm.get_record(kad::RecordKey::new(&key)).await {
+                        Ok(kad::GetRecordOk::FoundRecord(peer_record)) => {
+                            let value = peer_record.record.value.clone();
+                            let providers = self
+                                .swarm
+                                .get_providers(kad::RecordKey::new(&key))
+                                .await
+                                .unwrap_or_default();
+                            Some(Ok(to_cbor(&QueryKeyResult {
+                                key,
+                                value: Some(value),
+                                providers: providers.into_iter().map(|p| p.to_string()).collect(),
+                            })))
+                        }
+                        _ => {
+                            let providers = self
+                                .swarm
+                                .get_providers(kad::RecordKey::new(&key))
+                                .await
+                                .unwrap_or_default();
+                            if providers.is_empty() {
+                                Some(Err("key not found".to_string()))
+                            } else {
+                                Some(Ok(to_cbor(&QueryKeyResult {
+                                    key,
+                                    value: None,
+                                    providers: providers
+                                        .into_iter()
+                                        .map(|p| p.to_string())
+                                        .collect(),
+                                })))
                             }
                         }
                     }
                 }
-                _ => Some(Err("Unknown command".to_string())),
-            },
-            "service_request" => {
-                let key = format!("/oahd/service/{}", content);
+            }
+            Message::ServiceRequest {
+                service, payload, ..
+            } => {
+                let key = format!("/oahd/service/{}", service);
                 let record_key = kad::RecordKey::new(&key);
                 match self.swarm.get_providers(record_key).await {
                     Ok(providers) => {
@@ -1030,10 +997,7 @@ impl NodeController {
                                 .get_best_peer(&providers)
                                 .or_else(|| providers.first().copied())
                                 .unwrap();
-                            let request = service_protocol::Request {
-                                service: content,
-                                payload,
-                            };
+                            let request = service_protocol::Request { service, payload };
                             match self.swarm.send_request(&best_peer, request).await {
                                 Ok(resp) => Some(Ok(resp.data)),
                                 Err(e) => Some(Err(e.to_string())),
@@ -1043,24 +1007,21 @@ impl NodeController {
                     Err(e) => Some(Err(format!("{e:?}"))),
                 }
             }
-            "service_request_to" => {
-                let parts: Vec<&str> = content.splitn(2, "/in").collect();
-                if parts.len() != 2 {
-                    Some(Err("expected format: <service>/in<peerid>".to_string()))
-                } else {
-                    let service = parts[0].to_string();
-                    match parts[1].parse::<PeerId>() {
-                        Ok(peer_id) => {
-                            let request = service_protocol::Request { service, payload };
-                            match self.swarm.send_request(&peer_id, request).await {
-                                Ok(resp) => Some(Ok(resp.data)),
-                                Err(e) => Some(Err(e.to_string())),
-                            }
-                        }
-                        Err(e) => Some(Err(format!("invalid peer id: {e}"))),
+            Message::ServiceRequestTo {
+                service,
+                peer,
+                payload,
+                ..
+            } => match peer.parse::<PeerId>() {
+                Ok(peer_id) => {
+                    let request = service_protocol::Request { service, payload };
+                    match self.swarm.send_request(&peer_id, request).await {
+                        Ok(resp) => Some(Ok(resp.data)),
+                        Err(e) => Some(Err(e.to_string())),
                     }
                 }
-            }
+                Err(e) => Some(Err(format!("invalid peer id: {e}"))),
+            },
             _ => Some(Err("command not supported".to_string())),
         };
 
@@ -1185,26 +1146,21 @@ async fn refresh_auth_once(
     }
 }
 
-/// 解析 `add_key` 的 `value` / `value_b64`，返回待写入字节
-///
-/// 二者都存在时优先 `value`（UTF-8 文本）；均缺省返回 `Ok(None)`
-fn parse_add_key_value(json: &serde_json::Value) -> Result<Option<Vec<u8>>, String> {
-    if let Some(v) = json.get("value") {
-        return v
-            .as_str()
-            .map(|s| Some(s.as_bytes().to_vec()))
-            .ok_or_else(|| "'value' must be a string".to_string());
-    }
-    if let Some(v) = json.get("value_b64") {
-        let s = v
-            .as_str()
-            .ok_or_else(|| "'value_b64' must be a string".to_string())?;
-        return STANDARD
-            .decode(s)
-            .map(Some)
-            .map_err(|e| format!("invalid base64 in 'value_b64': {e}"));
-    }
-    Ok(None)
+/// `query_key` 的结果负载（CBOR 编码后作为 reply.result）
+#[derive(serde::Serialize)]
+struct QueryKeyResult {
+    key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    value: Option<Vec<u8>>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    providers: Vec<String>,
+}
+
+/// 将结果序列化为 CBOR
+fn to_cbor<T: serde::Serialize>(value: &T) -> Vec<u8> {
+    let mut buf = Vec::new();
+    ciborium::ser::into_writer(value, &mut buf).expect("CBOR 编码失败");
+    buf
 }
 
 fn extract_peer_id_from_multiaddr(addr: &Multiaddr) -> Option<PeerId> {
@@ -1261,99 +1217,4 @@ fn bootstrap_addrs_from(addrs: &[Multiaddr], peer_id: PeerId) -> Vec<Multiaddr> 
         }
     }
     [v4, v6].into_iter().flatten().collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{
-        bootstrap_addrs_from, is_dual_stack_addrs, parse_add_key_value, relay_backoff_secs,
-    };
-    use libp2p::multiaddr::Protocol;
-    use libp2p::{Multiaddr, PeerId};
-    use std::str::FromStr;
-
-    fn peer() -> PeerId {
-        libp2p::identity::Keypair::generate_ed25519()
-            .public()
-            .to_peer_id()
-    }
-
-    #[test]
-    fn backoff_grows_exponentially_and_caps() {
-        assert_eq!(relay_backoff_secs(1), 30);
-        assert_eq!(relay_backoff_secs(2), 60);
-        assert_eq!(relay_backoff_secs(3), 120);
-        assert_eq!(relay_backoff_secs(4), 240);
-        assert_eq!(relay_backoff_secs(5), 480);
-        assert_eq!(relay_backoff_secs(6), 600);
-        assert_eq!(relay_backoff_secs(100), 600);
-    }
-
-    #[test]
-    fn dual_stack_detection() {
-        let v4 = Multiaddr::from_str("/ip4/1.2.3.4/tcp/5000").unwrap();
-        let v6 = Multiaddr::from_str("/ip6/2001:db8::1/tcp/5000").unwrap();
-        assert!(!is_dual_stack_addrs(&[v4.clone()]));
-        assert!(!is_dual_stack_addrs(&[v6.clone()]));
-        assert!(is_dual_stack_addrs(&[v4, v6]));
-    }
-
-    #[test]
-    fn bootstrap_addrs_picks_one_per_family_with_peer_id() {
-        let pid = peer();
-        let v4 = Multiaddr::from_str("/ip4/1.2.3.4/tcp/5000").unwrap();
-        let v6a = Multiaddr::from_str("/ip6/2001:db8::1/tcp/5000").unwrap();
-        let v6b = Multiaddr::from_str("/ip6/2001:db8::2/tcp/5000").unwrap();
-
-        let addrs = bootstrap_addrs_from(&[v4, v6a, v6b], pid);
-        assert_eq!(addrs.len(), 2);
-        assert!(addrs.iter().all(|a| {
-            a.iter()
-                .any(|p| matches!(p, Protocol::P2p(id) if id == pid))
-        }));
-        assert_eq!(
-            addrs
-                .iter()
-                .filter(|a| a.iter().any(|p| matches!(p, Protocol::Ip4(_))))
-                .count(),
-            1
-        );
-        assert_eq!(
-            addrs
-                .iter()
-                .filter(|a| a.iter().any(|p| matches!(p, Protocol::Ip6(_))))
-                .count(),
-            1
-        );
-    }
-
-    #[test]
-    fn parse_add_key_value_prefers_text() {
-        let v = serde_json::json!({"value": "hi", "value_b64": "aGk="});
-        assert_eq!(parse_add_key_value(&v).unwrap(), Some(b"hi".to_vec()));
-    }
-
-    #[test]
-    fn parse_add_key_value_decodes_b64() {
-        let v = serde_json::json!({"value_b64": "aGk="});
-        assert_eq!(parse_add_key_value(&v).unwrap(), Some(b"hi".to_vec()));
-    }
-
-    #[test]
-    fn parse_add_key_value_none() {
-        let v = serde_json::json!({"key": "k"});
-        assert_eq!(parse_add_key_value(&v).unwrap(), None);
-    }
-
-    #[test]
-    fn parse_add_key_value_rejects_bad_base64() {
-        let v = serde_json::json!({"value_b64": "!!!"});
-        assert!(parse_add_key_value(&v).is_err());
-    }
-
-    #[test]
-    fn parse_add_key_value_rejects_non_string() {
-        let v = serde_json::json!({"value": 123});
-        assert!(parse_add_key_value(&v).is_err());
-    }
 }

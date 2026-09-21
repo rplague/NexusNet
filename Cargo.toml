@@ -42,7 +42,7 @@ reqwest = { version = "0.11", default-features = false, features = ["blocking", 
 get_if_addrs = "0.5.3"
 base64 = "0.22"
 scopeguard = "1"
-uuid = "1.23.1"
+uuid = { version = "1.23.1", features = ["serde", "v4"] }
 coset = "0.4"
 ciborium = "0.2"
 ml-kem = { version = "0.3.2", features = ["alloc", "getrandom", "zeroize"] }

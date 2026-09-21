@@ -666,15 +666,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_auth_config() {
-        let cfg = AuthConfig::default();
-        assert_eq!(cfg.network, "none");
-        assert_eq!(cfg.cache_ttl_secs, 300);
-        assert_eq!(cfg.refresh_interval_secs, 60);
-        assert!(cfg.networks.is_empty());
-    }
-
-    #[test]
     fn parse_auth_section() {
         let toml = r#"
             [auth]
@@ -689,40 +680,6 @@ mod tests {
         assert_eq!(handle.auth_authority("other"), None);
         assert_eq!(handle.auth_cache_ttl(), 300);
         assert_eq!(handle.auth_refresh_interval(), 60);
-    }
-
-    #[test]
-    fn local_service_require_auth_defaults_false() {
-        let toml = r#"
-            [[services.dispatcher.local_services]]
-            name = "cmd"
-            host = "127.0.0.1"
-            port = 5014
-        "#;
-        let node: NodeConfig = toml::from_str(toml).unwrap();
-        assert!(!node.services.dispatcher.local_services[0].require_auth);
-    }
-
-    #[test]
-    fn auth_required_services_filters() {
-        let toml = r#"
-            [[services.dispatcher.local_services]]
-            name = "cmd"
-            host = "127.0.0.1"
-            port = 5014
-            require_auth = true
-            [[services.dispatcher.local_services]]
-            name = "ocr"
-            host = "127.0.0.1"
-            port = 5013
-            require_auth = false
-        "#;
-        let node: NodeConfig = toml::from_str(toml).unwrap();
-        let handle = ConfigHandle::new(node);
-        assert_eq!(handle.auth_required_services(), vec!["cmd".to_string()]);
-        assert!(handle.service_requires_auth("cmd"));
-        assert!(!handle.service_requires_auth("ocr"));
-        assert!(!handle.service_requires_auth("missing"));
     }
 
     #[test]

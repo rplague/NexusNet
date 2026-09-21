@@ -1,0 +1,61 @@
+; NexusNet 节点 <-> 边车/后端 协议 v2（CBOR 契约）
+;
+; 线上格式:  u32_be(len) || cbor(message)      len <= 16 MiB
+; 连接建立后双方首帧必须是 hello，据此协商版本。
+
+message = hello / request / reply
+        / list-services / discover-providers / query-public-ip
+        / reconnect-bootstrap / reannounce-services / reload-config
+        / relay-status / pq-status / auth-status
+        / query-key / add-key / service-request / service-request-to
+
+; 关联 id：UUID 的 16 字节
+uuid = bstr .size 16
+
+hello = { t: "hello", version: uint }
+
+request = { t: "request", id: uuid, service: tstr, payload: bstr }
+
+reply = {
+  t: "reply",
+  id: uuid,
+  ok: bool,
+  ? result: bstr,       ; op 自定的 CBOR 字节
+  ? error: error,
+}
+
+error = { code: tstr, message: tstr }
+
+list-services       = { t: "list_services",       id: uuid }
+discover-providers  = { t: "discover_providers",  id: uuid, service: tstr }
+query-public-ip     = { t: "query_public_ip",     id: uuid }
+reconnect-bootstrap = { t: "reconnect_bootstrap", id: uuid }
+reannounce-services = { t: "reannounce_services", id: uuid }
+reload-config       = { t: "reload_config",       id: uuid }
+relay-status        = { t: "relay_status",        id: uuid }
+pq-status           = { t: "pq_status",           id: uuid }
+auth-status         = { t: "auth_status",         id: uuid }
+query-key           = { t: "query_key",           id: uuid, key: tstr }
+add-key             = {
+  t: "add_key",
+  id: uuid,
+  key: tstr,
+  ? value: bstr,
+  ? providing: bool,
+}
+service-request     = { t: "service_request",     id: uuid, service: tstr, payload: bstr }
+service-request-to  = { t: "service_request_to",  id: uuid, service: tstr, peer: tstr, payload: bstr }
+
+; reply.result 的 CBOR 负载（按 op）：
+;   list_services       -> [* tstr]
+;   discover_providers  -> [* tstr]                     ; PeerId 字符串
+;   query_public_ip     -> { ? ipv4: tstr, ? ipv6: tstr }
+;   reconnect_bootstrap -> { success: bool }
+;   reannounce_services -> { success: bool, ? error: tstr }
+;   reload_config       -> { success: bool, ? error: tstr }
+;   relay_status        -> { need_relay: bool, target: uint, active: [* tstr], pending: [* tstr] }
+;   pq_status           -> { enabled: bool, transport: bool, identity: bool, required: bool }
+;   auth_status         -> { network: tstr, state: tstr, local_required: [* tstr], ... }
+;   query_key           -> { key: tstr, ? value: bstr, ? providers: [* tstr] }
+;   add_key             -> { success: bool, key: tstr }
+;   service_request*    -> 原始服务响应字节

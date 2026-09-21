@@ -70,17 +70,17 @@ WhitelistDoc = {
 
 1. 为每个服务构造 `WhitelistDoc`，签名得到 value 字节（`external_aad = service_key`）。
 2. 计算每个 value 的 `SHA-256` 与长度，构造 `IndexDoc`（`external_aad = index_key`），签名。
-3. 经本地后端控制通道发布（标准 base64）：
+3. 经本地后端控制通道发布（CBOR `add_key`，`value` 为 `bstr`，二进制安全）：
 
 ```
-@add_key {"key":"/oahd/auth/<net_hash>/<service>","value_b64":"<base64>"}
-@add_key {"key":"/oahd/auth/<net_hash>/service","value_b64":"<base64>"}
+add_key { t:"add_key", id:<uuid>, key:"/oahd/auth/<net_hash>/<service>", value:<bstr> }
+add_key { t:"add_key", id:<uuid>, key:"/oahd/auth/<net_hash>/service", value:<bstr> }
 ```
 
    **顺序**：先发各服务白名单，再发索引（索引引用其 hash）。
 4. 在 `expires_at` 之前**重发续期**；否则记录过期后节点 fail-closed，拒绝相关服务。
 
-> 本地后端帧协议见 README「后端帧协议（TCP）」；`@add_key` 的 `value_b64` 为二进制安全通道。
+> 本地后端协议见 README「后端协议（TCP，v2）」；规范见 `docs/sidecar.cddl`。
 
 ## 6. 客户端验证算法（TUF-lite）
 
@@ -118,7 +118,7 @@ require_auth = true
 - `authority`：标准 base64 编码的 ed25519 公钥（32 字节）。
 - 若 `network != "none"` 但该网络未配置/非法 `authority`，节点进入 **fail-closed**：拒绝所有 `require_auth` 服务。
 
-### `@auth_status`
+### `auth_status`
 
 返回 JSON：
 

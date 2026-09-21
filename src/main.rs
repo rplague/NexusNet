@@ -24,6 +24,7 @@ mod node_controller;
 mod paths;
 mod service_dispatcher;
 mod service_protocol;
+mod sidecar_protocol;
 
 use log::{LogLevel, LogStruct};
 use network::{KeyManager, Network};
@@ -36,7 +37,8 @@ use tokio::sync::oneshot;
 use tokio::sync::watch;
 
 use crate::auth::AuthCache;
-use crate::service_dispatcher::{Command, ServiceDispatcher};
+use crate::service_dispatcher::{ControlRequest, ServiceDispatcher};
+use crate::sidecar_protocol::Message;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -96,10 +98,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 _ = sighup.recv() => {
                     LogStruct::new(LogLevel::Warning, "收到 SIGHUP", "重新加载配置并重建网络...").emit();
                     let (resp_tx, _resp_rx) = oneshot::channel();
-                    let _ = reload_tx.send(Command {
-                        prefix: "@".to_string(),
-                        content: "reload_config".to_string(),
-                        payload: Vec::new(),
+                    let _ = reload_tx.send(ControlRequest {
+                        msg: Message::ReloadConfig {
+                            id: uuid::Uuid::new_v4(),
+                        },
                         resp_tx,
                     });
                 }

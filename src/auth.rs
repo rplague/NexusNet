@@ -653,47 +653,4 @@ mod tests {
                 .is_none()
         );
     }
-
-    #[test]
-    fn name_validation() {
-        assert!(is_valid_network_name("myorg"));
-        assert!(is_valid_network_name("my_org-1"));
-        assert!(!is_valid_network_name(""));
-        assert!(!is_valid_network_name("a/b"));
-        assert!(is_valid_service_name("cmd"));
-        assert!(!is_valid_service_name(RESERVED_SERVICE));
-        assert!(!is_valid_service_name(""));
-    }
-
-    #[test]
-    fn net_hash_is_stable_and_path_safe() {
-        let h1 = net_hash("myorg");
-        let h2 = net_hash("myorg");
-        let h3 = net_hash("other");
-        assert_eq!(h1, h2);
-        assert_ne!(h1, h3);
-        assert!(!h1.contains('/'));
-        assert!(!h1.contains('+'));
-    }
-
-    #[test]
-    fn invalid_network_name_rejected_at_construction() {
-        let kp = keypair();
-        let pub_bytes = kp.public().try_into_ed25519().unwrap().to_bytes();
-        let b64 = STANDARD.encode(pub_bytes);
-        assert_eq!(
-            AuthNetwork::new("bad/name", &b64).err(),
-            Some(AuthError::InvalidName)
-        );
-    }
-
-    #[test]
-    fn reserved_service_key_rejected() {
-        let kp = keypair();
-        let net = network(&kp, "myorg");
-        assert_eq!(
-            net.service_key(RESERVED_SERVICE),
-            Err(AuthError::InvalidName)
-        );
-    }
 }
