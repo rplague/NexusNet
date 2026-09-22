@@ -847,6 +847,12 @@ impl NodeController {
                 });
                 Some(Ok(to_cbor(&ip_info)))
             }
+            Message::Whoami { .. } => {
+                let result = serde_json::json!({
+                    "peer_id": self.my_peer_id.to_string(),
+                });
+                Some(Ok(to_cbor(&result)))
+            }
             Message::ReconnectBootstrap { .. } => {
                 let nodes = self.config.bootstrap_nodes();
                 let mut any_success = false;

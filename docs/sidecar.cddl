@@ -5,6 +5,7 @@
 
 message = hello / request / reply
         / list-services / discover-providers / query-public-ip
+        / whoami
         / reconnect-bootstrap / reannounce-services / reload-config
         / relay-status / pq-status / auth-status
         / query-key / add-key / service-request / service-request-to
@@ -29,6 +30,7 @@ error = { code: tstr, message: tstr }
 list-services       = { t: "list_services",       id: uuid }
 discover-providers  = { t: "discover_providers",  id: uuid, service: tstr }
 query-public-ip     = { t: "query_public_ip",     id: uuid }
+whoami              = { t: "whoami",              id: uuid }
 reconnect-bootstrap = { t: "reconnect_bootstrap", id: uuid }
 reannounce-services = { t: "reannounce_services", id: uuid }
 reload-config       = { t: "reload_config",       id: uuid }
@@ -50,6 +52,7 @@ service-request-to  = { t: "service_request_to",  id: uuid, service: tstr, peer:
 ;   list_services       -> [* tstr]
 ;   discover_providers  -> [* tstr]                     ; PeerId 字符串
 ;   query_public_ip     -> { ? ipv4: tstr, ? ipv6: tstr }
+;   whoami              -> { peer_id: tstr }
 ;   reconnect_bootstrap -> { success: bool }
 ;   reannounce_services -> { success: bool, ? error: tstr }
 ;   reload_config       -> { success: bool, ? error: tstr }
