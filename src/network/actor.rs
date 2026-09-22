@@ -255,7 +255,11 @@ impl NetworkHandle {
 /// Kademlia 查询挂起表条目。
 enum KadPending {
     GetRecord(oneshot::Sender<Result<kad::GetRecordOk, NetworkError>>),
-    GetProviders(oneshot::Sender<Result<Vec<PeerId>, NetworkError>>),
+    GetProviders {
+        resp: oneshot::Sender<Result<Vec<PeerId>, NetworkError>>,
+        /// 已累积的 provider 集合。libp2p 会分多批回报，需累积到查询终结。
+        providers: HashSet<PeerId>,
+    },
     PutRecord(oneshot::Sender<Result<(), NetworkError>>),
     StartProviding(oneshot::Sender<Result<(), NetworkError>>),
 }
@@ -267,8 +271,8 @@ impl KadPending {
             KadPending::GetRecord(tx) => {
                 let _ = tx.send(Err(err));
             }
-            KadPending::GetProviders(tx) => {
-                let _ = tx.send(Err(err));
+            KadPending::GetProviders { resp, .. } => {
+                let _ = resp.send(Err(err));
             }
             KadPending::PutRecord(tx) => {
                 let _ = tx.send(Err(err));
@@ -277,6 +281,46 @@ impl KadPending {
                 let _ = tx.send(Err(err));
             }
         }
+    }
+}
+
+/// 累积 `GetProviders` 查询的进度事件。
+///
+/// libp2p 会先以 `FoundProviders` 回报本地 store 命中的 provider，再随 DHT 查询
+/// 陆续回报更多批次，最后以 `FinishedWithNoAdditionalRecord`（或 `Err`）终结。
+/// 因此必须累积所有批次，直到终结事件才能回执，否则会漏掉 DHT 发现的 provider。
+///
+/// 返回 `None` 表示查询已终结、结果已通过 `resp` 回执；返回 `Some` 表示仍需等待
+/// 后续事件（原挂起项原样返回）。非 `GetProviders` 条目原样返回。
+fn apply_get_providers(
+    pending: KadPending,
+    result: Result<kad::GetProvidersOk, kad::GetProvidersError>,
+) -> Option<KadPending> {
+    match (pending, result) {
+        (
+            KadPending::GetProviders {
+                resp,
+                mut providers,
+            },
+            Ok(kad::GetProvidersOk::FoundProviders {
+                providers: batch, ..
+            }),
+        ) => {
+            providers.extend(batch);
+            Some(KadPending::GetProviders { resp, providers })
+        }
+        (
+            KadPending::GetProviders { resp, providers },
+            Ok(kad::GetProvidersOk::FinishedWithNoAdditionalRecord { .. }),
+        ) => {
+            let _ = resp.send(Ok(providers.into_iter().collect()));
+            None
+        }
+        (KadPending::GetProviders { resp, .. }, Err(e)) => {
+            let _ = resp.send(Err(NetworkError::Kad(format!("{e:?}"))));
+            None
+        }
+        (other, _) => Some(other),
     }
 }
 
@@ -511,17 +555,11 @@ impl SwarmActor {
                 }
             }
             kad::QueryResult::GetProviders(result) => {
-                if let Some(KadPending::GetProviders(sender)) = self.pending_kad.remove(&id) {
-                    let send_result = match result {
-                        Ok(kad::GetProvidersOk::FoundProviders { providers, .. }) => {
-                            Ok(providers.into_iter().collect())
-                        }
-                        Ok(kad::GetProvidersOk::FinishedWithNoAdditionalRecord { .. }) => {
-                            Ok(Vec::new())
-                        }
-                        Err(e) => Err(NetworkError::Kad(format!("{e:?}"))),
-                    };
-                    let _ = sender.send(send_result);
+                if let Some(pending) = self.pending_kad.remove(&id)
+                    && let Some(pending) = apply_get_providers(pending, result)
+                {
+                    // 查询尚未终结，放回挂起表继续累积
+                    self.pending_kad.insert(id, pending);
                 }
             }
             kad::QueryResult::PutRecord(result) => {
@@ -777,8 +815,13 @@ impl SwarmActor {
                         return true;
                     }
                 };
-                self.pending_kad
-                    .insert(query_id, KadPending::GetProviders(resp));
+                self.pending_kad.insert(
+                    query_id,
+                    KadPending::GetProviders {
+                        resp,
+                        providers: HashSet::new(),
+                    },
+                );
             }
             SwarmCommand::KadPutRecord { key, value, resp } => {
                 let record = kad::Record::new(key, value);
@@ -1014,4 +1057,87 @@ fn decode_response(bytes: &[u8]) -> Option<service_protocol::Response> {
         success: *success != 0,
         data: data.to_vec(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    type ProvidersRx = oneshot::Receiver<Result<Vec<PeerId>, NetworkError>>;
+
+    fn pending_providers() -> (KadPending, ProvidersRx) {
+        let (tx, rx) = oneshot::channel();
+        (
+            KadPending::GetProviders {
+                resp: tx,
+                providers: HashSet::new(),
+            },
+            rx,
+        )
+    }
+
+    fn found(providers: Vec<PeerId>) -> kad::GetProvidersOk {
+        kad::GetProvidersOk::FoundProviders {
+            key: kad::RecordKey::new(b"k"),
+            providers: providers.into_iter().collect(),
+        }
+    }
+
+    fn finished() -> kad::GetProvidersOk {
+        kad::GetProvidersOk::FinishedWithNoAdditionalRecord {
+            closest_peers: Vec::new(),
+        }
+    }
+
+    /// 本地批次 + DHT 批次都应在终结时并入结果，而非只返回第一批。
+    #[test]
+    fn get_providers_accumulates_until_finished() {
+        let local = PeerId::random();
+        let remote = PeerId::random();
+        let (pending, mut rx) = pending_providers();
+
+        let pending =
+            apply_get_providers(pending, Ok(found(vec![local]))).expect("本地批次后查询尚未终结");
+        assert!(rx.try_recv().is_err(), "终结前不应回执");
+
+        let pending =
+            apply_get_providers(pending, Ok(found(vec![remote]))).expect("DHT 批次后查询尚未终结");
+        assert!(apply_get_providers(pending, Ok(finished())).is_none());
+
+        let got = rx.try_recv().expect("应已回执").expect("应成功");
+        let set: HashSet<PeerId> = got.into_iter().collect();
+        assert_eq!(set, HashSet::from([local, remote]));
+    }
+
+    /// 同一 provider 重复回报应去重。
+    #[test]
+    fn get_providers_dedups() {
+        let peer = PeerId::random();
+        let (pending, mut rx) = pending_providers();
+        let pending = apply_get_providers(pending, Ok(found(vec![peer, peer]))).expect("尚未终结");
+        assert!(apply_get_providers(pending, Ok(finished())).is_none());
+
+        let got = rx.try_recv().unwrap().unwrap();
+        assert_eq!(got, vec![peer]);
+    }
+
+    /// 无任何 provider 时应回执空集。
+    #[test]
+    fn get_providers_empty() {
+        let (pending, mut rx) = pending_providers();
+        assert!(apply_get_providers(pending, Ok(finished())).is_none());
+        assert!(rx.try_recv().unwrap().unwrap().is_empty());
+    }
+
+    /// 查询出错应终结并回执错误。
+    #[test]
+    fn get_providers_error_finalizes() {
+        let (pending, mut rx) = pending_providers();
+        let err = kad::GetProvidersError::Timeout {
+            key: kad::RecordKey::new(b"k"),
+            closest_peers: Vec::new(),
+        };
+        assert!(apply_get_providers(pending, Err(err)).is_none());
+        assert!(rx.try_recv().unwrap().is_err());
+    }
 }
