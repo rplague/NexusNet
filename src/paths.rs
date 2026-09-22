@@ -31,7 +31,7 @@ fn has_data_home() -> bool {
 
 /// 应用数据根目录。
 ///
-/// 优先级：`NEXUSNET_HOME` 环境变量 → 默认 `/var/lib/nexusnet`。
+/// 优先级：`NEXUSNET_HOME` 环境变量 -> 默认 `/var/lib/nexusnet`。
 fn data_home() -> PathBuf {
     match env::var_os("NEXUSNET_HOME") {
         Some(dir) if !dir.is_empty() => PathBuf::from(dir),
@@ -41,7 +41,7 @@ fn data_home() -> PathBuf {
 
 /// 配置文件路径。
 ///
-/// 优先级：`NEXUSNET_CONFIG` → `$NEXUSNET_HOME/config.toml` → `./config.toml`。
+/// 优先级：`NEXUSNET_CONFIG` -> `$NEXUSNET_HOME/config.toml` -> `./config.toml`。
 pub fn config_path() -> PathBuf {
     if let Some(path) = env::var_os("NEXUSNET_CONFIG")
         && !path.is_empty()
@@ -56,7 +56,7 @@ pub fn config_path() -> PathBuf {
 
 /// 节点身份密钥路径。
 ///
-/// 优先级：`NEXUSNET_KEYPAIR` → `$NEXUSNET_HOME/keypair.bin` → `./keypair.bin`。
+/// 优先级：`NEXUSNET_KEYPAIR` -> `$NEXUSNET_HOME/keypair.bin` -> `./keypair.bin`。
 pub fn keypair_path() -> PathBuf {
     if let Some(path) = env::var_os("NEXUSNET_KEYPAIR")
         && !path.is_empty()
@@ -71,7 +71,7 @@ pub fn keypair_path() -> PathBuf {
 
 /// 日志文件路径。
 ///
-/// 优先级：`NEXUSNET_LOG_PATH` → `$NEXUSNET_HOME/log` → `./log`。
+/// 优先级：`NEXUSNET_LOG_PATH` -> `$NEXUSNET_HOME/log` -> `./log`。
 pub fn log_path() -> PathBuf {
     if let Some(path) = env::var_os("NEXUSNET_LOG_PATH")
         && !path.is_empty()

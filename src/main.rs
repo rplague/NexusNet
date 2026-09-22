@@ -82,6 +82,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     //    inbound_req_tx -> NodeController 发送入站请求给 ServiceDispatcher
     //    inbound_req_rx -> ServiceDispatcher 接收入站请求
     let (inbound_req_tx, inbound_req_rx) = mpsc::unbounded_channel();
+    //    backend_status_tx -> ServiceDispatcher 上报后端就绪状态给 NodeController
+    //    backend_status_rx -> NodeController 接收后端就绪状态
+    let (backend_status_tx, backend_status_rx) = mpsc::unbounded_channel();
 
     // 信号处理：SIGTERM / Ctrl-C 优雅退出；SIGHUP 触发热重载，配合 systemd ExecReload
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -125,6 +128,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let dispatcher = ServiceDispatcher::new(
         inbound_req_rx,
         cmd_tx,
+        backend_status_tx.clone(),
         config_handle.clone(),
         shutdown_rx.clone(),
     );
@@ -132,11 +136,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
         dispatcher.run().await;
     });
 
+    // 保活：即使 dispatcher 提前退出，NodeController 的状态通道也不关闭。
+    let _backend_status_keepalive = backend_status_tx;
+
     let controller = NodeController::new(
         config_handle,
         peer_id,
         cmd_rx,
         inbound_req_tx,
+        backend_status_rx,
         network,
         shutdown_rx,
         auth_cache,

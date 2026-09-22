@@ -22,21 +22,6 @@
 //! libp2p 是事件驱动模型：发起查询立刻返回一个 `QueryId`，真正的结果要等未来
 //! 某次轮询 `Swarm` 才出现。若调用方既轮询 Swarm 又等待查询结果，就会互相阻塞，
 //! 形成重入死锁。因此把轮询 Swarm 与等待结果拆成两个执行体：
-//!
-//! - **`SwarmActor`**：永不停止地轮询 `Swarm`，串行处理事件与命令。
-//! - **调用方**：通过 [`NetworkHandle`] 发命令并 `.await` 一个 oneshot 回执。
-//!
-//! # 三张挂起表
-//!
-//! | 表 | 键 | 值 |
-//! |---|---|---|
-//! | `pending_kad` | Kademlia `QueryId` | DHT 查询的 oneshot |
-//! | `pending_outbound` | `OutboundRequestId` | 服务调用的 oneshot |
-//! | `pending_inbound` | 自造 request_id | `(ConnectionId, ResponseChannel)` |
-//!
-//! 此外，本模块还承担「Identify → Kademlia 地址桥接」这一网络层自身职责：
-//! 把对端宣告的监听地址 `add_address` 进 DHT，触发自动 bootstrap。否则路由表
-//! 永远为空，服务无法被发现。
 
 use crate::config::ConfigHandle;
 use crate::network::NetworkError;
@@ -72,6 +57,10 @@ pub enum SwarmCommand {
         resp: oneshot::Sender<Result<(), NetworkError>>,
     },
     KadStartProviding {
+        key: kad::RecordKey,
+        resp: oneshot::Sender<Result<(), NetworkError>>,
+    },
+    KadStopProviding {
         key: kad::RecordKey,
         resp: oneshot::Sender<Result<(), NetworkError>>,
     },
@@ -185,6 +174,16 @@ impl NetworkHandle {
     pub async fn start_providing(&self, key: kad::RecordKey) -> Result<(), NetworkError> {
         match self
             .request(|resp| SwarmCommand::KadStartProviding { key, resp })
+            .await
+        {
+            Ok(inner) => inner,
+            Err(e) => Err(e),
+        }
+    }
+
+    pub async fn stop_providing(&self, key: kad::RecordKey) -> Result<(), NetworkError> {
+        match self
+            .request(|resp| SwarmCommand::KadStopProviding { key, resp })
             .await
         {
             Ok(inner) => inner,
@@ -818,6 +817,15 @@ impl SwarmActor {
                     }
                 }
             }
+            SwarmCommand::KadStopProviding { key, resp } => match self.kad() {
+                Ok(kad) => {
+                    kad.stop_providing(&key);
+                    let _ = resp.send(Ok(()));
+                }
+                Err(e) => {
+                    let _ = resp.send(Err(e));
+                }
+            },
             SwarmCommand::ServiceSendRequest {
                 peer,
                 request,
