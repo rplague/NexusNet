@@ -79,6 +79,9 @@ pub enum Message {
     QueryPublicIp {
         id: Uuid,
     },
+    Whoami {
+        id: Uuid,
+    },
     ReconnectBootstrap {
         id: Uuid,
     },
@@ -132,6 +135,7 @@ impl Message {
             | Message::ListServices { id }
             | Message::DiscoverProviders { id, .. }
             | Message::QueryPublicIp { id }
+            | Message::Whoami { id }
             | Message::ReconnectBootstrap { id }
             | Message::ReannounceServices { id }
             | Message::ReloadConfig { id }
@@ -254,6 +258,7 @@ mod tests {
     fn control_ops_round_trip() {
         let id = Uuid::new_v4();
         round_trip(Message::ListServices { id });
+        round_trip(Message::Whoami { id });
         round_trip(Message::DiscoverProviders {
             id,
             service: "cmd".into(),

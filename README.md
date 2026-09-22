@@ -212,7 +212,7 @@ u32_be(len) || cbor(message)      # len <= 16 MiB
 | `hello` | 双向 | 握手与版本协商 |
 | `request` | 节点→后端 | 转发入站服务请求 `{ id, service, payload }` |
 | `reply` | 双向 | 关联回复 `{ id, ok, result?, error? }` |
-| `list_services` / `discover_providers` / `query_public_ip` / `reconnect_bootstrap` / `reannounce_services` / `reload_config` / `relay_status` / `pq_status` / `auth_status` / `query_key` / `add_key` / `service_request` / `service_request_to` | 后端→节点 | 控制指令，节点以 `reply` 应答 |
+| `list_services` / `discover_providers` / `query_public_ip` / `whoami` / `reconnect_bootstrap` / `reannounce_services` / `reload_config` / `relay_status` / `pq_status` / `auth_status` / `query_key` / `add_key` / `service_request` / `service_request_to` | 后端→节点 | 控制指令，节点以 `reply` 应答 |
 
 - 关联 id 为 UUID；`reply.result` 是该 op 自定的 **CBOR** 字节。
 - `add_key` 的 `value` 为 `bstr`，二进制安全（无需 base64）。
