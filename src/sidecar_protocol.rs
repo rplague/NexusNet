@@ -54,7 +54,7 @@ pub enum Message {
     Hello {
         version: u32,
     },
-    /// 节点 → 后端：转发入站服务请求
+    /// 节点 -> 后端：转发入站服务请求
     Request {
         id: Uuid,
         service: String,

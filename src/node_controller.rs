@@ -2,7 +2,7 @@ use crate::auth::{self, AuthCache};
 use crate::config::ConfigHandle;
 use crate::log::{LogLevel, LogStruct};
 use crate::network::{NetworkEvent, NetworkHandle, NetworkStart};
-use crate::service_dispatcher::{ControlRequest, InboundServiceRequest};
+use crate::service_dispatcher::{BackendStatus, ControlRequest, InboundServiceRequest};
 use crate::service_protocol;
 use crate::sidecar_protocol::Message;
 use libp2p::multiaddr::Protocol;
@@ -13,10 +13,12 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{Notify, mpsc, oneshot, watch};
 
-/// DHT provider 键：声明/发现 bootstrap 节点。
+/// DHT provider 键：声明/发现 bootstrap 节点
 const BOOTSTRAP_PROVIDER_KEY: &[u8] = b"/oahd/bootstrap";
-/// 中继预约目标数量（固定为 3，不可配置）。
+/// 中继预约目标数量
 const RELAY_TARGET: usize = 3;
+/// 后端掉线后撤销服务宣告的宽限期
+const WITHDRAW_GRACE: Duration = Duration::from_secs(3);
 /// 鉴权缓存两次刷新之间的最小间隔，避免缓存失效时高频触发 DHT 查询
 const AUTH_MIN_REFRESH: Duration = Duration::from_secs(5);
 
@@ -58,24 +60,33 @@ pub struct NodeController {
     my_peer_id: PeerId,
     node_rtts: Arc<RwLock<HashMap<PeerId, Duration>>>,
     node_ping_failures: HashMap<PeerId, u32>,
-    /// 已确认可用的中继。
+    /// 已确认可用的中继
     active_relays: HashSet<PeerId>,
-    /// 已发起、等待确认的中继预约，值为发起时间（用于超时判定）。
+    /// 已发起、等待确认的中继预约，值为发起时间（用于超时判定）
     pending_relays: HashMap<PeerId, Instant>,
-    /// 中继连续失败计数。
+    /// 中继连续失败计数
     relay_failures: HashMap<PeerId, u32>,
-    /// 中继退避截止时间。
+    /// 中继退避截止时间
     relay_backoff: HashMap<PeerId, Instant>,
-    /// 缓存的 bootstrap 提供者集合，来自 DHT get_providers。
+    /// 缓存的 bootstrap 提供者集合，来自 DHT get_providers
     bootstrap_providers: HashSet<PeerId>,
-    /// 自身是否已成功声明为 bootstrap 提供者。
+    /// 自身是否已成功声明为 bootstrap 提供者
     is_bootstrap_provider: bool,
+    /// 本轮 Swarm 生命周期内是否已完成 bootstrap
+    bootstrap_completed: bool,
+    /// 后端握手成功、当前可服务的本地服务名集合
+    backend_ready: HashSet<String>,
+    /// 当前已向 DHT 宣告的服务名集合
+    announced_services: HashSet<String>,
+    /// 后端掉线后等待撤销的截止时间
+    withdraw_deadline: HashMap<String, Instant>,
     cmd_rx: mpsc::UnboundedReceiver<ControlRequest>,
     inbound_req_tx: mpsc::UnboundedSender<InboundServiceRequest>,
+    backend_status_rx: mpsc::UnboundedReceiver<BackendStatus>,
     swarm: NetworkHandle,
     event_rx: mpsc::UnboundedReceiver<NetworkEvent>,
     shutdown_rx: watch::Receiver<bool>,
-    /// 鉴权运行状态（构造与 reload 时解析）
+    /// 鉴权运行状态
     auth_state: AuthState,
     /// 与后台刷新任务共享的鉴权缓存
     auth_cache: Arc<RwLock<AuthCache>>,
@@ -89,6 +100,7 @@ impl NodeController {
         my_peer_id: PeerId,
         cmd_rx: mpsc::UnboundedReceiver<ControlRequest>,
         inbound_req_tx: mpsc::UnboundedSender<InboundServiceRequest>,
+        backend_status_rx: mpsc::UnboundedReceiver<BackendStatus>,
         network: NetworkStart,
         shutdown_rx: watch::Receiver<bool>,
         auth_cache: Arc<RwLock<AuthCache>>,
@@ -121,8 +133,13 @@ impl NodeController {
             relay_backoff: HashMap::new(),
             bootstrap_providers: HashSet::new(),
             is_bootstrap_provider: false,
+            bootstrap_completed: false,
+            backend_ready: HashSet::new(),
+            announced_services: HashSet::new(),
+            withdraw_deadline: HashMap::new(),
             cmd_rx,
             inbound_req_tx,
+            backend_status_rx,
             swarm,
             event_rx,
             shutdown_rx,
@@ -134,10 +151,14 @@ impl NodeController {
 
     /// 运行节点编排循环，接收 SwarmActor 转发的事件 + backend 命令
     pub async fn run(mut self) -> Result<(), Box<dyn Error>> {
-        // 周期补约：即使 bootstrap 未完成或中继掉线，也会持续尝试补足目标数量。
+        // 周期补约：即使 bootstrap 未完成或中继掉线，也会持续尝试补足目标数量
         let retry = Duration::from_secs(self.config.relay_retry_interval().max(1) as u64);
         let mut relay_tick = tokio::time::interval_at(tokio::time::Instant::now() + retry, retry);
         relay_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        // 撤销检查：固定 1s，仅用于处理到期撤销
+        let mut service_tick = tokio::time::interval(Duration::from_secs(1));
+        service_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {
             tokio::select! {
@@ -146,6 +167,12 @@ impl NodeController {
                 }
                 Some(cmd) = self.cmd_rx.recv() => {
                     self.handle_command(cmd).await;
+                }
+                Some(status) = self.backend_status_rx.recv() => {
+                    self.handle_backend_status(status).await;
+                }
+                _ = service_tick.tick() => {
+                    self.reconcile_services().await;
                 }
                 _ = relay_tick.tick() => {
                     self.announce_bootstrap_provider().await;
@@ -165,7 +192,8 @@ impl NodeController {
             NetworkEvent::Ping(event) => self.handle_ping(event).await?,
             NetworkEvent::Identify(event) => self.handle_identify(event).await?,
             NetworkEvent::BootstrapCompleted => {
-                self.announce_local_services().await?;
+                self.bootstrap_completed = true;
+                self.announce_local_services().await;
                 self.announce_bootstrap_provider().await;
                 self.refresh_bootstrap_providers().await;
                 self.reconcile_relays().await;
@@ -210,7 +238,7 @@ impl NodeController {
             NetworkEvent::Relay(event) => self.handle_relay(event).await?,
             NetworkEvent::RelayClient(event) => self.handle_relay_client(event).await?,
             NetworkEvent::ListenerClosed { addresses } => {
-                // 中继掉线：立即尝试补足目标数量。
+                // 中继掉线：立即尝试补足目标数量
                 if self.handle_listener_closed(addresses).await {
                     self.reconcile_relays().await;
                 }
@@ -298,7 +326,7 @@ impl NodeController {
                 if let Ok(mut map) = self.node_rtts.write() {
                     map.remove(&peer);
                 }
-                // 连续失败达 max_failures 时主动断开。阈值每次读配置，支持热调；0 表示不断连。
+                // 连续失败达 max_failures 时主动断开。阈值每次读配置，支持热调；0 表示不断连
                 let max = self.config.ping_max_failures();
                 if max > 0 {
                     let count = self.node_ping_failures.entry(peer).or_insert(0);
@@ -440,8 +468,58 @@ impl NodeController {
             .map(|(p, _)| *p)
     }
 
-    async fn announce_local_services(&mut self) -> Result<(), Box<dyn Error>> {
-        let local_services: Vec<_> = self
+    /// 处理 ServiceDispatcher 上报的后端就绪状态变化
+    async fn handle_backend_status(&mut self, status: BackendStatus) {
+        if status.ready {
+            self.backend_ready.insert(status.service.clone());
+            self.withdraw_deadline.remove(&status.service);
+            if self.bootstrap_completed {
+                self.announce_local_services().await;
+            }
+        } else {
+            self.backend_ready.remove(&status.service);
+            // 已宣告的服务掉线后进入宽限期；3s 内重连则不撤销
+            if self.announced_services.contains(&status.service) {
+                self.withdraw_deadline
+                    .entry(status.service)
+                    .or_insert_with(|| Instant::now() + WITHDRAW_GRACE);
+            }
+        }
+    }
+
+    /// 处理到期撤销：宽限期已过且后端仍未就绪的已宣告服务，调用 stop_providing
+    async fn reconcile_services(&mut self) {
+        let due = due_withdrawals(&self.withdraw_deadline, &self.backend_ready, Instant::now());
+        for service in due {
+            self.withdraw_deadline.remove(&service);
+            self.withdraw_service(&service).await;
+        }
+    }
+
+    /// 撤销单个服务的 DHT 宣告。不改动 `/oahd/service/types` 全局类型记录
+    async fn withdraw_service(&mut self, service: &str) {
+        let key = format!("/oahd/service/{}", service);
+        match self.swarm.stop_providing(kad::RecordKey::new(&key)).await {
+            Ok(()) => {
+                self.announced_services.remove(service);
+                LogStruct::new(LogLevel::Preset, format!("已撤销服务宣告: {}", service), "").emit();
+            }
+            Err(e) => {
+                LogStruct::new(
+                    LogLevel::Warning,
+                    "撤销服务宣告失败",
+                    format!("{}: {}", service, e),
+                )
+                .emit();
+            }
+        }
+    }
+
+    /// 宣告「后端已就绪且尚未宣告」的本地服务，并同步全局服务类型记录
+    ///
+    /// 只在 bootstrap 完成且对应后端握手成功后调用，避免提前宣告不可用的服务
+    async fn announce_local_services(&mut self) {
+        let targets: Vec<String> = self
             .config
             .read()
             .services
@@ -449,36 +527,40 @@ impl NodeController {
             .local_services
             .iter()
             .filter(|s| auth::is_valid_service_name(&s.name))
-            .cloned()
+            .filter(|s| self.backend_ready.contains(&s.name))
+            .filter(|s| !self.announced_services.contains(&s.name))
+            .map(|s| s.name.clone())
             .collect();
-        if local_services.is_empty() {
-            return Ok(());
+        if targets.is_empty() {
+            return;
         }
 
-        for local_service in &local_services {
-            let key = format!("/oahd/service/{}", local_service.name);
+        let mut newly = Vec::new();
+        for name in &targets {
+            let key = format!("/oahd/service/{}", name);
             let record_key = libp2p::kad::RecordKey::new(&key);
             if let Err(e) = self.swarm.start_providing(record_key).await {
                 LogStruct::new(
                     LogLevel::Warning,
                     "注册服务失败",
-                    format!("{}: {}", local_service.name, e),
+                    format!("{}: {}", name, e),
                 )
                 .emit();
                 continue;
             }
-            LogStruct::new(
-                LogLevel::Preset,
-                format!("已注册服务: {}", local_service.name),
-                "",
-            )
-            .emit();
+            self.announced_services.insert(name.clone());
+            newly.push(name.clone());
+            LogStruct::new(LogLevel::Preset, format!("已注册服务: {}", name), "").emit();
         }
 
-        // 合并服务类型列表并写回 DHT
-        let my_types: Vec<String> = local_services.iter().map(|s| s.name.clone()).collect();
-        let types_key = kad::RecordKey::new(b"/oahd/service/types");
+        if !newly.is_empty() {
+            self.update_service_types().await;
+        }
+    }
 
+    /// 合并已宣告服务类型并写回 DHT 全局记录 `/oahd/service/types`
+    async fn update_service_types(&mut self) {
+        let types_key = kad::RecordKey::new(b"/oahd/service/types");
         let existing_types = match self.swarm.get_record(types_key.clone()).await {
             Ok(kad::GetRecordOk::FoundRecord(peer_record)) => {
                 serde_json::from_slice::<Vec<String>>(&peer_record.record.value).unwrap_or_default()
@@ -487,7 +569,7 @@ impl NodeController {
         };
 
         let mut all_types = existing_types;
-        for t in &my_types {
+        for t in &self.announced_services {
             if !all_types.contains(t) {
                 all_types.push(t.clone());
             }
@@ -498,13 +580,11 @@ impl NodeController {
         {
             LogStruct::new(LogLevel::Warning, "更新服务类型列表失败", e.to_string()).emit();
         }
-
-        Ok(())
     }
 
-    /// 消费者侧中继补约：尽力把可用中继补足到目标数量。
+    /// 消费者侧中继补约：尽力把可用中继补足到目标数量
     ///
-    /// 触发点：bootstrap 完成、中继监听器关闭、周期 tick。软目标，不强求。
+    /// 触发点：bootstrap 完成、中继监听器关闭、周期 tick。软目标，不强求
     async fn reconcile_relays(&mut self) {
         let need_relay = {
             let cfg = self.config.read();
@@ -569,7 +649,7 @@ impl NodeController {
         }
     }
 
-    /// 处理中继监听器关闭。返回是否有被跟踪的中继因此失效。
+    /// 处理中继监听器关闭。返回是否有被跟踪的中继因此失效
     async fn handle_listener_closed(&mut self, addresses: Vec<Multiaddr>) -> bool {
         let mut lost = false;
         for addr in addresses {
@@ -582,7 +662,7 @@ impl NodeController {
             let was_active = self.active_relays.remove(&peer_id);
             let was_pending = self.pending_relays.remove(&peer_id).is_some();
             if !was_active && !was_pending {
-                // 非本次跟踪的预约，忽略。
+                // 非本次跟踪的预约，忽略
                 continue;
             }
             lost = true;
@@ -594,7 +674,7 @@ impl NodeController {
         lost
     }
 
-    /// 超过一定时间仍未确认的预约视为失败，避免 pending 永久占用名额。
+    /// 超过一定时间仍未确认的预约视为失败，避免 pending 永久占用名额
     fn expire_pending_relays(&mut self, now: Instant) {
         let timeout = Duration::from_secs(
             (self.config.relay_retry_interval() as u64)
@@ -613,7 +693,7 @@ impl NodeController {
         }
     }
 
-    /// 记录一次中继失败并设置指数退避；达到阈值则从 bootstrap 剔除该节点。
+    /// 记录一次中继失败并设置指数退避；达到阈值则从 bootstrap 剔除该节点
     fn record_relay_failure(&mut self, peer_id: PeerId, now: Instant) {
         let count = {
             let c = self.relay_failures.entry(peer_id).or_insert(0);
@@ -630,7 +710,7 @@ impl NodeController {
         }
     }
 
-    /// 从 bootstrap 列表移除失效节点并持久化（不保底）。
+    /// 从 bootstrap 列表移除失效节点并持久化（不保底）
     fn evict_bootstrap(&mut self, peer_id: PeerId) {
         let nodes = self.config.bootstrap_nodes();
         let filtered: Vec<Multiaddr> = nodes
@@ -653,7 +733,7 @@ impl NodeController {
         .emit();
     }
 
-    /// 声明自身为 bootstrap 提供者（仅双栈 + allow_bootstrap 时）。
+    /// 声明自身为 bootstrap 提供者
     async fn announce_bootstrap_provider(&mut self) {
         if self.is_bootstrap_provider || !self.config.allow_bootstrap() {
             return;
@@ -678,7 +758,7 @@ impl NodeController {
         }
     }
 
-    /// 刷新缓存的 bootstrap 提供者集合（失败则保留旧缓存）。
+    /// 刷新缓存的 bootstrap 提供者集合
     async fn refresh_bootstrap_providers(&mut self) {
         let key = kad::RecordKey::new(&BOOTSTRAP_PROVIDER_KEY);
         match self.swarm.get_providers(key).await {
@@ -691,23 +771,20 @@ impl NodeController {
         }
     }
 
-    /// Identify 命中后，按「先双栈、再 bootstrap」判定是否加入本地 bootstrap 列表。
+    /// Identify 命中后，按「先双栈、再 bootstrap」判定是否加入本地 bootstrap 列表
     ///
-    /// 地址一律取自 Identify 信息，无需 DHT 存地址。
+    /// 地址一律取自 Identify 信息，无需 DHT 存地址
     async fn add_bootstrap_node_if_new(
         &self,
         info: &identify::Info,
         peer_id: PeerId,
     ) -> Result<(), Box<dyn Error>> {
-        // ① 先校验双栈
         if !is_dual_stack_addrs(&info.listen_addrs) {
             return Ok(());
         }
-        // ② 再确认对方是 bootstrap 提供者
         if !self.bootstrap_providers.contains(&peer_id) {
             return Ok(());
         }
-        // ③ 用 Identify 地址写入（v4、v6 各一个）
         let candidates = bootstrap_addrs_from(&info.listen_addrs, peer_id);
         if candidates.is_empty() {
             return Ok(());
@@ -725,7 +802,7 @@ impl NodeController {
             self.config.set_bootstrap_nodes(nodes);
             self.config.save_to_default();
             LogStruct::new(
-                LogLevel::Debug,
+                LogLevel::Preset,
                 "配置更新",
                 format!("添加 bootstrap 节点: {}", peer_id),
             )
@@ -784,25 +861,26 @@ impl NodeController {
                 Some(Ok(to_cbor(&result)))
             }
             Message::ReannounceServices { .. } => {
-                let result = match self.announce_local_services().await {
-                    Ok(_) => serde_json::json!({"success": true}),
-                    Err(e) => {
-                        serde_json::json!({"success": false, "error": e.to_string()})
-                    }
-                };
+                self.announce_local_services().await;
+                let result = serde_json::json!({"success": true});
                 Some(Ok(to_cbor(&result)))
             }
             Message::ReloadConfig { .. } => {
-                // 用当前 config.toml 重建 Swarm。注意：会瞬断连接并清空 DHT 本地存储。
+                // 用当前 config.toml 重建 Swarm。注意：会瞬断连接并清空 DHT 本地存储
                 let result = match self.swarm.reload().await {
                     Ok(_) => {
-                        // 旧 Swarm 已丢弃，中继预约与 bootstrap 声明随之失效，清空本地跟踪。
+                        // 旧 Swarm 已丢弃，中继预约与 bootstrap 声明随之失效，清空本地跟踪
                         self.active_relays.clear();
                         self.pending_relays.clear();
                         self.relay_failures.clear();
                         self.relay_backoff.clear();
                         self.bootstrap_providers.clear();
                         self.is_bootstrap_provider = false;
+                        // DHT 本地存储随 Swarm 重建而清空，服务宣告失效；待下次
+                        // BootstrapCompleted 按 backend_ready 重新宣告。
+                        self.announced_services.clear();
+                        self.withdraw_deadline.clear();
+                        self.bootstrap_completed = false;
                         // 鉴权状态随配置重算，缓存清空后由刷新任务重建
                         self.auth_state = resolve_auth_state(&self.config);
                         if let AuthState::Misconfigured(reason) = &self.auth_state {
@@ -1150,7 +1228,7 @@ async fn refresh_auth_once(
     }
 }
 
-/// `query_key` 的结果负载（CBOR 编码后作为 reply.result）
+/// `query_key` 的结果负载
 #[derive(serde::Serialize)]
 struct QueryKeyResult {
     key: String,
@@ -1177,13 +1255,26 @@ fn extract_peer_id_from_multiaddr(addr: &Multiaddr) -> Option<PeerId> {
     None
 }
 
-/// 连续失败次数 → 退避秒数（指数退避，上限 10 分钟）。
+/// 选出宽限期已过、且后端仍未就绪的待撤销服务名
+fn due_withdrawals(
+    deadlines: &HashMap<String, Instant>,
+    ready: &HashSet<String>,
+    now: Instant,
+) -> Vec<String> {
+    deadlines
+        .iter()
+        .filter(|(svc, dl)| **dl <= now && !ready.contains(*svc))
+        .map(|(svc, _)| svc.clone())
+        .collect()
+}
+
+/// 连续失败次数 -> 退避秒数
 fn relay_backoff_secs(count: u32) -> u64 {
     let shift = count.saturating_sub(1).min(5);
     (30u64 << shift).min(600)
 }
 
-/// 地址列表是否同时包含 IPv4 与 IPv6（双栈）。
+/// 网络地址双栈判断
 fn is_dual_stack_addrs(addrs: &[Multiaddr]) -> bool {
     let mut v4 = false;
     let mut v6 = false;
@@ -1199,7 +1290,7 @@ fn is_dual_stack_addrs(addrs: &[Multiaddr]) -> bool {
     v4 && v6
 }
 
-/// 从 Identify 的监听地址中为每个 IP 族各取一个，补上 `/p2p/<peer_id>`。
+/// 从 Identify 的监听地址中为每个 IP 族各取一个，补上 `/p2p/<peer_id>`
 fn bootstrap_addrs_from(addrs: &[Multiaddr], peer_id: PeerId) -> Vec<Multiaddr> {
     let mut v4: Option<Multiaddr> = None;
     let mut v6: Option<Multiaddr> = None;
@@ -1221,4 +1312,49 @@ fn bootstrap_addrs_from(addrs: &[Multiaddr], peer_id: PeerId) -> Vec<Multiaddr> 
         }
     }
     [v4, v6].into_iter().flatten().collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn set(names: &[&str]) -> HashSet<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn due_withdrawals_empty_before_deadline() {
+        let now = Instant::now();
+        let mut deadlines = HashMap::new();
+        deadlines.insert("cmd".to_string(), now + Duration::from_secs(3));
+        assert!(due_withdrawals(&deadlines, &HashSet::new(), now).is_empty());
+    }
+
+    #[test]
+    fn due_withdrawals_includes_expired_unready() {
+        let now = Instant::now();
+        let mut deadlines = HashMap::new();
+        deadlines.insert("cmd".to_string(), now - Duration::from_secs(1));
+        let due = due_withdrawals(&deadlines, &HashSet::new(), now);
+        assert_eq!(due, vec!["cmd".to_string()]);
+    }
+
+    #[test]
+    fn due_withdrawals_skips_ready_service() {
+        let now = Instant::now();
+        let mut deadlines = HashMap::new();
+        deadlines.insert("cmd".to_string(), now - Duration::from_secs(1));
+        let due = due_withdrawals(&deadlines, &set(&["cmd"]), now);
+        assert!(due.is_empty());
+    }
+
+    #[test]
+    fn due_withdrawals_only_expired_entries() {
+        let now = Instant::now();
+        let mut deadlines = HashMap::new();
+        deadlines.insert("cmd".to_string(), now - Duration::from_secs(5));
+        deadlines.insert("ocr".to_string(), now + Duration::from_secs(5));
+        let due = due_withdrawals(&deadlines, &HashSet::new(), now);
+        assert_eq!(due, vec!["cmd".to_string()]);
+    }
 }

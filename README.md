@@ -167,9 +167,12 @@ boot::init()
   ├─ 启动 auth_refresher（后台鉴权缓存刷新）
    └─ NodeController::run()（主协程）
         tokio::select! {
-            event_rx → 网络事件
-            cmd_rx  → 后端命令
-            shutdown→ SIGTERM/Ctrl-C 优雅退出
+            event_rx          → 网络事件
+            cmd_rx            → 后端命令
+            backend_status_rx → 后端就绪/断开状态
+            service_tick      → 到期撤销服务宣告（1s）
+            relay_tick        → 中继补约
+            shutdown          → SIGTERM/Ctrl-C 优雅退出
         }
 ```
 
@@ -180,8 +183,8 @@ boot::init()
 | **boot** | 初始化 |
 | **main** | 程序入口 |
 | **paths** | 统一路径解析（环境变量锚定，本地回退当前目录） |
-| **node_controller** | 事件循环统一处理、服务自动宣告，处理远程查询和内部命令 |
-| **service_dispatcher** | 后端连接管理 |
+| **node_controller** | 事件循环统一处理、服务自动宣告（后端就绪门控）、处理远程查询和内部命令 |
+| **service_dispatcher** | 后端连接管理与就绪状态上报 |
 | **network** | 网络层门面：身份、地址探测、行为装配、Swarm Actor（`network/identity`、`network/addr`、`network/behaviour`、`network/builder`、`network/actor`） |
 | **config** | 提供ConfigHandle |
 | **service_protocol** | 提供通讯协议 |
@@ -234,8 +237,10 @@ u32_be(len) || cbor(message)      # len <= 16 MiB
 ## 服务注册与发现
 
 - 本地服务列表由 `config.services.dispatcher.local_services` 定义
-- Bootstrap 成功（首次 DHT 查询完成）后自动调用 `start_providing`，key 为 `/oahd/service/<name>`
-- 同步 `/oahd/service/types` 全局服务类型记录（put_record/get_record）
+- 仅当 DHT bootstrap 完成**且**对应后端 TCP 握手（`hello`）成功后，才自动调用 `start_providing`，key 为 `/oahd/service/<name>`——避免提前宣告尚不可用的服务
+- 后端连接断开后进入 3 秒宽限期：期间重连则不撤销；超过 3 秒仍未恢复则 `stop_providing` 撤销宣告
+- 撤销为本地行为，远端 provider 记录需待 provider TTL 过期才会消失
+- 同步 `/oahd/service/types` 全局服务类型记录（`put_record`/`get_record`，仅新增、不清理）
 - `list_services` → 查询全局服务类型
 - `discover_providers` → DHT get_providers 获取提供者列表
 - `service_request` → 查询提供者，RTT 排序选优，P2P 调用

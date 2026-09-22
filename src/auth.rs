@@ -522,7 +522,7 @@ mod tests {
         let net = network(&kp, "myorg");
         let peer = keypair().public().to_peer_id();
         let value = sign_whitelist(&kp, &net, "cmd", &whitelist(1, &[&peer])).unwrap();
-        // 用同一 value、但以另一个服务的 key 路径验签 → aad 不符
+        // 用同一 value、但以另一个服务的 key 路径验签 -> aad 不符
         let entry = entry_for("ocr", &value);
         assert_eq!(
             verify_whitelist(&net, "ocr", &value, &entry),
@@ -644,9 +644,9 @@ mod tests {
             })
             .unwrap();
         assert!(cache.fresh_index(now, Duration::from_secs(300)).is_some());
-        // TTL 为零 → 视为不新鲜
+        // TTL 为零 -> 视为不新鲜
         assert!(cache.fresh_index(now, Duration::ZERO).is_none());
-        // 已过文档期 → 不新鲜
+        // 已过文档期 -> 不新鲜
         assert!(
             cache
                 .fresh_index(now + 301, Duration::from_secs(300))

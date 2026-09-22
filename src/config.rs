@@ -355,7 +355,7 @@ pub struct AuthConfig {
     /// 后台刷新间隔
     #[serde(default = "default_auth_refresh_interval")]
     pub refresh_interval_secs: u32,
-    /// 网络名 → 信任锚
+    /// 网络名 -> 信任锚
     #[serde(default)]
     pub networks: HashMap<String, AuthNetworkConfig>,
 }

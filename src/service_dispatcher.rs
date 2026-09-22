@@ -37,6 +37,12 @@ pub struct ControlRequest {
     pub resp_tx: oneshot::Sender<Result<Vec<u8>, String>>,
 }
 
+/// 后端连接就绪状态变化，由 ServiceDispatcher 上报给 NodeController。
+pub struct BackendStatus {
+    pub service: String,
+    pub ready: bool,
+}
+
 /// 单个后端的「id → 响应等待者」挂起表。
 type PendingMap = Arc<Mutex<HashMap<Uuid, oneshot::Sender<Result<Vec<u8>, String>>>>>;
 /// 单个后端的写半连接。
@@ -53,6 +59,7 @@ pub struct InboundServiceRequest {
 pub struct ServiceDispatcher {
     inbound_rx: mpsc::UnboundedReceiver<InboundServiceRequest>,
     cmd_tx: mpsc::UnboundedSender<ControlRequest>,
+    backend_status_tx: mpsc::UnboundedSender<BackendStatus>,
     config: ConfigHandle,
     local_services: Vec<LocalServiceEntry>,
     shutdown_rx: watch::Receiver<bool>,
@@ -65,6 +72,7 @@ impl ServiceDispatcher {
     pub fn new(
         inbound_rx: mpsc::UnboundedReceiver<InboundServiceRequest>,
         cmd_tx: mpsc::UnboundedSender<ControlRequest>,
+        backend_status_tx: mpsc::UnboundedSender<BackendStatus>,
         config: ConfigHandle,
         shutdown_rx: watch::Receiver<bool>,
     ) -> Self {
@@ -99,6 +107,7 @@ impl ServiceDispatcher {
         Self {
             inbound_rx,
             cmd_tx,
+            backend_status_tx,
             config,
             local_services,
             shutdown_rx,
@@ -168,11 +177,13 @@ impl ServiceDispatcher {
             let service_name = service.name.clone();
             let pending_map = self.pending_requests.get(&service_name).cloned().unwrap();
             let cmd_tx = self.cmd_tx.clone();
+            let backend_status_tx = self.backend_status_tx.clone();
 
             tokio::spawn(Self::backend_read_loop(
                 service_name,
                 pending_map,
                 cmd_tx,
+                backend_status_tx,
                 backend_writers.clone(),
                 addr,
                 query_timeout,
@@ -184,11 +195,14 @@ impl ServiceDispatcher {
         service_name: String,
         pending_map: PendingMap,
         cmd_tx: mpsc::UnboundedSender<ControlRequest>,
+        backend_status_tx: mpsc::UnboundedSender<BackendStatus>,
         backend_writers: BackendWriters,
         addr: String,
         query_timeout: Duration,
     ) {
         let mut backoff = 1u64;
+        // 仅当握手成功后才会向上层宣告就绪；断开时据此上报撤销。
+        let mut was_ready = false;
 
         loop {
             match TcpStream::connect(&addr).await {
@@ -211,6 +225,11 @@ impl ServiceDispatcher {
 
                     match Self::handshake(&mut read_half, &writer).await {
                         Ok(()) => {
+                            was_ready = true;
+                            let _ = backend_status_tx.send(BackendStatus {
+                                service: service_name.clone(),
+                                ready: true,
+                            });
                             let _ = Self::read_loop_inner(
                                 read_half,
                                 &service_name,
@@ -232,6 +251,14 @@ impl ServiceDispatcher {
                     }
 
                     backend_writers.lock().await.remove(&service_name);
+
+                    if was_ready {
+                        was_ready = false;
+                        let _ = backend_status_tx.send(BackendStatus {
+                            service: service_name.clone(),
+                            ready: false,
+                        });
+                    }
 
                     LogStruct::new(
                         LogLevel::Warning,
