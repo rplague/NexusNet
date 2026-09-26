@@ -21,6 +21,8 @@ use crate::config::ConfigHandle;
 use crate::network::NetworkError;
 use crate::network::addr::to_multiaddr;
 use crate::network::behaviour::NetBehaviour;
+use crate::network::dialable_addrs;
+use crate::{LogLevel, LogStruct};
 use libp2p::{Multiaddr, Swarm, SwarmBuilder, identity, noise, tcp, yamux};
 use std::net::IpAddr;
 use std::time::Duration;
@@ -75,6 +77,27 @@ pub fn build_swarm(
         swarm
             .listen_on(addr)
             .map_err(|e| NetworkError::Build(e.to_string()))?;
+    }
+
+    // 确认对外可达地址：供 Identify 广播，并为 Circuit Relay v2 服务端提供
+    // 预约应答中的地址。libp2p 客户端会拒绝地址列表为空的预约应答
+    // （`NoAddressesInReservation`），导致中继预约静默失败。
+    let peer_id = keypair.public().to_peer_id();
+    let external = dialable_addrs(config, peer_id);
+    for addr in &external {
+        swarm.add_external_address(addr.clone());
+    }
+    if !external.is_empty() {
+        LogStruct::new(
+            LogLevel::Preset,
+            "已确认对外地址",
+            external
+                .iter()
+                .map(|a| a.to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+        )
+        .emit();
     }
 
     Ok(swarm)
