@@ -52,7 +52,7 @@ service-request-to  = { t: "service_request_to",  id: uuid, service: tstr, peer:
 ;   list_services       -> [* tstr]
 ;   discover_providers  -> [* tstr]                     ; PeerId 字符串
 ;   query_public_ip     -> { ? ipv4: tstr, ? ipv6: tstr }
-;   whoami              -> { peer_id: tstr }
+;   whoami              -> { peer_id: tstr, name: tstr, description: tstr }
 ;   reconnect_bootstrap -> { success: bool }
 ;   reannounce_services -> { success: bool, ? error: tstr }
 ;   reload_config       -> { success: bool, ? error: tstr }

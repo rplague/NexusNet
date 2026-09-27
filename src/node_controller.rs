@@ -848,9 +848,12 @@ impl NodeController {
                 Some(Ok(to_cbor(&ip_info)))
             }
             Message::Whoami { .. } => {
-                let result = serde_json::json!({
-                    "peer_id": self.my_peer_id.to_string(),
-                });
+                let node = self.config.read().node.clone();
+                let result = WhoamiResult {
+                    peer_id: self.my_peer_id.to_string(),
+                    name: node.name,
+                    description: node.description,
+                };
                 Some(Ok(to_cbor(&result)))
             }
             Message::ReconnectBootstrap { .. } => {
@@ -1234,6 +1237,14 @@ async fn refresh_auth_once(
     }
 }
 
+/// `whoami` 的结果负载
+#[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct WhoamiResult {
+    peer_id: String,
+    name: String,
+    description: String,
+}
+
 /// `query_key` 的结果负载
 #[derive(serde::Serialize)]
 struct QueryKeyResult {
@@ -1326,6 +1337,18 @@ mod tests {
 
     fn set(names: &[&str]) -> HashSet<String> {
         names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn whoami_result_round_trip() {
+        let result = WhoamiResult {
+            peer_id: "12D3KooW".to_string(),
+            name: "节点A".to_string(),
+            description: "测试节点".to_string(),
+        };
+        let bytes = to_cbor(&result);
+        let decoded: WhoamiResult = ciborium::de::from_reader(bytes.as_slice()).unwrap();
+        assert_eq!(decoded, result);
     }
 
     #[test]
