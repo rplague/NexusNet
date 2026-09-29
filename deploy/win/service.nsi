@@ -44,7 +44,8 @@ FunctionEnd
 
 Function .onInit
   SetRegView 64
-  StrCpy $DataDir "$COMMONAPPDATA\@PKG@"
+  ReadEnvStr $DataDir "ProgramData"
+  StrCpy $DataDir "$DataDir\@PKG@"
 FunctionEnd
 
 Section "Install"
