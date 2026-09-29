@@ -81,6 +81,8 @@ apt purge <pkg>              # 彻底清除包配置
 | `service.service` | systemd 单元（打包素材，含 `@PKG@`/`@BIN@`/`@USER@` 占位符） |
 | `service.tmpfiles.conf` | 预建目录与属主（打包素材） |
 | `../deb/{postinst,prerm,postrm}` | Debian 维护脚本（打包素材） |
+| `build-win.sh` | 交叉编译产物 + NSIS 组装 Windows 安装器与便携 zip，自动派生命名 |
+| `win/service.nsi` | NSIS 安装脚本（含 `@PKG@`/`@BIN@`/`@VERSION@` 等占位符） |
 | `publish-release.sh` | 幂等发布：把指定目录内的文件上传到 Gitea Release（供 CI 复用） |
 
 ## 手动构建 deb
@@ -101,11 +103,63 @@ systemctl cat <pkg>             # 查看当前单元定义
 systemctl show <pkg>            # 查看运行状态详情
 ```
 
+## Windows 安装
+
+Windows 侧在 Linux 上交叉编译（`x86_64-pc-windows-gnu`）+ NSIS 打包，命名同样自动从 `Cargo.toml` 派生。
+
+### 构建
+
+```bash
+rustup target add x86_64-pc-windows-gnu
+cargo build --release --target x86_64-pc-windows-gnu
+./deploy/build-win.sh
+```
+
+依赖：`mingw-w64`（`x86_64-w64-mingw32-gcc`）、NSIS（`makensis`）、`curl`/`unzip`/`zip`。
+NSSM 由脚本按固定版本（2.24）+ SHA256 下载缓存到 `target/nssm-cache/`，不随仓库分发。
+
+产物（`target/packaging/`）：
+
+| 文件 | 说明 |
+|---|---|
+| `<pkg>_<version>_windows_amd64_setup.exe` | NSIS 安装器 |
+| `<pkg>_<version>_windows_amd64.zip` | 便携包（仅裸 exe） |
+| `<name>-windows-amd64.exe` | 裸二进制 |
+
+### 目录布局
+
+| 项 | 路径 | 说明 |
+|---|---|---|
+| 二进制 | `%ProgramFiles%\<pkg>\<bin>.exe` | 主程序 |
+| 包装器 | `%ProgramFiles%\<pkg>\nssm.exe` | NSSM，服务 ImagePath |
+| 配置 | `%ProgramData%\<pkg>\config.toml` | 首启自动生成 |
+| 数据/日志 | `%ProgramData%\<pkg>\log` | 轮转产物同目录 |
+
+路径经 `NEXUSNET_HOME` / `NEXUSNET_CONFIG` / `NEXUSNET_LOG_PATH` 锚定，由安装器以
+NSSM `AppEnvironmentExtra` 注入，与 systemd 单元同一契约。
+
+### 安装 / 升级 / 卸载
+
+以管理员运行 `setup.exe`。安装过程：停删旧服务（升级场景）→ 释放文件 → 建数据目录并对
+`NT SERVICE\<pkg>` 授予写权限 → `nssm install` 并配置（自动启动、失败重启、Ctrl+C 优雅停止 15s）
+→ `sc.exe config obj= "NT SERVICE\<pkg>"` → 启动服务并写卸载项。
+
+- 服务账号：虚拟账号 `NT SERVICE\<pkg>`（无需密码），配置/日志目录已 ACL 放行。
+- 升级：运行新版本 `setup.exe`，`%ProgramData%\<pkg>` 保留。
+- 卸载：应用和功能或 `uninstall.exe`；停删服务、删除 `%ProgramFiles%\<pkg>`，**保留** `%ProgramData%\<pkg>`。
+
+```powershell
+Get-Service <pkg>
+sc.exe query <pkg>
+sc.exe stop <pkg>; sc.exe start <pkg>
+& "$env:ProgramFiles\<pkg>\nssm.exe" edit <pkg>
+```
+
 ## 说明
 
 - 服务以 `nexusnet` 专用用户运行（`NoNewPrivileges`、`ProtectSystem=strict` 等加固），
   通过 `ReadWritePaths` 放行配置与数据目录的写权限；日志经 stdout/stderr 交给 journald。
 - 收到 `SIGTERM` 时程序优雅关闭（`NodeController`/`ServiceDispatcher` 收到共享 shutdown 信号），
-  `TimeoutStopSec=15` 防止卡死被强杀。
+  `TimeoutStopSec=15` 防止卡死被强杀。Windows 下由 NSSM 以 Ctrl+C 触发同一优雅退出路径。
 - 后端边车（CLI / OCR 等）仍由外部独立管理，本服务不管理其生命周期；
   如后续需要，可在 `nexusnet.service` 的 `[Unit]` 中追加 `After=`/`Wants=` 关联对应的边车服务。
