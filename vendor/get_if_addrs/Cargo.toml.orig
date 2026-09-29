@@ -1,0 +1,25 @@
+[package]
+authors = ["MaidSafe Developers <dev@maidsafe.net>"]
+description = "Return interface IP addresses on Posix and windows systems"
+documentation = "https://docs.rs/get_if_addrs"
+homepage = "http://maidsafe.net"
+license = "MIT OR BSD-3-Clause"
+name = "get_if_addrs"
+readme = "README.md"
+repository = "https://github.com/maidsafe/get_if_addrs"
+version = "0.5.3"
+
+[dependencies]
+clippy = {version = "~0.0.175", optional = true}
+libc = "~0.2.34"
+c_linked_list = "~1.1.1"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+winapi = "0.2"
+
+[target.'cfg(target_os = "android")'.dependencies.get_if_addrs-sys]
+version = "~0.1.1"
+path = "get_if_addrs-sys"
+
+[dev-dependencies]
+unwrap = "~1.1.0"

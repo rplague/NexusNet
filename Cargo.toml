@@ -28,3 +28,8 @@ sha2 = "0.10"
 chacha20poly1305 = "0.10"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
+
+# Windows 交叉编译需 iphlpapi 全小写链接名（大小写敏感的 Linux 主机）；
+# get_if_addrs 0.5.3 硬编码 #[link(name = "Iphlpapi")]，故本地 vendored 修正。
+[patch.crates-io]
+get_if_addrs = { path = "vendor/get_if_addrs" }

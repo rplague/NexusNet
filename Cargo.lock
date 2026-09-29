@@ -1172,8 +1172,6 @@ dependencies = [
 [[package]]
 name = "get_if_addrs"
 version = "0.5.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "abddb55a898d32925f3148bd281174a68eeb68bbfd9a5938a57b18f506ee4ef7"
 dependencies = [
  "c_linked_list",
  "get_if_addrs-sys",
