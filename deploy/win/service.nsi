@@ -44,7 +44,8 @@ FunctionEnd
 
 Function .onInit
   SetRegView 64
-  StrCpy $DataDir "$COMMONAPPDATA\@PKG@"
+  ReadEnvStr $DataDir "ProgramData"
+  StrCpy $DataDir "$DataDir\@PKG@"
 FunctionEnd
 
 Section "Install"
@@ -73,6 +74,9 @@ Section "Install"
   nsExec::ExecToLog '"$INSTDIR\nssm.exe" set @PKG@ AppExit Default Restart'
   nsExec::ExecToLog '"$INSTDIR\nssm.exe" set @PKG@ AppStopMethodConsole 15000'
   nsExec::ExecToLog '"$INSTDIR\nssm.exe" set @PKG@ AppEnvironmentExtra "NEXUSNET_HOME=$DataDir" "NEXUSNET_CONFIG=$DataDir\config.toml" "NEXUSNET_LOG_PATH=$DataDir"'
+  nsExec::ExecToLog '"$INSTDIR\nssm.exe" set @PKG@ AppStdout "$DataDir\service.out.log"'
+  nsExec::ExecToLog '"$INSTDIR\nssm.exe" set @PKG@ AppStderr "$DataDir\service.err.log"'
+  nsExec::ExecToLog '"$INSTDIR\nssm.exe" set @PKG@ AppRotateFiles 1'
 
   ; 虚拟服务账号（无需密码）
   nsExec::ExecToLog 'sc.exe config @PKG@ obj= "NT SERVICE\@PKG@" start= auto'

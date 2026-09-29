@@ -155,6 +155,51 @@ sc.exe stop <pkg>; sc.exe start <pkg>
 & "$env:ProgramFiles\<pkg>\nssm.exe" edit <pkg>
 ```
 
+### 服务管理（等价 systemctl）
+
+服务名即规范化包名 `<pkg>`，由 NSSM 托管；NSSM 位于 `%ProgramFiles%\<pkg>\nssm.exe`。
+
+| systemctl | Windows 等价 |
+|---|---|
+| `systemctl status <pkg>` | `sc.exe query <pkg>` / `Get-Service <pkg>` / `nssm.exe status <pkg>` |
+| `systemctl start/stop/restart` | `sc.exe start\|stop <pkg>` / `Restart-Service <pkg>` / `nssm.exe start\|stop\|restart <pkg>` |
+| `systemctl enable/disable` | `sc.exe config <pkg> start= auto\|demand` |
+| `systemctl cat` | `nssm.exe get <pkg> <param>`（逐项）/ `sc.exe qc <pkg>` |
+| `systemctl edit` | `nssm.exe edit <pkg>`（GUI） |
+| `systemctl reload`（SIGHUP） | 无 SIGHUP；用 `nssm.exe restart <pkg>` |
+
+> 若服务卡在 `PAUSED`（`sc query` STATE 7）：`nssm.exe continue <pkg>` 恢复；
+> 无效则 `nssm.exe stop <pkg>` → `nssm.exe remove <pkg> confirm` → `sc.exe delete <pkg>` 后重新运行 `setup.exe`。
+
+### 日志
+
+Windows 下无 journald，程序自动切换为**文件模式**，写入 `%ProgramData%\<pkg>\`：
+
+| 项 | 路径 |
+|---|---|
+| 当前日志（追加，**无扩展名**） | `%ProgramData%\<pkg>\log` |
+| 轮转归档（>10MB 触发，gzip） | `%ProgramData%\<pkg>\<MMDD_HHMM>-<MMDD_HHMM>-<nanos>.gz` |
+| NSSM 捕获的 stdout/stderr（兜底） | `%ProgramData%\<pkg>\service.out.log` / `service.err.log` |
+| NSSM 服务级事件（启停/重启） | Windows「应用程序」事件日志，来源 `nssm` |
+
+```powershell
+$log = "$env:ProgramData\<pkg>\log"
+Get-Content $log -Tail 50                 # 最近 50 行
+Get-Content $log -Wait -Tail 50           # 实时跟踪（等价 journalctl -f）
+Get-Content $log | Select-String '\[!\]|\[CRITICAL\]'   # 只看错误/严重
+Get-WinEvent -ProviderName nssm -MaxEvents 50            # NSSM 服务级事件
+```
+
+日志级别前缀：`[IMPORTANT] [+] [-] [*] [!] [CRITICAL]`。
+
+前台直跑（快速排障，直接看终端输出）：
+```powershell
+$env:NEXUSNET_HOME="$env:ProgramData\<pkg>"
+$env:NEXUSNET_CONFIG="$env:ProgramData\<pkg>\config.toml"
+$env:NEXUSNET_LOG_PATH="$env:ProgramData\<pkg>"
+& "$env:ProgramFiles\<pkg>\<bin>.exe"
+```
+
 ## 说明
 
 - 服务以 `nexusnet` 专用用户运行（`NoNewPrivileges`、`ProtectSystem=strict` 等加固），
