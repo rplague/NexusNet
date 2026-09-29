@@ -1,29 +1,31 @@
 #!/bin/sh
-# NexusNet deb 包 postinst
+# @BIN@ deb 包 postinst
 # 参数:
-#   configure     安装 或 升级
-#   abort-upgrade 升级中途失败回滚
+#   $1=configure     安装 或 升级
+#   $2=旧版本号       首次安装为空，升级时为被替换的版本
+#
+# 运行账号固定为 NexusNet 的专用用户 `nexusnet` 账号缺失时创建
 set -e
 
-USER_NAME="nexusnet"
-UNIT_NAME="nexusnet"
+USER_NAME="@USER@"
+UNIT_NAME="@PKG@"
 
 create_system_user() {
-    if command -v systemd-sysusers >/dev/null 2>&1; then
-        # 处理 /usr/lib/sysusers.d 下的所有声明
-        systemd-sysusers >/dev/null 2>&1 || true
-    elif command -v useradd >/dev/null 2>&1; then
-        useradd --system --no-create-home --shell /usr/sbin/nologin "${USER_NAME}" || true
+    if id "${USER_NAME}" >/dev/null 2>&1; then
+        return 0
+    fi
+    if command -v useradd >/dev/null 2>&1; then
+        useradd --system --user-group --no-create-home --shell /usr/sbin/nologin "${USER_NAME}" || true
     fi
 }
 
 create_dirs() {
     if command -v systemd-tmpfiles >/dev/null 2>&1; then
-        systemd-tmpfiles --create /usr/lib/tmpfiles.d/nexusnet.conf >/dev/null 2>&1 || true
+        systemd-tmpfiles --create /usr/lib/tmpfiles.d/@PKG@.conf >/dev/null 2>&1 || true
     else
-        mkdir -p /etc/nexusnet /var/lib/nexusnet
-        chown "${USER_NAME}:${USER_NAME}" /etc/nexusnet /var/lib/nexusnet || true
-        chmod 0755 /etc/nexusnet; chmod 0700 /var/lib/nexusnet
+        mkdir -p /etc/@PKG@ /var/lib/@PKG@
+        chown "${USER_NAME}:${USER_NAME}" /etc/@PKG@ /var/lib/@PKG@ || true
+        chmod 0755 /etc/@PKG@; chmod 0700 /var/lib/@PKG@
     fi
 }
 
@@ -42,8 +44,12 @@ case "$1" in
         create_dirs
         ensure_persistent_journal
         systemctl daemon-reload >/dev/null 2>&1 || true
-        if systemctl is-active --quiet "${UNIT_NAME}" 2>/dev/null; then
+        systemctl enable "${UNIT_NAME}" >/dev/null 2>&1 || true
+        if [ -n "${2:-}" ] && systemctl is-active --quiet "${UNIT_NAME}" 2>/dev/null; then
+            # 升级/重配置且服务原本在运行：平滑重启
             systemctl try-restart "${UNIT_NAME}" >/dev/null 2>&1 || true
+        else
+            systemctl restart "${UNIT_NAME}" >/dev/null 2>&1 || true
         fi
         ;;
     abort-upgrade)
