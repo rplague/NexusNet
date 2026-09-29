@@ -33,11 +33,15 @@ use std::error::Error;
 use std::sync::{Arc, RwLock};
 use tokio::sync::Notify;
 use tokio::sync::mpsc;
+#[cfg(unix)]
 use tokio::sync::oneshot;
 use tokio::sync::watch;
 
 use crate::auth::AuthCache;
-use crate::service_dispatcher::{ControlRequest, ServiceDispatcher};
+#[cfg(unix)]
+use crate::service_dispatcher::ControlRequest;
+use crate::service_dispatcher::ServiceDispatcher;
+#[cfg(unix)]
 use crate::sidecar_protocol::Message;
 
 #[tokio::main]
@@ -86,29 +90,39 @@ async fn main() -> Result<(), Box<dyn Error>> {
     //    backend_status_rx -> NodeController 接收后端就绪状态
     let (backend_status_tx, backend_status_rx) = mpsc::unbounded_channel();
 
-    // 信号处理：SIGTERM / Ctrl-C 优雅退出；SIGHUP 触发热重载，配合 systemd ExecReload
+    // 信号处理：SIGTERM / Ctrl-C 优雅退出；SIGHUP 触发热重载，配合 systemd ExecReload（仅 unix）
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    #[cfg(unix)]
     let reload_tx = cmd_tx.clone();
     tokio::spawn(async move {
-        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("无法安装 SIGTERM 处理器");
-        let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
-            .expect("无法安装 SIGHUP 处理器");
-        loop {
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => break,
-                _ = sigterm.recv() => break,
-                _ = sighup.recv() => {
-                    LogStruct::new(LogLevel::Warning, "收到 SIGHUP", "重新加载配置并重建网络...").emit();
-                    let (resp_tx, _resp_rx) = oneshot::channel();
-                    let _ = reload_tx.send(ControlRequest {
-                        msg: Message::ReloadConfig {
-                            id: uuid::Uuid::new_v4(),
-                        },
-                        resp_tx,
-                    });
+        #[cfg(unix)]
+        {
+            let mut sigterm =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .expect("无法安装 SIGTERM 处理器");
+            let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+                .expect("无法安装 SIGHUP 处理器");
+            loop {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => break,
+                    _ = sigterm.recv() => break,
+                    _ = sighup.recv() => {
+                        LogStruct::new(LogLevel::Warning, "收到 SIGHUP", "重新加载配置并重建网络...").emit();
+                        let (resp_tx, _resp_rx) = oneshot::channel();
+                        let _ = reload_tx.send(ControlRequest {
+                            msg: Message::ReloadConfig {
+                                id: uuid::Uuid::new_v4(),
+                            },
+                            resp_tx,
+                        });
+                    }
                 }
             }
+        }
+        #[cfg(windows)]
+        {
+            // Windows 服务（NSSM）以 Ctrl+C 触发优雅退出，无 SIGHUP 热重载。
+            let _ = tokio::signal::ctrl_c().await;
         }
         LogStruct::new(LogLevel::Warning, "收到退出信号", "正在优雅关闭...").emit();
         let _ = shutdown_tx.send(true);
