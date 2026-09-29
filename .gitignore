@@ -1,5 +1,4 @@
 /target
-config.toml
-keypair.bin
-log
-Cargo.lock
+/config.toml
+/keypair.bin
+/log
