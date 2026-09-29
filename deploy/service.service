@@ -1,18 +1,19 @@
 [Unit]
-Description=NexusNet P2P Node (OAHD core network layer)
-Documentation=file:/etc/nexusnet/README.md
+Description=@BIN@ P2P node (OAHD core network layer)
+Documentation=file:/etc/@PKG@/README.md
 Wants=network-online.target
 After=network-online.target
 
 [Service]
 Type=simple
-User=nexusnet
-Group=nexusnet
-WorkingDirectory=/var/lib/nexusnet
-Environment=NEXUSNET_HOME=/var/lib/nexusnet
-Environment=NEXUSNET_CONFIG=/etc/nexusnet/config.toml 
+User=@USER@
+Group=@USER@
+WorkingDirectory=/var/lib/@PKG@
+Environment=NEXUSNET_HOME=/var/lib/@PKG@
+Environment=NEXUSNET_CONFIG=/etc/@PKG@/config.toml
+Environment=NEXUSNET_LOG_PATH=/var/lib/@PKG@
 
-ExecStart=/usr/bin/NexusNet
+ExecStart=/usr/bin/@BIN@
 ExecReload=/bin/kill -HUP $MAINPID
 
 Restart=on-failure
@@ -39,7 +40,7 @@ LockPersonality=true
 MemoryDenyWriteExecute=true
 SystemCallArchitectures=native
 RestrictNamespaces=true
-ReadWritePaths=/etc/nexusnet /var/lib/nexusnet
+ReadWritePaths=/etc/@PKG@ /var/lib/@PKG@
 
 [Install]
 WantedBy=multi-user.target
