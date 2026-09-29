@@ -86,6 +86,9 @@ apt install -y ./nexusnet_<version>_amd64.deb
 
 查看运行状态：`systemctl status nexusnet`；日志：`journalctl -u nexusnet -f`。
 
+Windows 侧提供交叉编译产出的 NSIS 安装器与便携 zip（NSSM 托管为系统服务，
+以虚拟账号 `NT SERVICE\nexusnet` 运行），构建与安装见 [deploy/README.md](./deploy/README.md)。
+
 构建、升级、卸载等详见 [deploy/README.md](./deploy/README.md)。
 
 ## 配置（config.toml）
@@ -303,7 +306,7 @@ u32_be(len) || cbor(message)      # len <= 16 MiB
 
 ## 开发状态
 
-当前版本：**0.4.1** — 完成度 **5.5/10**
+当前版本：**0.4.4** — 完成度 **5.5/10**
 
 ## 许可
 

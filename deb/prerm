@@ -1,11 +1,11 @@
 #!/bin/sh
-# NexusNet deb 包 prerm（卸载前）
+# @BIN@ deb 包 prerm（卸载前）
 # 参数:
 #   remove       卸载
 #   upgrade      升级
 set -e
 
-UNIT_NAME="nexusnet"
+UNIT_NAME="@PKG@"
 
 case "$1" in
     remove)

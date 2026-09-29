@@ -1,0 +1,124 @@
+name: Rust CI
+on: [push]
+
+jobs:
+  test:
+    runs-on: linux
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: 运行测试 | Run tests
+        run: cargo test --verbose
+
+  fmt:
+    runs-on: linux
+    needs: [test]
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: 格式化检查 | Check code format
+        run: cargo fmt -- --check
+
+  build-on-linux:
+    runs-on: linux
+    needs: [test]
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: 生产构建 | Build in release mode
+        run: cargo build --release
+      - name: 运行包装程序
+        run: ./deploy/build-deb.sh
+      - name: 解析包名
+        run: |
+          NAME=$(grep '^name' Cargo.toml | sed 's/name = "\(.*\)"/\1/')
+          echo "cargo_name=$NAME" >> $GITHUB_ENV
+
+      - name: 收集产物
+        run: |
+          mkdir -p dist
+          cp "target/release/${{ env.cargo_name }}" "dist/${{ env.cargo_name }}-linux-amd64"
+          cp target/packaging/*.deb dist/
+
+      - name: 上传 Linux 产物
+        uses: actions/upload-artifact@v3
+        with:
+          name: linux-dist
+          path: dist/
+          if-no-files-found: error
+
+  build-for-windows:
+    runs-on: windows
+    needs: [test]
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: 添加 Windows 目标
+        run: rustup target add x86_64-pc-windows-gnu
+      - name: 交叉编译 | Cross build for Windows
+        run: cargo build --release --target x86_64-pc-windows-gnu
+      - name: 打包 Windows 安装器
+        shell: bash
+        run: ./deploy/build-win.sh
+      - name: 收集产物
+        run: |
+          mkdir -p dist
+          cp target/packaging/*setup.exe dist/
+          cp target/packaging/*.zip dist/
+          cp target/packaging/*-windows-amd64.exe dist/
+      - name: 上传 Windows 产物
+        uses: actions/upload-artifact@v3
+        with:
+          name: windows-dist
+          path: dist/
+          if-no-files-found: error
+
+  release-on-linux:
+    if: github.ref == 'refs/heads/main'
+    runs-on: linux
+    needs: [build-on-linux]
+    concurrency:
+      group: release-linux-${{ github.ref }}
+      cancel-in-progress: false
+
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+
+      - name: 取回 Linux 产物
+        uses: actions/download-artifact@v3
+        with:
+          name: linux-dist
+          path: dist
+
+      - name: 发布 Linux 资产
+        shell: bash
+        env:
+          REPO: ${{ github.repository }}
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: ./deploy/publish-release.sh dist
+
+  release-on-windows:
+    if: github.ref == 'refs/heads/main'
+    runs-on: windows
+    needs: [build-for-windows]
+    concurrency:
+      group: release-windows-${{ github.ref }}
+      cancel-in-progress: false
+
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+
+      - name: 取回 Windows 产物
+        uses: actions/download-artifact@v3
+        with:
+          name: windows-dist
+          path: dist
+
+      - name: 发布 Windows 资产
+        shell: bash
+        env:
+          REPO: ${{ github.repository }}
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: ./deploy/publish-release.sh dist
