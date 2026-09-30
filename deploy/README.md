@@ -133,7 +133,7 @@ NSSM 由脚本按固定版本（2.24）+ SHA256 下载缓存到 `target/nssm-cac
 | 二进制 | `%ProgramFiles%\<pkg>\<bin>.exe` | 主程序 |
 | 包装器 | `%ProgramFiles%\<pkg>\nssm.exe` | NSSM，服务 ImagePath |
 | 配置 | `%ProgramData%\<pkg>\config.toml` | 首启自动生成 |
-| 数据/日志 | `%ProgramData%\<pkg>\log` | 轮转产物同目录 |
+| 数据/日志 | `%ProgramData%\<pkg>` | 身份/日志文件 `log` 与轮转 `.gz` 同目录 |
 
 路径经 `NEXUSNET_HOME` / `NEXUSNET_CONFIG` / `NEXUSNET_LOG_PATH` 锚定，由安装器以
 NSSM `AppEnvironmentExtra` 注入，与 systemd 单元同一契约。

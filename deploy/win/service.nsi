@@ -62,7 +62,6 @@ Section "Install"
 
   ; 数据目录与虚拟账号写权限
   CreateDirectory "$DataDir"
-  CreateDirectory "$DataDir\log"
   nsExec::ExecToLog 'icacls "$DataDir" /grant "NT SERVICE\@PKG@:(OI)(CI)M" /T /C'
 
   ; 注册服务（NSSM 包装）
