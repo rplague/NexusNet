@@ -22,9 +22,9 @@ use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::net::IpAddr;
-use std::path::Path;
-use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
-// 定义配置结构体
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
+// Node configuration schema.
 
 fn bool_true() -> bool {
     true
@@ -77,11 +77,11 @@ pub struct NodeConfig {
 }
 
 impl NodeConfig {
-    /// 返回值总是有效的 NodeConfig。
+    /// Always returns a valid `NodeConfig`.
     fn from_toml_file(path: impl AsRef<Path>, create_if_missing: bool) -> NodeConfig {
         let path = path.as_ref();
 
-        // 如果不需要创建且文件不存在，直接返回默认配置
+        // If creation is not requested and the file is missing, return defaults.
         if !create_if_missing && !path.exists() {
             LogStruct::new(
                 LogLevel::Warning,
@@ -92,7 +92,7 @@ impl NodeConfig {
             return NodeConfig::default();
         }
 
-        // 尝试读取并解析文件
+        // Try to read and parse the file.
         match fs::read_to_string(path) {
             Ok(content) => match toml::from_str(&content) {
                 Ok(config) => return config,
@@ -121,8 +121,8 @@ impl NodeConfig {
             }
         }
 
-        // 走到这里：文件不存在 或 解析失败后重命名完成
-        // 创建默认配置并写入文件
+        // Reached here when the file is missing or was renamed after a parse failure.
+        // Create the default config and write it to disk.
         let default_config = NodeConfig::default();
         let toml_string = match toml::to_string_pretty(&default_config) {
             Ok(s) => s,
@@ -164,7 +164,8 @@ pub struct NodeInfo {
     pub name: String,
     #[serde(default = "default_description")]
     pub description: String,
-    /// 是否允许在自身双栈的前提下成为 bootstrap 节点（发布 DHT provider 记录）。
+    /// Whether this node may act as a bootstrap node when dual-stack (publishes
+    /// a DHT provider record).
     #[serde(default = "bool_true")]
     pub allow_bootstrap: bool,
 }
@@ -273,18 +274,21 @@ impl Default for KademliaService {
     }
 }
 
-/// 中继预约（消费者侧）配置。
+/// Relay reservation (consumer side) configuration.
 ///
-/// 单栈节点通过向 bootstrap 节点（概念上必须是双栈中继）预约 `p2p-circuit`
-/// 来获得跨 IP 族的可达性。目标数量固定为 3，尽力而为，不强求。
+/// A single-stack node reserves a `p2p-circuit` on bootstrap nodes
+/// (conceptually dual-stack relays) to gain reachability across IP families.
+/// The target count is fixed at 3 and best-effort only.
 ///
-/// 是否需要预约由「自身是否双栈」决定：非双栈即消费者，无需开关。
+/// Whether reservations are needed is decided by the node's own stack: a
+/// non-dual-stack node is a consumer and needs no switch.
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct RelayService {
-    /// 补约检查间隔（秒）。
+    /// Interval between top-up checks, in seconds.
     #[serde(default = "default_relay_retry_interval")]
     pub retry_interval_secs: u32,
-    /// 连续预约失败多少次后，将节点从 bootstrap 列表剔除。
+    /// Consecutive reservation failures before evicting the node from the
+    /// bootstrap list.
     #[serde(default = "default_relay_max_failures")]
     pub max_failures: u32,
 }
@@ -301,9 +305,8 @@ impl Default for RelayService {
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct LocalServiceEntry {
     pub name: String,
-    pub host: String,
     pub port: u16,
-    /// 该服务是否要求鉴权
+    /// Whether this service requires authentication.
     #[serde(default = "bool_false")]
     pub require_auth: bool,
 }
@@ -341,21 +344,24 @@ pub struct CryptoConfig {
     pub pq_required: bool,
 }
 
-/// 节点级鉴权配置
+/// Node-level authentication configuration.
 ///
-/// `network = "none"` 表示不鉴权；其余取值需在 `networks` 中有对应的权威公钥
+/// `network = "none"` disables authentication; any other value must have a
+/// matching authority public key under `networks`.
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct AuthConfig {
-    /// 当前节点所属鉴权网络名；"none" 表示不鉴权
+    /// Authentication network this node belongs to; "none" disables
+    /// authentication.
     #[serde(default = "default_auth_network")]
     pub network: String,
-    /// 鉴权索引/白名单的本地缓存有效期（秒）；索引另有 `expires_at`
+    /// Local cache TTL for the auth index and whitelists, in seconds; the index
+    /// also carries its own `expires_at`.
     #[serde(default = "default_auth_cache_ttl")]
     pub cache_ttl_secs: u32,
-    /// 后台刷新间隔
+    /// Background refresh interval.
     #[serde(default = "default_auth_refresh_interval")]
     pub refresh_interval_secs: u32,
-    /// 网络名 -> 信任锚
+    /// Network name -> trust anchor.
     #[serde(default)]
     pub networks: HashMap<String, AuthNetworkConfig>,
 }
@@ -371,10 +377,10 @@ impl Default for AuthConfig {
     }
 }
 
-/// 单个鉴权网络的信任锚
+/// Trust anchor of a single authentication network.
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct AuthNetworkConfig {
-    /// 权威 ed25519 公钥（base64），由 `auth` 模块解析
+    /// Authority ed25519 public key (base64), parsed by the `auth` module.
     #[serde(default)]
     pub authority: String,
 }
@@ -392,6 +398,12 @@ pub struct ConfigHandle {
     inner: Arc<RwLock<NodeConfig>>,
 }
 
+/// Config file path, resolved once via `paths::fail_path_gener`.
+fn config_filepath() -> &'static Path {
+    static PATH: OnceLock<PathBuf> = OnceLock::new();
+    PATH.get_or_init(|| paths::fail_path_gener(paths::FailType::Config, "config.toml"))
+}
+
 impl ConfigHandle {
     pub fn new(config: NodeConfig) -> Self {
         Self {
@@ -405,12 +417,13 @@ impl ConfigHandle {
     }
 
     pub fn load_or_create_default() -> Self {
-        Self::from_toml_file(paths::config_path(), true)
+        Self::from_toml_file(config_filepath(), true)
     }
 
-    /// 将当前配置保存到 TOML 文件
-    /// 如果文件已存在，会覆盖写入
-    /// 如果写入失败（如权限不足、磁盘满），会记录 Critical 日志并退出程序
+    /// Save the current config to a TOML file.
+    ///
+    /// Overwrites an existing file. On write failure (e.g. permissions, disk
+    /// full) it logs Critical and exits the process.
     fn save_to_file(&self, path: impl AsRef<Path>) {
         let path = path.as_ref();
         let snapshot = self.snapshot();
@@ -451,22 +464,22 @@ impl ConfigHandle {
         }
     }
 
-    /// 便捷方法：保存到默认路径（由 paths::config_path() 解析）
+    /// Save to the default config path (`NEXUSNET_CONFIG_PATH`).
     pub fn save_to_default(&self) {
-        self.save_to_file(paths::config_path());
+        self.save_to_file(config_filepath());
     }
 
-    /// 获取只读锁
+    /// Acquire a read lock.
     pub fn read(&self) -> RwLockReadGuard<'_, NodeConfig> {
         self.inner.read().expect("RwLock 被污染")
     }
 
-    /// 获取写锁
+    /// Acquire a write lock.
     pub fn write(&self) -> RwLockWriteGuard<'_, NodeConfig> {
         self.inner.write().expect("RwLock 被污染")
     }
 
-    // ========== 便捷只读方法 ==========
+    // ========== Convenience getters ==========
     pub fn allow_bootstrap(&self) -> bool {
         self.read().node.allow_bootstrap
     }
@@ -515,13 +528,13 @@ impl ConfigHandle {
         self.read().crypto.pq_required
     }
 
-    /// PQ 是否启用（传输或身份任一）。
+    /// Whether PQ is enabled (transport or identity).
     pub fn pq_enabled(&self) -> bool {
         let c = self.read();
         c.crypto.pq_transport_enabled || c.crypto.pq_identity_enabled
     }
 
-    // ========== 鉴权 ==========
+    // ========== Authentication ==========
     pub fn auth_network(&self) -> String {
         self.read().auth.network.clone()
     }
@@ -534,7 +547,8 @@ impl ConfigHandle {
         self.read().auth.refresh_interval_secs
     }
 
-    /// 返回指定网络的权威公钥（base64 原文），解析由 `auth` 模块负责
+    /// Raw base64 authority public key for `network`; parsing is handled by
+    /// the `auth` module.
     pub fn auth_authority(&self, network: &str) -> Option<String> {
         self.read()
             .auth
@@ -543,7 +557,8 @@ impl ConfigHandle {
             .map(|n| n.authority.clone())
     }
 
-    /// 本地配置中要求鉴权的服务名（用于定向刷新白名单）
+    /// Local services that require authentication (used to target whitelist
+    /// refreshes).
     pub fn auth_required_services(&self) -> Vec<String> {
         self.read()
             .services
@@ -592,7 +607,7 @@ impl ConfigHandle {
         self.read().network.ipv4_enabled
     }
 
-    // ========== 便捷修改方法 ==========
+    // ========== Convenience setters ==========
     pub fn set_ping_enabled(&self, enabled: bool) {
         self.write().services.ping.enabled = enabled;
     }
@@ -631,7 +646,8 @@ impl ConfigHandle {
         cfg.network.ipv4_address = address;
     }
 
-    /// 设置指定本地服务是否要求鉴权；返回是否命中且发生了修改
+    /// Set whether a local service requires authentication; returns true if it
+    /// was found and actually changed.
     pub fn set_service_require_auth(&self, name: &str, require_auth: bool) -> bool {
         let mut cfg = self.write();
         match cfg
@@ -650,12 +666,12 @@ impl ConfigHandle {
         }
     }
 
-    /// 替换整个 NodeConfig
+    /// Replace the entire `NodeConfig`.
     pub fn replace_config(&self, new_config: NodeConfig) {
         *self.write() = new_config;
     }
 
-    /// 获取配置的快照
+    /// Get a snapshot of the config.
     pub fn snapshot(&self) -> NodeConfig {
         self.read().clone()
     }
