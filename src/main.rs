@@ -16,7 +16,6 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 mod auth;
-mod boot;
 mod config;
 mod log;
 mod network;
@@ -26,6 +25,7 @@ mod service_dispatcher;
 mod service_protocol;
 mod sidecar_protocol;
 
+use crate::config::ConfigHandle;
 use log::{LogLevel, LogStruct};
 use network::{KeyManager, Network};
 use node_controller::{NodeController, auth_refresher};
@@ -46,11 +46,14 @@ use crate::sidecar_protocol::Message;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    let config_handle = boot::init();
+    let config_handle = ConfigHandle::load_or_create_default();
     if let Err(e) = network::update_config_with_public_ip(&config_handle) {
         LogStruct::new(LogLevel::Warning, "更新公网IP失败", e.to_string()).emit();
     }
-    let mut key_manager = KeyManager::load_or_create(paths::keypair_path())?;
+    let mut key_manager = KeyManager::load_or_create(paths::fail_path_gener(
+        paths::FailType::Keypair,
+        "keypair.bin",
+    ))?;
     if config_handle.pq_enabled()
         && let Err(e) = key_manager.ensure_pq_keys()
     {
