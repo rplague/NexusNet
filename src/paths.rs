@@ -15,71 +15,62 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-//! 统一路径解析。
-//!
-//! - systemd 部署：由 `NEXUSNET_HOME` / `NEXUSNET_LOG_PATH` 等环境变量锚定标准目录。
-//! - 本地 `cargo run`：未设置任何环境变量时回退当前目录（`./config.toml`、`./keypair.bin`、`./log`），
-//!   以兼容既有行为。
-
 use std::env;
 use std::path::PathBuf;
 
-/// 当前进程是否显式指定了应用数据根目录（`NEXUSNET_HOME`）。
-fn has_data_home() -> bool {
-    env::var_os("NEXUSNET_HOME").is_some_and(|v| !v.is_empty())
-}
-
-/// 应用数据根目录。
+/// Directory that holds `config.toml`.
 ///
-/// 优先级：`NEXUSNET_HOME` 环境变量 -> 默认 `/var/lib/nexusnet`。
-fn data_home() -> PathBuf {
-    match env::var_os("NEXUSNET_HOME") {
-        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
-        _ => PathBuf::from("/var/lib/nexusnet"),
-    }
-}
-
-/// 配置文件路径。
-///
-/// 优先级：`NEXUSNET_CONFIG` -> `$NEXUSNET_HOME/config.toml` -> `./config.toml`。
-pub fn config_path() -> PathBuf {
-    if let Some(path) = env::var_os("NEXUSNET_CONFIG")
+/// `NEXUSNET_CONFIG_PATH` if set (non-empty); otherwise the current directory.
+fn config_path() -> PathBuf {
+    if let Some(path) = env::var_os("NEXUSNET_CONFIG_PATH")
         && !path.is_empty()
     {
         return PathBuf::from(path);
     }
-    if has_data_home() {
-        return data_home().join("config.toml");
-    }
-    PathBuf::from("./config.toml")
+    PathBuf::from("./")
 }
 
-/// 节点身份密钥路径。
+/// Directory that holds the node identity key (`keypair.bin`).
 ///
-/// 优先级：`NEXUSNET_KEYPAIR` -> `$NEXUSNET_HOME/keypair.bin` -> `./keypair.bin`。
-pub fn keypair_path() -> PathBuf {
-    if let Some(path) = env::var_os("NEXUSNET_KEYPAIR")
+/// `NEXUSNET_KEYPAIR_PATH` if set (non-empty); otherwise the current directory.
+fn keypair_path() -> PathBuf {
+    if let Some(path) = env::var_os("NEXUSNET_KEYPAIR_PATH")
         && !path.is_empty()
     {
         return PathBuf::from(path);
     }
-    if has_data_home() {
-        return data_home().join("keypair.bin");
-    }
-    PathBuf::from("./keypair.bin")
+    PathBuf::from("./")
 }
 
-/// 日志文件路径。
+/// Directory that holds the log file.
 ///
-/// 优先级：`NEXUSNET_LOG_PATH` -> `$NEXUSNET_HOME/log` -> `./log`。
-pub fn log_path() -> PathBuf {
+/// `NEXUSNET_LOG_PATH` if set (non-empty); otherwise the current directory.
+fn log_path() -> PathBuf {
     if let Some(path) = env::var_os("NEXUSNET_LOG_PATH")
         && !path.is_empty()
     {
         return PathBuf::from(path);
     }
-    if has_data_home() {
-        return data_home();
-    }
     PathBuf::from("./")
+}
+
+/// Selects the base directory used by [`fail_path_gener`].
+#[derive(Debug, PartialEq)]
+pub enum FailType {
+    /// Directory holding `config.toml`.
+    Config,
+    /// Directory holding `keypair.bin`.
+    Keypair,
+    /// Directory holding the log file.
+    Log,
+}
+
+/// Join `fail_name` onto the directory selected by `fail_type`.
+pub fn fail_path_gener(fail_type: FailType, fail_name: &str) -> PathBuf {
+    let base = match fail_type {
+        FailType::Config => config_path(),
+        FailType::Keypair => keypair_path(),
+        FailType::Log => log_path(),
+    };
+    base.join(fail_name)
 }
