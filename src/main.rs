@@ -28,28 +28,22 @@ mod sidecar_protocol;
 use crate::config::ConfigHandle;
 use log::{LogLevel, LogStruct};
 use network::{KeyManager, Network};
-use node_controller::{NodeController, auth_refresher};
+use node_controller::NodeController;
 use std::error::Error;
-use std::sync::{Arc, RwLock};
-use tokio::sync::Notify;
 use tokio::sync::mpsc;
 #[cfg(unix)]
 use tokio::sync::oneshot;
 use tokio::sync::watch;
 
-use crate::auth::AuthCache;
 #[cfg(unix)]
-use crate::service_dispatcher::ControlRequest;
-use crate::service_dispatcher::ServiceDispatcher;
+use crate::service_dispatcher::ControlCommand;
+use crate::service_dispatcher::{ServiceDispatcher, ToController};
 #[cfg(unix)]
 use crate::sidecar_protocol::Message;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let config_handle = ConfigHandle::load_or_create_default();
-    if let Err(e) = network::update_config_with_public_ip(&config_handle) {
-        LogStruct::new(LogLevel::Warning, "更新公网IP失败", e.to_string()).emit();
-    }
     let mut key_manager = KeyManager::load_or_create(paths::fail_path_gener(
         paths::FailType::Keypair,
         "keypair.bin",
@@ -59,93 +53,54 @@ async fn main() -> Result<(), Box<dyn Error>> {
     {
         LogStruct::new(LogLevel::Warning, "PQ 密钥初始化失败", e.to_string()).emit();
     }
+    if let Err(e) = network::update_config_with_public_ip(&config_handle) {
+        LogStruct::new(LogLevel::Warning, "更新公网IP失败", e.to_string()).emit();
+    }
     let peer_id = key_manager.peer_id();
-    let dial: Vec<String> = network::dialable_addrs(&config_handle, peer_id)
+    let announce: Vec<String> = config_handle
+        .dialable_addrs(peer_id)
         .iter()
         .map(|a| a.to_string())
         .collect();
-    let identity = if dial.is_empty() {
+    let identity = if announce.is_empty() {
         format!("PeerId: {}", peer_id)
     } else {
-        format!("PeerId: {}\n    {}", peer_id, dial.join("\n    "))
+        format!("PeerId: {}\n    {}", peer_id, announce.join("\n    "))
     };
     LogStruct::new(LogLevel::Important, "节点身份", identity).emit();
 
-    // 构建网络并启动 Swarm Actor
+    // Build the network and start the Swarm actor.
     let keypair = key_manager.keypair().clone();
     let pq_keys = key_manager.take_pq_keys();
     let network = Network::start(config_handle.clone(), keypair, pq_keys)?;
 
-    // 拨号已有的 bootstrap 节点
+    // Dial the configured bootstrap nodes.
     for addr in config_handle.bootstrap_nodes() {
         if let Err(e) = network.handle.dial(addr).await {
             LogStruct::new(LogLevel::Warning, "拨号节点失败", e.to_string()).emit();
         }
     }
 
-    //    cmd_tx -> ServiceDispatcher 发送命令给 NodeController
-    //    cmd_rx -> NodeController 接收命令
-    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
-    //    inbound_req_tx -> NodeController 发送入站请求给 ServiceDispatcher
-    //    inbound_req_rx -> ServiceDispatcher 接收入站请求
-    let (inbound_req_tx, inbound_req_rx) = mpsc::unbounded_channel();
-    //    backend_status_tx -> ServiceDispatcher 上报后端就绪状态给 NodeController
-    //    backend_status_rx -> NodeController 接收后端就绪状态
-    let (backend_status_tx, backend_status_rx) = mpsc::unbounded_channel();
+    //   to_controller_tx -> ServiceDispatcher reports control commands and
+    //                       backend status to NodeController
+    //   to_dispatcher_tx -> NodeController forwards inbound service requests to
+    //                       ServiceDispatcher
+    let (to_controller_tx, to_controller_rx) = mpsc::unbounded_channel();
+    let (to_dispatcher_tx, to_dispatcher_rx) = mpsc::unbounded_channel();
 
-    // 信号处理：SIGTERM / Ctrl-C 优雅退出；SIGHUP 触发热重载，配合 systemd ExecReload（仅 unix）
+    // Signal handling: SIGINT/SIGTERM/Ctrl-C trigger shutdown; SIGHUP requests a
+    // hot reload (unix only).
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    #[cfg(unix)]
-    let reload_tx = cmd_tx.clone();
+    let signal_tx = to_controller_tx.clone();
     tokio::spawn(async move {
-        #[cfg(unix)]
-        {
-            let mut sigterm =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                    .expect("无法安装 SIGTERM 处理器");
-            let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
-                .expect("无法安装 SIGHUP 处理器");
-            loop {
-                tokio::select! {
-                    _ = tokio::signal::ctrl_c() => break,
-                    _ = sigterm.recv() => break,
-                    _ = sighup.recv() => {
-                        LogStruct::new(LogLevel::Warning, "收到 SIGHUP", "重新加载配置并重建网络...").emit();
-                        let (resp_tx, _resp_rx) = oneshot::channel();
-                        let _ = reload_tx.send(ControlRequest {
-                            msg: Message::ReloadConfig {
-                                id: uuid::Uuid::new_v4(),
-                            },
-                            resp_tx,
-                        });
-                    }
-                }
-            }
-        }
-        #[cfg(windows)]
-        {
-            // Windows 服务（NSSM）以 Ctrl+C 触发优雅退出，无 SIGHUP 热重载。
-            let _ = tokio::signal::ctrl_c().await;
-        }
-        LogStruct::new(LogLevel::Warning, "收到退出信号", "正在优雅关闭...").emit();
+        wait_for_signal(signal_tx).await;
+        LogStruct::new(LogLevel::Warning, "收到退出信号", "正在关闭...").emit();
         let _ = shutdown_tx.send(true);
     });
 
-    // 鉴权缓存与后台刷新任务
-    let auth_cache = Arc::new(RwLock::new(AuthCache::default()));
-    let auth_notify = Arc::new(Notify::new());
-    tokio::spawn(auth_refresher(
-        config_handle.clone(),
-        network.handle.clone(),
-        auth_cache.clone(),
-        auth_notify.clone(),
-        shutdown_rx.clone(),
-    ));
-
     let dispatcher = ServiceDispatcher::new(
-        inbound_req_rx,
-        cmd_tx,
-        backend_status_tx.clone(),
+        to_dispatcher_rx,
+        to_controller_tx.clone(),
         config_handle.clone(),
         shutdown_rx.clone(),
     );
@@ -153,22 +108,60 @@ async fn main() -> Result<(), Box<dyn Error>> {
         dispatcher.run().await;
     });
 
-    // 保活：即使 dispatcher 提前退出，NodeController 的状态通道也不关闭。
-    let _backend_status_keepalive = backend_status_tx;
+    // Keep-alive: even if the dispatcher exits early, NodeController's
+    // controller channel stays open.
+    let _to_controller_keepalive = to_controller_tx;
 
     let controller = NodeController::new(
         config_handle,
         peer_id,
-        cmd_rx,
-        inbound_req_tx,
-        backend_status_rx,
+        to_controller_rx,
+        to_dispatcher_tx,
         network,
         shutdown_rx,
-        auth_cache,
-        auth_notify,
     );
     if let Err(e) = controller.run().await {
         LogStruct::new(LogLevel::Critical, "节点运行错误", e.to_string()).emit();
     }
     Ok(())
+}
+
+/// Request a hot reload on SIGHUP (fire-and-forget).
+#[cfg(unix)]
+fn request_reload(reload_tx: &mpsc::UnboundedSender<ToController>) {
+    let (resp_tx, _resp_rx) = oneshot::channel();
+    let _ = reload_tx.send(ToController::Control(ControlCommand {
+        msg: Message::ReloadConfig {
+            id: uuid::Uuid::new_v4(),
+        },
+        resp_tx,
+    }));
+}
+
+/// Wait for an exit signal, handling SIGHUP reloads while waiting.
+#[cfg(unix)]
+async fn wait_for_signal(reload_tx: mpsc::UnboundedSender<ToController>) {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut sigint = signal(SignalKind::interrupt()).expect("无法安装 SIGINT 处理器");
+    let mut sigterm = signal(SignalKind::terminate()).expect("无法安装 SIGTERM 处理器");
+    let mut sighup = signal(SignalKind::hangup()).expect("无法安装 SIGHUP 处理器");
+
+    loop {
+        tokio::select! {
+            _ = sigint.recv() => return,
+            _ = sigterm.recv() => return,
+            _ = sighup.recv() => {
+                LogStruct::new(LogLevel::Warning, "收到 SIGHUP", "重新加载配置并重建网络...").emit();
+                request_reload(&reload_tx);
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+async fn wait_for_signal(_reload_tx: mpsc::UnboundedSender<ToController>) {
+    // Windows service (NSSM) triggers graceful shutdown via Ctrl+C; no SIGHUP
+    // hot reload.
+    let _ = tokio::signal::ctrl_c().await;
 }

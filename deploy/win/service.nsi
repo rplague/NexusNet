@@ -72,12 +72,14 @@ Section "Install"
   nsExec::ExecToLog '"$INSTDIR\nssm.exe" set @PKG@ Start SERVICE_AUTO_START'
   nsExec::ExecToLog '"$INSTDIR\nssm.exe" set @PKG@ AppExit Default Restart'
   nsExec::ExecToLog '"$INSTDIR\nssm.exe" set @PKG@ AppStopMethodConsole 15000'
-  nsExec::ExecToLog '"$INSTDIR\nssm.exe" set @PKG@ AppEnvironmentExtra "NEXUSNET_HOME=$DataDir" "NEXUSNET_CONFIG=$DataDir\config.toml" "NEXUSNET_LOG_PATH=$DataDir"'
+  nsExec::ExecToLog '"$INSTDIR\nssm.exe" set @PKG@ AppEnvironmentExtra "NEXUSNET_CONFIG_PATH=$DataDir" "NEXUSNET_KEYPAIR_PATH=$DataDir" "NEXUSNET_LOG_PATH=$DataDir" "NEXUSNET_LOG_MODE=nssm"'
   nsExec::ExecToLog '"$INSTDIR\nssm.exe" set @PKG@ AppStdout "$DataDir\service.out.log"'
   nsExec::ExecToLog '"$INSTDIR\nssm.exe" set @PKG@ AppStderr "$DataDir\service.err.log"'
   nsExec::ExecToLog '"$INSTDIR\nssm.exe" set @PKG@ AppRotateFiles 1'
+  nsExec::ExecToLog '"$INSTDIR\nssm.exe" set @PKG@ AppRotateOnline 1'
+  nsExec::ExecToLog '"$INSTDIR\nssm.exe" set @PKG@ AppRotateBytes 10485760'
 
-  ; 虚拟服务账号（无需密码）
+  ; 虚拟服务账号
   nsExec::ExecToLog 'sc.exe config @PKG@ obj= "NT SERVICE\@PKG@" start= auto'
   nsExec::ExecToLog 'sc.exe description @PKG@ "NexusNet P2P node (OAHD core network layer)"'
 

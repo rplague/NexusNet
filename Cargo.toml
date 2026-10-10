@@ -5,31 +5,31 @@ edition = "2024"
 license = "GPL-3.0"
 
 [dependencies]
+base64 = "0.22"
+chacha20poly1305 = "0.10"
 chrono = "0.4.44"
+ciborium = "0.2"
 colored = "3.1.1"
+coset = "0.4"
 flate2 = "1.1.9"
+get_if_addrs = "0.5.3"
+hkdf = "0.12"
 libp2p = { version = "0.56.0", features = ["full"] }
 log = "0.4.29"
+ml-dsa = { version = "0.1.1", features = ["alloc", "getrandom", "rand_core", "zeroize"] }
+ml-kem = { version = "0.3.2", features = ["alloc", "getrandom", "zeroize"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+reqwest = { version = "0.11", default-features = false, features = ["blocking", "rustls-tls"] }
+scopeguard = "1"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
+sha2 = "0.10"
 toml = "0.8"
 tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.11", default-features = false, features = ["blocking", "rustls-tls"] }
-get_if_addrs = "0.5.3"
-base64 = "0.22"
-scopeguard = "1"
 uuid = { version = "1.23.1", features = ["serde", "v4"] }
-coset = "0.4"
-ciborium = "0.2"
-ml-kem = { version = "0.3.2", features = ["alloc", "getrandom", "zeroize"] }
-ml-dsa = { version = "0.1.1", features = ["alloc", "getrandom", "rand_core", "zeroize"] }
-hkdf = "0.12"
-sha2 = "0.10"
-chacha20poly1305 = "0.10"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
-rand_core = { version = "0.6", features = ["getrandom"] }
 
-# Windows 交叉编译需 iphlpapi 全小写链接名（大小写敏感的 Linux 主机）；
-# get_if_addrs 0.5.3 硬编码 #[link(name = "Iphlpapi")]，故本地 vendored 修正。
+# Windows 交叉编译需 iphlpapi 全小写链接名
+# get_if_addrs 0.5.3 硬编码 #[link(name = "Iphlpapi")]，故本地 vendored 修正
 [patch.crates-io]
 get_if_addrs = { path = "vendor/get_if_addrs" }

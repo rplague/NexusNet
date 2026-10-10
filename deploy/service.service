@@ -9,9 +9,10 @@ Type=simple
 User=@USER@
 Group=@USER@
 WorkingDirectory=/var/lib/@PKG@
-Environment=NEXUSNET_HOME=/var/lib/@PKG@
-Environment=NEXUSNET_CONFIG=/etc/@PKG@/config.toml
-Environment=NEXUSNET_LOG_PATH=/var/lib/@PKG@
+Environment=NEXUSNET_CONFIG_PATH=/etc/@PKG@/
+Environment=NEXUSNET_LOG_PATH=/var/lib/@PKG@/
+Environment=NEXUSNET_KEYPAIR_PATH=/var/lib/@PKG@/
+Environment=NEXUSNET_LOG_MODE=journald
 
 ExecStart=/usr/bin/@BIN@
 ExecReload=/bin/kill -HUP $MAINPID

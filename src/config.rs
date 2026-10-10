@@ -17,7 +17,8 @@
 
 use crate::paths;
 use crate::{LogLevel, LogStruct};
-use libp2p::Multiaddr;
+use libp2p::multiaddr::Protocol;
+use libp2p::{Multiaddr, PeerId};
 use std::collections::HashMap;
 use std::fs;
 use std::io;
@@ -55,8 +56,6 @@ default_u32_fn!(default_replication_factor, 20);
 default_u32_fn!(default_query_timeout_seconds, 60);
 default_u32_fn!(default_relay_retry_interval, 60);
 default_u32_fn!(default_relay_max_failures, 3);
-default_u32_fn!(default_auth_cache_ttl, 300);
-default_u32_fn!(default_auth_refresh_interval, 60);
 
 fn default_auth_network() -> String {
     "none".to_string()
@@ -196,8 +195,6 @@ pub struct NetworkConfig {
     pub ipv6_address: Option<IpAddr>,
     #[serde(default = "default_port")]
     pub port: u32,
-    #[serde(default = "default_announce_addresses")]
-    pub announce_addresses: Vec<Multiaddr>,
 }
 
 impl Default for NetworkConfig {
@@ -208,7 +205,6 @@ impl Default for NetworkConfig {
             ipv6_enabled: bool_false(),
             ipv6_address: None,
             port: default_port(),
-            announce_addresses: default_announce_addresses(),
         }
     }
 }
@@ -354,13 +350,6 @@ pub struct AuthConfig {
     /// authentication.
     #[serde(default = "default_auth_network")]
     pub network: String,
-    /// Local cache TTL for the auth index and whitelists, in seconds; the index
-    /// also carries its own `expires_at`.
-    #[serde(default = "default_auth_cache_ttl")]
-    pub cache_ttl_secs: u32,
-    /// Background refresh interval.
-    #[serde(default = "default_auth_refresh_interval")]
-    pub refresh_interval_secs: u32,
     /// Network name -> trust anchor.
     #[serde(default)]
     pub networks: HashMap<String, AuthNetworkConfig>,
@@ -370,8 +359,6 @@ impl Default for AuthConfig {
     fn default() -> Self {
         AuthConfig {
             network: default_auth_network(),
-            cache_ttl_secs: default_auth_cache_ttl(),
-            refresh_interval_secs: default_auth_refresh_interval(),
             networks: HashMap::new(),
         }
     }
@@ -539,14 +526,6 @@ impl ConfigHandle {
         self.read().auth.network.clone()
     }
 
-    pub fn auth_cache_ttl(&self) -> u32 {
-        self.read().auth.cache_ttl_secs
-    }
-
-    pub fn auth_refresh_interval(&self) -> u32 {
-        self.read().auth.refresh_interval_secs
-    }
-
     /// Raw base64 authority public key for `network`; parsing is handled by
     /// the `auth` module.
     pub fn auth_authority(&self, network: &str) -> Option<String> {
@@ -597,6 +576,27 @@ impl ConfigHandle {
 
     pub fn bootstrap_nodes(&self) -> Vec<Multiaddr> {
         self.read().services.kademlia.bootstrap_nodes.clone()
+    }
+
+    /// External addresses (`<ip>/tcp/<port>/p2p/<peer_id>`) derived from the
+    /// configured IPv4/IPv6 addresses.
+    pub fn dialable_addrs(&self, peer_id: PeerId) -> Vec<Multiaddr> {
+        let cfg = self.read();
+        let port = cfg.network.port as u16;
+        [cfg.network.ipv4_address, cfg.network.ipv6_address]
+            .into_iter()
+            .flatten()
+            .map(|ip| {
+                let mut a = Multiaddr::empty();
+                match ip {
+                    IpAddr::V4(v4) => a.push(Protocol::Ip4(v4)),
+                    IpAddr::V6(v6) => a.push(Protocol::Ip6(v6)),
+                }
+                a.push(Protocol::Tcp(port));
+                a.push(Protocol::P2p(peer_id));
+                a
+            })
+            .collect()
     }
 
     pub fn listen_port(&self) -> u32 {
@@ -681,6 +681,45 @@ impl ConfigHandle {
 mod tests {
     use super::*;
 
+    fn peer() -> PeerId {
+        libp2p::identity::Keypair::generate_ed25519()
+            .public()
+            .to_peer_id()
+    }
+
+    #[test]
+    fn dialable_addrs_appends_peer_id() {
+        let mut cfg = NodeConfig::default();
+        cfg.network.port = 5000;
+        cfg.network.ipv4_address = Some(IpAddr::V4(std::net::Ipv4Addr::new(1, 2, 3, 4)));
+        cfg.network.ipv6_address = Some("2001:db8::1".parse().unwrap());
+        let handle = ConfigHandle::new(cfg);
+        let pid = peer();
+
+        let addrs = handle.dialable_addrs(pid);
+        assert_eq!(addrs.len(), 2);
+        assert_eq!(
+            addrs[0].to_string(),
+            format!("/ip4/1.2.3.4/tcp/5000/p2p/{pid}")
+        );
+        assert_eq!(
+            addrs[1].to_string(),
+            format!("/ip6/2001:db8::1/tcp/5000/p2p/{pid}")
+        );
+    }
+
+    #[test]
+    fn dialable_addrs_only_ipv6() {
+        let mut cfg = NodeConfig::default();
+        cfg.network.ipv6_address = Some("2001:db8::1".parse().unwrap());
+        let handle = ConfigHandle::new(cfg);
+        let pid = peer();
+
+        let addrs = handle.dialable_addrs(pid);
+        assert_eq!(addrs.len(), 1);
+        assert!(addrs[0].to_string().ends_with(&format!("/p2p/{pid}")));
+    }
+
     #[test]
     fn parse_auth_section() {
         let toml = r#"
@@ -694,8 +733,6 @@ mod tests {
         assert_eq!(handle.auth_network(), "myorg");
         assert_eq!(handle.auth_authority("myorg"), Some("AAAA".to_string()));
         assert_eq!(handle.auth_authority("other"), None);
-        assert_eq!(handle.auth_cache_ttl(), 300);
-        assert_eq!(handle.auth_refresh_interval(), 60);
     }
 
     #[test]
@@ -703,8 +740,6 @@ mod tests {
         let toml = r#"
             [auth]
             network = "myorg"
-            cache_ttl_secs = 120
-            refresh_interval_secs = 30
             [auth.networks.myorg]
             authority = "BBBB"
         "#;
@@ -712,8 +747,6 @@ mod tests {
         let s = toml::to_string_pretty(&node).unwrap();
         let back: NodeConfig = toml::from_str(&s).unwrap();
         assert_eq!(back.auth.network, "myorg");
-        assert_eq!(back.auth.cache_ttl_secs, 120);
-        assert_eq!(back.auth.refresh_interval_secs, 30);
         assert_eq!(back.auth.networks.get("myorg").unwrap().authority, "BBBB");
     }
 

@@ -15,13 +15,16 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-//! libp2p 行为聚合：把 ping / identify / kademlia / request-response / relay
-//! 组合成单一的 `NetBehaviour`，并把手写事件枚举作为 `out_event`。
+//! libp2p behaviour aggregation: combines ping / identify / kademlia /
+//! request-response / relay into a single `NetBehaviour`, with a hand-written
+//! event enum as `out_event`.
 //!
-//! 配置在构造时读取一次并固化进各行为实例。libp2p 各行为没有运行时 setter。
+//! Configuration is read once at construction and baked into each behaviour.
+//! libp2p behaviours have no runtime setters.
 //!
-//! PQ 相关的两个行为（`service_req_pq`、`pq_identity`）只在 PQ 启用时注册，
-//! 关闭时协议不出现在 Identify 协议表里，避免"假称支持"。
+//! The two PQ behaviours (`service_req_pq`, `pq_identity`) are registered only
+//! when PQ is enabled; when disabled their protocols never appear in the
+//! Identify protocol table, avoiding a false claim of support.
 
 use crate::config::ConfigHandle;
 use crate::network::pq::{self, PqIdentity, PqRequest, PqResponse};
@@ -33,6 +36,9 @@ use std::num::NonZeroUsize;
 use std::time::Duration;
 
 use crate::{LogLevel, LogStruct};
+
+/// Identify agent name reported by NexusNet nodes.
+pub const AGENT_NAME: &str = "/nexusnet";
 
 #[derive(NetworkBehaviour)]
 #[behaviour(out_event = "NetBehaviourEvent")]
@@ -47,10 +53,11 @@ pub struct NetBehaviour {
     pub relay_client: relay::client::Behaviour,
 }
 
-/// 复合行为对外发出的事件。
+/// Events emitted by the composite behaviour.
 ///
-/// 每个变体承载对应子行为的原始事件；`Toggle<T>` 的 `ToSwarm` 与 `T` 相同，
-/// 因此 `Ping`/`Kademlia` 变体仍使用 `ping::Event` / `kad::Event`。
+/// Each variant carries the wrapped behaviour's raw event; `Toggle<T>` has the
+/// same `ToSwarm` as `T`, so `Ping`/`Kademlia` still use `ping::Event` /
+/// `kad::Event`.
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 pub enum NetBehaviourEvent {
@@ -121,33 +128,23 @@ impl NetBehaviour {
     ) -> Self {
         let peer_id = keypair.public().to_peer_id();
 
-        // Ping —— enabled=false 时用 Toggle 彻底关闭
+        // Ping: fully disabled via Toggle when enabled = false.
         let ping_config = ping::Config::new()
             .with_interval(Duration::from_secs(config.ping_interval().into()))
             .with_timeout(Duration::from_secs(config.ping_timeout().into()));
         let ping: Toggle<ping::Behaviour> = if config.ping_enabled() {
             Toggle::from(Some(ping::Behaviour::new(ping_config)))
         } else {
-            LogStruct::new(
-                LogLevel::Preset,
-                "Ping 已禁用",
-                "services.ping.enabled = false",
-            )
-            .emit();
             Toggle::from(None)
         };
 
-        // Identify 配置
-        let protocol_name = "/oahd";
-        let identify_config = identify::Config::new(
-            format!("{}/{}", protocol_name, env!("CARGO_PKG_VERSION")),
-            keypair.public(),
-        )
-        .with_agent_version(format!("{}/{}", protocol_name, env!("CARGO_PKG_VERSION")))
-        .with_push_listen_addr_updates(true);
+        // Identify configuration.
+        let identify_config = identify::Config::new(AGENT_NAME.to_string(), keypair.public())
+            .with_agent_version(AGENT_NAME.to_string())
+            .with_push_listen_addr_updates(true);
         let identify = identify::Behaviour::new(identify_config);
 
-        // Kademlia 配置
+        // Kademlia configuration.
         let store = kad::store::MemoryStore::new(peer_id);
         let mut kad_config = kad::Config::new(StreamProtocol::new("/ipfs/kad/1.0.0"));
         kad_config.set_record_ttl(Some(Duration::from_secs(
@@ -174,7 +171,7 @@ impl NetBehaviour {
 
         let service_req = service_protocol::new_service_req_behaviour();
 
-        // PQ 行为：仅启用时注册
+        // PQ behaviours: registered only when enabled.
         let pq_active = config.pq_enabled();
         let service_req_pq: Toggle<cbor::Behaviour<PqRequest, PqResponse>> = if pq_active {
             Toggle::from(Some(cbor::Behaviour::new(
@@ -202,7 +199,8 @@ impl NetBehaviour {
             LogStruct::new(LogLevel::Preset, "PQ 已启用", "crypto.pq_* = true").emit();
         }
 
-        // Relay server — 双栈节点接受 reservation，单栈节点拒绝所有
+        // Relay server: dual-stack nodes accept reservations, single-stack
+        // nodes reject all.
         let is_dual_stack = {
             let cfg = config.read();
             cfg.network.ipv4_enabled && cfg.network.ipv6_enabled

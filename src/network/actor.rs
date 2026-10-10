@@ -15,17 +15,19 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-//! Swarm Actor：独占 `Swarm` 的单一事件循环。
+//! Swarm actor: a single event loop owning the `Swarm`.
 //!
-//! # 为什么需要 Actor
+//! # Why an actor is needed
 //!
-//! libp2p 是事件驱动模型：发起查询立刻返回一个 `QueryId`，真正的结果要等未来
-//! 某次轮询 `Swarm` 才出现。若调用方既轮询 Swarm 又等待查询结果，就会互相阻塞，
-//! 形成重入死锁。因此把轮询 Swarm 与等待结果拆成两个执行体：
+//! libp2p is event-driven: starting a query returns a `QueryId` immediately, and
+//! the actual result only appears on some future poll of the `Swarm`. If a
+//! caller both polls the Swarm and waits for the query result, they block each
+//! other, forming a re-entrant deadlock. So polling the Swarm and waiting for
+//! results are split into two execution contexts:
 
 use crate::config::ConfigHandle;
 use crate::network::NetworkError;
-use crate::network::behaviour::{NetBehaviour, NetBehaviourEvent};
+use crate::network::behaviour::{AGENT_NAME, NetBehaviour, NetBehaviourEvent};
 use crate::network::builder::build_swarm;
 use crate::network::pq::{self, PqIdentity, PqKeys, PqRequest, PqResponse};
 use crate::service_protocol;
@@ -38,10 +40,11 @@ use libp2p::{
     request_response,
 };
 use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
-/// 上层 NodeController 通过 [`NetworkHandle`] 发给 Actor 的命令。
+/// Commands sent to the actor by `NodeController` through [`NetworkHandle`].
 pub enum SwarmCommand {
     KadGetRecord {
         key: kad::RecordKey,
@@ -64,6 +67,11 @@ pub enum SwarmCommand {
         key: kad::RecordKey,
         resp: oneshot::Sender<Result<(), NetworkError>>,
     },
+    /// Clear the `get_record` result cache; replies with the number of entries
+    /// removed.
+    KadCacheRefresh {
+        resp: oneshot::Sender<Result<usize, NetworkError>>,
+    },
     ServiceSendRequest {
         peer: PeerId,
         request: service_protocol::Request,
@@ -84,19 +92,19 @@ pub enum SwarmCommand {
     DisconnectPeer {
         peer: PeerId,
     },
-    /// 用当前配置重建整个 Swarm，用于热重载。
+    /// Rebuild the whole Swarm from the current config, for hot reload.
     Reload {
         resp: oneshot::Sender<Result<(), NetworkError>>,
     },
     Shutdown,
 }
 
-/// Actor 转发给 NodeController 的事件。
+/// Events forwarded from the actor to `NodeController`.
 #[allow(clippy::large_enum_variant)]
 pub enum NetworkEvent {
     Ping(ping::Event),
     Identify(identify::Event),
-    /// 本轮 Swarm 生命周期内首次 bootstrap 成功。
+    /// First successful bootstrap within this Swarm's lifetime.
     BootstrapCompleted,
     InboundServiceRequest {
         peer: PeerId,
@@ -107,14 +115,16 @@ pub enum NetworkEvent {
     },
     Relay(relay::Event),
     RelayClient(relay::client::Event),
-    /// 某个监听器关闭。`addresses` 含该监听器曾监听的全部地址；
-    /// 中继预约失败或掉线会以带 `p2p-circuit` 的地址出现在这里。
+    /// A listener closed. `addresses` holds all addresses it ever listened on;
+    /// failed or dropped relay reservations show up here with a `p2p-circuit`
+    /// address.
     ListenerClosed {
         addresses: Vec<Multiaddr>,
     },
 }
 
-/// 对外异步门面。所有方法通过命令通道与 Actor 通信，内部使用 oneshot 回执。
+/// Async facade. All methods talk to the actor via a command channel, using
+/// oneshot channels for replies internally.
 #[derive(Clone)]
 pub struct NetworkHandle {
     cmd_tx: mpsc::UnboundedSender<SwarmCommand>,
@@ -125,7 +135,8 @@ impl NetworkHandle {
         Self { cmd_tx }
     }
 
-    /// 通用「发命令 + 等回执」辅助：消除各方法的 oneshot 样板。
+    /// Generic "send command + await reply" helper, removing per-method oneshot
+    /// boilerplate.
     async fn request<T>(
         &self,
         make: impl FnOnce(oneshot::Sender<T>) -> SwarmCommand,
@@ -150,6 +161,18 @@ impl NetworkHandle {
     pub async fn get_providers(&self, key: kad::RecordKey) -> Result<Vec<PeerId>, NetworkError> {
         match self
             .request(|resp| SwarmCommand::KadGetProviders { key, resp })
+            .await
+        {
+            Ok(inner) => inner,
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Clear the `get_record` result cache; returns the number of entries
+    /// removed.
+    pub async fn refresh_record_cache(&self) -> Result<usize, NetworkError> {
+        match self
+            .request(|resp| SwarmCommand::KadCacheRefresh { resp })
             .await
         {
             Ok(inner) => inner,
@@ -233,12 +256,13 @@ impl NetworkHandle {
         }
     }
 
-    /// 主动断开某 peer，无需等待回执。
+    /// Disconnect a peer, without waiting for a reply.
     pub fn disconnect_peer(&self, peer: PeerId) {
         let _ = self.cmd_tx.send(SwarmCommand::DisconnectPeer { peer });
     }
 
-    /// 用当前 `ConfigHandle` 重建 Swarm。会瞬断所有连接并清空 DHT 本地存储。
+    /// Rebuild the Swarm from the current `ConfigHandle`. Drops all connections
+    /// and clears the DHT local store.
     pub async fn reload(&self) -> Result<(), NetworkError> {
         match self.request(|resp| SwarmCommand::Reload { resp }).await {
             Ok(inner) => inner,
@@ -246,36 +270,44 @@ impl NetworkHandle {
         }
     }
 
-    /// 通知 Actor 退出循环。
+    /// Tell the actor to exit its loop.
     pub fn shutdown(&self) {
         let _ = self.cmd_tx.send(SwarmCommand::Shutdown);
     }
 }
 
-/// Kademlia 查询挂起表条目。
+/// A pending Kademlia query entry.
 enum KadPending {
-    GetRecord(oneshot::Sender<Result<kad::GetRecordOk, NetworkError>>),
+    GetRecord {
+        key: kad::RecordKey,
+        resp: oneshot::Sender<Result<kad::GetRecordOk, NetworkError>>,
+    },
     GetProviders {
         resp: oneshot::Sender<Result<Vec<PeerId>, NetworkError>>,
-        /// 已累积的 provider 集合。libp2p 会分多批回报，需累积到查询终结。
+        /// Accumulated provider set. libp2p reports in batches, so it is
+        /// accumulated until the query finalizes.
         providers: HashSet<PeerId>,
     },
-    PutRecord(oneshot::Sender<Result<(), NetworkError>>),
+    PutRecord {
+        key: kad::RecordKey,
+        value: Vec<u8>,
+        resp: oneshot::Sender<Result<(), NetworkError>>,
+    },
     StartProviding(oneshot::Sender<Result<(), NetworkError>>),
 }
 
 impl KadPending {
-    /// 查询被取消时回填错误，例如 reload。
+    /// Backfill an error when the query is cancelled, e.g. on reload.
     fn fail(self, err: NetworkError) {
         match self {
-            KadPending::GetRecord(tx) => {
-                let _ = tx.send(Err(err));
+            KadPending::GetRecord { resp, .. } => {
+                let _ = resp.send(Err(err));
             }
             KadPending::GetProviders { resp, .. } => {
                 let _ = resp.send(Err(err));
             }
-            KadPending::PutRecord(tx) => {
-                let _ = tx.send(Err(err));
+            KadPending::PutRecord { resp, .. } => {
+                let _ = resp.send(Err(err));
             }
             KadPending::StartProviding(tx) => {
                 let _ = tx.send(Err(err));
@@ -284,14 +316,28 @@ impl KadPending {
     }
 }
 
-/// 累积 `GetProviders` 查询的进度事件。
+/// TTL of the in-memory `get_record` result cache.
+const RECORD_CACHE_TTL: Duration = Duration::from_secs(60);
+/// Maximum number of cached records; when full a random third is evicted.
+const RECORD_CACHE_CAPACITY: usize = 1024;
+
+/// A cached `get_record` result. `value == None` is a negative cache entry.
+struct CachedRecord {
+    value: Option<Vec<u8>>,
+    fetched_at: Instant,
+}
+
+/// Accumulate progress events for a `GetProviders` query.
 ///
-/// libp2p 会先以 `FoundProviders` 回报本地 store 命中的 provider，再随 DHT 查询
-/// 陆续回报更多批次，最后以 `FinishedWithNoAdditionalRecord`（或 `Err`）终结。
-/// 因此必须累积所有批次，直到终结事件才能回执，否则会漏掉 DHT 发现的 provider。
+/// libp2p reports providers whose records hit the local store first via
+/// `FoundProviders`, then more batches as the DHT query proceeds, and finally
+/// terminates with `FinishedWithNoAdditionalRecord` (or `Err`). All batches
+/// must be accumulated until the terminal event, or providers discovered by the
+/// DHT would be lost.
 ///
-/// 返回 `None` 表示查询已终结、结果已通过 `resp` 回执；返回 `Some` 表示仍需等待
-/// 后续事件（原挂起项原样返回）。非 `GetProviders` 条目原样返回。
+/// Returns `None` once the query finalized and the result was sent via `resp`;
+/// `Some` means more events are needed (the pending entry is returned as-is).
+/// Non-`GetProviders` entries are returned as-is.
 fn apply_get_providers(
     pending: KadPending,
     result: Result<kad::GetProvidersOk, kad::GetProvidersError>,
@@ -324,14 +370,14 @@ fn apply_get_providers(
     }
 }
 
-/// 启动结果：门面 + 事件流 + 任务句柄。
+/// Start result: facade + event stream + task handle.
 pub struct NetworkStart {
     pub handle: NetworkHandle,
     pub events: mpsc::UnboundedReceiver<NetworkEvent>,
     pub task: tokio::task::JoinHandle<()>,
 }
 
-/// 入站请求的回复上下文：区分明文与 PQ。
+/// Reply context for an inbound request: distinguishes plain and PQ.
 enum PendingInbound {
     Plain(request_response::ResponseChannel<service_protocol::Response>),
     Pq {
@@ -340,7 +386,7 @@ enum PendingInbound {
     },
 }
 
-/// 出站 PQ 请求的等待者与响应密钥。
+/// Waiter and response key for an outbound PQ request.
 struct PqOutboundPending {
     resp: oneshot::Sender<Result<service_protocol::Response, NetworkError>>,
     out: pq::PqOutbound,
@@ -355,9 +401,10 @@ pub(crate) struct SwarmActor {
     cmd_tx: mpsc::UnboundedSender<SwarmCommand>,
     event_tx: mpsc::UnboundedSender<NetworkEvent>,
     bootstrap_triggered: bool,
-    /// 对端已宣告的协议集合（来自 Identify），用于 PQ 能力判定。
+    /// Protocols announced by the peer (from Identify), used to decide PQ
+    /// capability.
     peer_protocols: HashMap<PeerId, HashSet<StreamProtocol>>,
-    /// 已校验并缓存的对端 PQ 身份。
+    /// Verified and cached peer PQ identities.
     pq_identities: HashMap<PeerId, PqIdentity>,
     pending_kad: HashMap<kad::QueryId, KadPending>,
     pending_outbound: HashMap<
@@ -367,9 +414,11 @@ pub(crate) struct SwarmActor {
     pending_outbound_pq: HashMap<request_response::OutboundRequestId, PqOutboundPending>,
     pending_pq_identity: HashMap<request_response::OutboundRequestId, PeerId>,
     pending_inbound: HashMap<String, (ConnectionId, PendingInbound)>,
+    /// `get_record` result cache (including negative entries).
+    record_cache: HashMap<kad::RecordKey, CachedRecord>,
 }
 
-/// 构建 Swarm 并启动 Actor 任务。
+/// Build the Swarm and start the actor task.
 pub fn spawn(
     config: ConfigHandle,
     keypair: identity::Keypair,
@@ -398,6 +447,7 @@ pub fn spawn(
         pending_outbound_pq: HashMap::new(),
         pending_pq_identity: HashMap::new(),
         pending_inbound: HashMap::new(),
+        record_cache: HashMap::new(),
     };
 
     let task = tokio::spawn(async move {
@@ -432,13 +482,61 @@ impl SwarmActor {
         }
     }
 
-    /// 取可变 Kademlia 引用；若被 Toggle 关闭则返回 `Disabled`。
+    /// Get a mutable Kademlia reference; returns `Disabled` if toggled off.
     fn kad(&mut self) -> Result<&mut kad::Behaviour<kad::store::MemoryStore>, NetworkError> {
         self.swarm
             .behaviour_mut()
             .kademlia
             .as_mut()
             .ok_or(NetworkError::Disabled)
+    }
+
+    /// Return a fresh cached `get_record` result, if any.
+    ///
+    /// Positive entries rebuild a `FoundRecord`; negative entries report
+    /// `FinishedWithNoAdditionalRecord` (i.e. not found).
+    fn cached_record(&self, key: &kad::RecordKey) -> Option<kad::GetRecordOk> {
+        let entry = self.record_cache.get(key)?;
+        if entry.fetched_at.elapsed() >= RECORD_CACHE_TTL {
+            return None;
+        }
+        Some(match &entry.value {
+            Some(value) => kad::GetRecordOk::FoundRecord(kad::PeerRecord {
+                peer: None,
+                record: kad::Record::new(key.clone(), value.clone()),
+            }),
+            None => kad::GetRecordOk::FinishedWithNoAdditionalRecord {
+                cache_candidates: Default::default(),
+            },
+        })
+    }
+
+    /// Insert a record into the cache, evicting entries when at capacity.
+    fn insert_cached(&mut self, key: kad::RecordKey, value: Option<Vec<u8>>) {
+        if self.record_cache.len() >= RECORD_CACHE_CAPACITY && !self.record_cache.contains_key(&key)
+        {
+            // Purge expired entries first; if still full, drop a random third.
+            self.record_cache
+                .retain(|_, entry| entry.fetched_at.elapsed() < RECORD_CACHE_TTL);
+            if self.record_cache.len() >= RECORD_CACHE_CAPACITY {
+                let victims: Vec<kad::RecordKey> = self
+                    .record_cache
+                    .keys()
+                    .take(self.record_cache.len() / 3)
+                    .cloned()
+                    .collect();
+                for victim in victims {
+                    self.record_cache.remove(&victim);
+                }
+            }
+        }
+        self.record_cache.insert(
+            key,
+            CachedRecord {
+                value,
+                fetched_at: Instant::now(),
+            },
+        );
     }
 
     async fn handle_event(&mut self, event: SwarmEvent<NetBehaviourEvent>) {
@@ -476,7 +574,8 @@ impl SwarmActor {
                 num_established,
                 ..
             } => {
-                // 连接关闭后其挂起的入站请求无法再回复，清理避免泄漏。
+                // After a connection closes its pending inbound requests can no
+                // longer be replied to; clean them up to avoid a leak.
                 self.pending_inbound
                     .retain(|_, (cid, _)| *cid != connection_id);
                 if num_established == 0 {
@@ -493,29 +592,31 @@ impl SwarmActor {
         }
     }
 
-    /// Identify → Kademlia 地址桥接。
+    /// Identify -> Kademlia address bridge.
     ///
-    /// 把 OAHD 对端宣告的监听地址写入 DHT 路由表；`add_address` 会在新节点插入时
-    /// 触发自动 bootstrap，节流约 500ms，从而最终发出 `BootstrapCompleted`。
+    /// Writes the OAHD peer's announced listen addresses into the DHT routing
+    /// table; `add_address` triggers an auto-bootstrap (throttled ~500ms) when a
+    /// new node is inserted, eventually emitting `BootstrapCompleted`.
     fn on_identify_peer(&mut self, peer_id: PeerId, info: &identify::Info) {
-        // 缓存对端协议表，用于 PQ 能力判定。
+        // Cache the peer's protocol table for PQ capability checks.
         self.peer_protocols
             .insert(peer_id, info.protocols.iter().cloned().collect());
 
-        if !info.agent_version.starts_with("/oahd/") {
+        if !info.agent_version.starts_with(AGENT_NAME) {
             return;
         }
-        // Identify → Kademlia 地址桥接
+        // Identify -> Kademlia address bridge
         if let Ok(kad) = self.kad() {
             for addr in &info.listen_addrs {
                 kad.add_address(&peer_id, addr.clone());
             }
         }
-        // 对端支持 PQ 且身份未缓存 → 拉取并校验其 PQ 身份
+        // Peer supports PQ and its identity is uncached -> fetch and verify it.
         self.maybe_fetch_pq_identity(peer_id);
     }
 
-    /// 若 PQ 启用且对端宣告支持，则请求其 PQ 身份（一次）。
+    /// If PQ is enabled and the peer advertises support, request its PQ identity
+    /// (once).
     fn maybe_fetch_pq_identity(&mut self, peer_id: PeerId) {
         if self.pq_keys.is_none() || !self.config.pq_enabled() {
             return;
@@ -536,7 +637,8 @@ impl SwarmActor {
         }
     }
 
-    /// 处理 Kademlia 查询进度事件，按 QueryId 唤醒对应挂起表条目。
+    /// Handle Kademlia query progress events, waking the matching pending entry
+    /// by `QueryId`.
     fn handle_kad_event(&mut self, event: kad::Event) {
         let kad::Event::OutboundQueryProgressed { result, id, .. } = event else {
             return;
@@ -550,21 +652,33 @@ impl SwarmActor {
                 }
             }
             kad::QueryResult::GetRecord(result) => {
-                if let Some(KadPending::GetRecord(sender)) = self.pending_kad.remove(&id) {
-                    let _ = sender.send(result.map_err(|e| NetworkError::Kad(format!("{e:?}"))));
+                if let Some(KadPending::GetRecord { key, resp }) = self.pending_kad.remove(&id) {
+                    let value = match &result {
+                        Ok(kad::GetRecordOk::FoundRecord(peer_record)) => {
+                            Some(peer_record.record.value.clone())
+                        }
+                        _ => None,
+                    };
+                    self.insert_cached(key, value);
+                    let _ = resp.send(result.map_err(|e| NetworkError::Kad(format!("{e:?}"))));
                 }
             }
             kad::QueryResult::GetProviders(result) => {
                 if let Some(pending) = self.pending_kad.remove(&id)
                     && let Some(pending) = apply_get_providers(pending, result)
                 {
-                    // 查询尚未终结，放回挂起表继续累积
+                    // Query not finalized yet; put it back to keep accumulating.
                     self.pending_kad.insert(id, pending);
                 }
             }
             kad::QueryResult::PutRecord(result) => {
-                if let Some(KadPending::PutRecord(sender)) = self.pending_kad.remove(&id) {
-                    let _ = sender.send(
+                if let Some(KadPending::PutRecord { key, value, resp }) =
+                    self.pending_kad.remove(&id)
+                {
+                    if result.is_ok() {
+                        self.insert_cached(key, Some(value));
+                    }
+                    let _ = resp.send(
                         result
                             .map(|_| ())
                             .map_err(|e| NetworkError::Kad(format!("{e:?}"))),
@@ -598,7 +712,7 @@ impl SwarmActor {
                 request_response::Message::Request {
                     request, channel, ..
                 } => {
-                    // pq_required：拒绝明文请求
+                    // pq_required: reject plaintext requests.
                     if self.config.pq_required() {
                         let _ = self.swarm.behaviour_mut().service_req.send_response(
                             channel,
@@ -627,7 +741,8 @@ impl SwarmActor {
 
                     let cmd_tx = self.cmd_tx.clone();
                     tokio::spawn(async move {
-                        // 无论成功/失败/通道关闭，都必须回填响应，避免对端永久挂起。
+                        // Whatever the outcome (ok/error/channel closed), a response
+                        // must be sent back, so the peer never hangs forever.
                         let response = match resp_rx.await {
                             Ok(Ok(response)) => response,
                             Ok(Err(e)) => service_protocol::Response {
@@ -666,7 +781,7 @@ impl SwarmActor {
         }
     }
 
-    /// 处理 PQ 加密服务请求/响应。
+    /// Handle PQ-encrypted service requests/responses.
     async fn handle_service_req_pq(
         &mut self,
         event: request_response::Event<PqRequest, PqResponse>,
@@ -759,7 +874,8 @@ impl SwarmActor {
         }
     }
 
-    /// 处理 PQ 身份交换（请求应答 + 响应缓存校验）。
+    /// Handle PQ identity exchange (request reply + cached response
+    /// verification).
     async fn handle_pq_identity(&mut self, event: request_response::Event<(), PqIdentity>) {
         let request_response::Event::Message { message, .. } = event else {
             return;
@@ -793,19 +909,23 @@ impl SwarmActor {
         }
     }
 
-    /// 处理单条命令；返回 `false` 表示要求 Actor 退出。
+    /// Handle one command; returns `false` to ask the actor to exit.
     async fn handle_command(&mut self, cmd: SwarmCommand) -> bool {
         match cmd {
             SwarmCommand::KadGetRecord { key, resp } => {
+                if let Some(cached) = self.cached_record(&key) {
+                    let _ = resp.send(Ok(cached));
+                    return true;
+                }
                 let query_id = match self.kad() {
-                    Ok(kad) => kad.get_record(key),
+                    Ok(kad) => kad.get_record(key.clone()),
                     Err(e) => {
                         let _ = resp.send(Err(e));
                         return true;
                     }
                 };
                 self.pending_kad
-                    .insert(query_id, KadPending::GetRecord(resp));
+                    .insert(query_id, KadPending::GetRecord { key, resp });
             }
             SwarmCommand::KadGetProviders { key, resp } => {
                 let query_id = match self.kad() {
@@ -824,7 +944,7 @@ impl SwarmActor {
                 );
             }
             SwarmCommand::KadPutRecord { key, value, resp } => {
-                let record = kad::Record::new(key, value);
+                let record = kad::Record::new(key.clone(), value.clone());
                 let result = match self.kad() {
                     Ok(kad) => kad.put_record(record, kad::Quorum::One),
                     Err(e) => {
@@ -835,7 +955,7 @@ impl SwarmActor {
                 match result {
                     Ok(query_id) => {
                         self.pending_kad
-                            .insert(query_id, KadPending::PutRecord(resp));
+                            .insert(query_id, KadPending::PutRecord { key, value, resp });
                     }
                     Err(e) => {
                         let _ = resp.send(Err(NetworkError::Kad(format!("{e:?}"))));
@@ -869,12 +989,17 @@ impl SwarmActor {
                     let _ = resp.send(Err(e));
                 }
             },
+            SwarmCommand::KadCacheRefresh { resp } => {
+                let cleared = self.record_cache.len();
+                self.record_cache.clear();
+                let _ = resp.send(Ok(cleared));
+            }
             SwarmCommand::ServiceSendRequest {
                 peer,
                 request,
                 resp,
             } => {
-                // pq_required：对端非 PQ 则拒绝
+                // pq_required: reject non-PQ peers.
                 if self.config.pq_required() && !self.pq_identities.contains_key(&peer) {
                     let _ = resp.send(Err(NetworkError::Request(
                         "PQ required but peer is not PQ-capable".into(),
@@ -988,9 +1113,10 @@ impl SwarmActor {
         true
     }
 
-    /// 用当前配置重建 Swarm：清空挂起表、重建、重新拨号 bootstrap。
+    /// Rebuild the Swarm from the current config: clear pending tables,
+    /// rebuild, re-dial bootstrap.
     async fn reload(&mut self) -> Result<(), NetworkError> {
-        // 1. 回填所有挂起请求，避免调用方永久等待。
+        // 1. Backfill all pending requests so callers never wait forever.
         for (_, pending) in self.pending_kad.drain() {
             pending.fail(NetworkError::Reloaded);
         }
@@ -1004,13 +1130,15 @@ impl SwarmActor {
         self.pq_identities.clear();
         self.peer_protocols.clear();
         self.pending_inbound.clear();
+        self.record_cache.clear();
 
-        // 2. 重建 Swarm。旧 Swarm 在此 drop，连接与监听随之关闭。
+        // 2. Rebuild the Swarm. The old one is dropped here, closing connections
+        // and listeners.
         let new_swarm = build_swarm(&self.config, &self.keypair)?;
         self.swarm = new_swarm;
         self.bootstrap_triggered = false;
 
-        // 3. 重新拨号静态 bootstrap 节点。
+        // 3. Re-dial the static bootstrap nodes.
         for addr in self.config.bootstrap_nodes() {
             let _ = self.swarm.dial(addr);
         }
@@ -1020,10 +1148,10 @@ impl SwarmActor {
 }
 
 // ---------------------------------------------------------------------------
-// 明文编码（PQ 信封内部的 Request/Response）
+// Plaintext encoding (Request/Response inside the PQ envelope)
 // ---------------------------------------------------------------------------
 
-/// Request 内部编码：`[u32 service_len][service][payload]`。
+/// Request inner encoding: `[u32 service_len][service][payload]`.
 fn encode_request(req: &service_protocol::Request) -> Vec<u8> {
     let mut out = Vec::with_capacity(4 + req.service.len() + req.payload.len());
     out.extend_from_slice(&(req.service.len() as u32).to_be_bytes());
@@ -1043,7 +1171,7 @@ fn decode_request(bytes: &[u8]) -> Option<service_protocol::Request> {
     })
 }
 
-/// Response 内部编码：`[u8 success][data]`。
+/// Response inner encoding: `[u8 success][data]`.
 fn encode_response(resp: &service_protocol::Response) -> Vec<u8> {
     let mut out = Vec::with_capacity(1 + resp.data.len());
     out.push(resp.success as u8);
@@ -1089,7 +1217,8 @@ mod tests {
         }
     }
 
-    /// 本地批次 + DHT 批次都应在终结时并入结果，而非只返回第一批。
+    /// Both the local batch and DHT batches should be merged at finalization,
+    /// not just the first batch.
     #[test]
     fn get_providers_accumulates_until_finished() {
         let local = PeerId::random();
@@ -1109,7 +1238,7 @@ mod tests {
         assert_eq!(set, HashSet::from([local, remote]));
     }
 
-    /// 同一 provider 重复回报应去重。
+    /// Duplicate provider reports should be de-duplicated.
     #[test]
     fn get_providers_dedups() {
         let peer = PeerId::random();
@@ -1121,7 +1250,7 @@ mod tests {
         assert_eq!(got, vec![peer]);
     }
 
-    /// 无任何 provider 时应回执空集。
+    /// With no providers, an empty set should be returned.
     #[test]
     fn get_providers_empty() {
         let (pending, mut rx) = pending_providers();
@@ -1129,7 +1258,7 @@ mod tests {
         assert!(rx.try_recv().unwrap().unwrap().is_empty());
     }
 
-    /// 查询出错应终结并回执错误。
+    /// A query error should finalize and return the error.
     #[test]
     fn get_providers_error_finalizes() {
         let (pending, mut rx) = pending_providers();

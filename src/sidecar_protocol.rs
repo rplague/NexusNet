@@ -15,9 +15,9 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-//! 节点 ↔ 边车/后端协议 v2（CBOR 契约）
+//! Node <-> sidecar/backend protocol v2 (CBOR contract).
 //!
-//! 线上格式：`u32_be(len) || cbor(message)`，`len <= MAX_FRAME`
+//! Wire format: `u32_be(len) || cbor(message)`, `len <= MAX_FRAME`.
 
 use std::fmt;
 
@@ -25,12 +25,12 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use uuid::Uuid;
 
-/// 协议版本
+/// Protocol version.
 pub const PROTOCOL_VERSION: u32 = 2;
-/// 单帧上限（含 CBOR 载荷）
+/// Maximum frame size (including the CBOR payload).
 pub const MAX_FRAME: usize = 16 << 20;
 
-/// 结构化错误
+/// Structured error.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SidecarError {
     pub code: String,
@@ -46,21 +46,21 @@ impl SidecarError {
     }
 }
 
-/// 协议消息判别字段为文本 `t`
+/// Protocol messages are discriminated by a text field `t`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum Message {
-    /// 握手（双向首帧）
+    /// Handshake (first frame in both directions).
     Hello {
         version: u32,
     },
-    /// 节点 -> 后端：转发入站服务请求
+    /// Node -> backend: forward an inbound service request.
     Request {
         id: Uuid,
         service: String,
         payload: Vec<u8>,
     },
-    /// 关联回复（服务响应 / 控制结果，双向）
+    /// Correlated reply (service response / control result, both directions).
     Reply {
         id: Uuid,
         ok: bool,
@@ -89,6 +89,10 @@ pub enum Message {
         id: Uuid,
     },
     ReloadConfig {
+        id: Uuid,
+    },
+    /// Clear the local DHT record cache; later queries go back to the network.
+    RefreshCache {
         id: Uuid,
     },
     RelayStatus {
@@ -126,7 +130,7 @@ pub enum Message {
 }
 
 impl Message {
-    /// 取关联 id；`hello` 无 id
+    /// Get the correlation id; `hello` has none.
     pub fn id(&self) -> Option<Uuid> {
         match self {
             Message::Hello { .. } => None,
@@ -139,6 +143,7 @@ impl Message {
             | Message::ReconnectBootstrap { id }
             | Message::ReannounceServices { id }
             | Message::ReloadConfig { id }
+            | Message::RefreshCache { id }
             | Message::RelayStatus { id }
             | Message::PqStatus { id }
             | Message::AuthStatus { id }
@@ -150,7 +155,7 @@ impl Message {
     }
 }
 
-/// 帧编解码错误
+/// Frame encode/decode error.
 #[derive(Debug)]
 pub enum FrameError {
     Io(std::io::Error),
@@ -178,7 +183,7 @@ impl From<std::io::Error> for FrameError {
     }
 }
 
-/// 将消息编码为完整帧（长度前缀 + CBOR）
+/// Encode a message into a full frame (length prefix + CBOR).
 pub fn encode_frame(msg: &Message) -> Result<Vec<u8>, FrameError> {
     let mut body = Vec::new();
     ciborium::ser::into_writer(msg, &mut body).map_err(|e| FrameError::Encode(e.to_string()))?;
@@ -191,7 +196,7 @@ pub fn encode_frame(msg: &Message) -> Result<Vec<u8>, FrameError> {
     Ok(frame)
 }
 
-/// 解析帧体（不含长度前缀）
+/// Decode a frame body (without the length prefix).
 pub fn decode_frame(body: &[u8]) -> Result<Message, FrameError> {
     if body.len() > MAX_FRAME {
         return Err(FrameError::TooLarge(body.len()));
@@ -199,7 +204,7 @@ pub fn decode_frame(body: &[u8]) -> Result<Message, FrameError> {
     ciborium::de::from_reader(body).map_err(|e| FrameError::Decode(e.to_string()))
 }
 
-/// 读取一个完整帧
+/// Read one complete frame.
 pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Message, FrameError> {
     let mut len_buf = [0u8; 4];
     reader.read_exact(&mut len_buf).await?;
@@ -212,7 +217,7 @@ pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Message,
     decode_frame(&body)
 }
 
-/// 写入一个完整帧
+/// Write one complete frame.
 pub async fn write_frame<W: AsyncWrite + Unpin>(
     writer: &mut W,
     msg: &Message,
@@ -259,6 +264,7 @@ mod tests {
         let id = Uuid::new_v4();
         round_trip(Message::ListServices { id });
         round_trip(Message::Whoami { id });
+        round_trip(Message::RefreshCache { id });
         round_trip(Message::DiscoverProviders {
             id,
             service: "cmd".into(),
@@ -287,7 +293,7 @@ mod tests {
 
     #[test]
     fn malformed_body_rejected() {
-        // 0xff 是 CBOR 的 break，单独出现非法
+        // 0xff is the CBOR "break"; standalone it is invalid.
         assert!(matches!(decode_frame(&[0xff]), Err(FrameError::Decode(_))));
     }
 }

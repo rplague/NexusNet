@@ -1,8 +1,10 @@
-use crate::auth::{self, AuthCache};
+use crate::auth::{self, AuthVersions};
 use crate::config::ConfigHandle;
 use crate::log::{LogLevel, LogStruct};
-use crate::network::{NetworkEvent, NetworkHandle, NetworkStart};
-use crate::service_dispatcher::{BackendStatus, ControlRequest, InboundServiceRequest};
+use crate::network::{AGENT_NAME, NetworkEvent, NetworkHandle, NetworkStart};
+use crate::service_dispatcher::{
+    BackendStatus, ControlCommand, InboundRequest, ToController, ToDispatcher,
+};
 use crate::service_protocol;
 use crate::sidecar_protocol::Message;
 use libp2p::multiaddr::Protocol;
@@ -11,36 +13,34 @@ use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
-use tokio::sync::{Notify, mpsc, oneshot, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 
-/// DHT provider 键：声明/发现 bootstrap 节点
+/// DHT provider key: announce/discover bootstrap nodes
 const BOOTSTRAP_PROVIDER_KEY: &[u8] = b"/oahd/bootstrap";
-/// 中继预约目标数量
+/// Target number of relay reservations.
 const RELAY_TARGET: usize = 3;
-/// 后端掉线后撤销服务宣告的宽限期
+/// Grace period before withdrawing a service announcement after a backend drops.
 const WITHDRAW_GRACE: Duration = Duration::from_secs(3);
-/// 鉴权缓存两次刷新之间的最小间隔，避免缓存失效时高频触发 DHT 查询
-const AUTH_MIN_REFRESH: Duration = Duration::from_secs(5);
 
-/// 节点鉴权运行状态
+/// Node authentication runtime state.
 enum AuthState {
-    /// `auth.network == "none"`，不鉴权
+    /// `auth.network == "none"`: authentication disabled.
     Disabled,
-    /// 鉴权启用且权威公钥有效
+    /// Authentication enabled and the authority public key is valid.
     Active(auth::AuthNetwork),
-    /// 已设网络但权威公钥缺失/非法：失败即拒绝（fail-closed）
+    /// Network set but the authority key is missing/invalid: fail-closed (reject).
     Misconfigured(String),
 }
 
-/// 单次入站请求的鉴权结论
+/// Authorization verdict for a single inbound request.
 enum Decision {
     Allow,
-    /// 服务不在鉴权索引中：放行，并将本地该服务的鉴权要求同步为关闭
+    /// Service not in the auth index: allow, and sync the local auth requirement off.
     AllowUnprotected,
     Deny(String),
 }
 
-/// 由配置解析鉴权状态
+/// Resolve the authentication state from config.
 fn resolve_auth_state(config: &ConfigHandle) -> AuthState {
     let network = config.auth_network();
     if network == "none" {
@@ -60,51 +60,43 @@ pub struct NodeController {
     my_peer_id: PeerId,
     node_rtts: Arc<RwLock<HashMap<PeerId, Duration>>>,
     node_ping_failures: HashMap<PeerId, u32>,
-    /// 已确认可用的中继
+    /// Relays confirmed usable.
     active_relays: HashSet<PeerId>,
-    /// 已发起、等待确认的中继预约，值为发起时间（用于超时判定）
+    /// Relay reservations started and awaiting confirmation; value is the start time (for timeout).
     pending_relays: HashMap<PeerId, Instant>,
-    /// 中继连续失败计数
+    /// Consecutive relay failure counts.
     relay_failures: HashMap<PeerId, u32>,
-    /// 中继退避截止时间
+    /// Relay backoff deadlines.
     relay_backoff: HashMap<PeerId, Instant>,
-    /// 缓存的 bootstrap 提供者集合，来自 DHT get_providers
-    bootstrap_providers: HashSet<PeerId>,
-    /// 自身是否已成功声明为 bootstrap 提供者
+    /// Whether this node has successfully announced itself as a bootstrap provider.
     is_bootstrap_provider: bool,
-    /// 本轮 Swarm 生命周期内是否已完成 bootstrap
+    /// Whether bootstrap completed within this Swarm's lifetime.
     bootstrap_completed: bool,
-    /// 后端握手成功、当前可服务的本地服务名集合
+    /// Local service names whose backend handshake succeeded and are currently serviceable.
     backend_ready: HashSet<String>,
-    /// 当前已向 DHT 宣告的服务名集合
+    /// Service names currently announced to the DHT.
     announced_services: HashSet<String>,
-    /// 后端掉线后等待撤销的截止时间
+    /// Deadlines awaiting withdrawal after a backend drops.
     withdraw_deadline: HashMap<String, Instant>,
-    cmd_rx: mpsc::UnboundedReceiver<ControlRequest>,
-    inbound_req_tx: mpsc::UnboundedSender<InboundServiceRequest>,
-    backend_status_rx: mpsc::UnboundedReceiver<BackendStatus>,
+    to_controller_rx: mpsc::UnboundedReceiver<ToController>,
+    to_dispatcher_tx: mpsc::UnboundedSender<ToDispatcher>,
     swarm: NetworkHandle,
     event_rx: mpsc::UnboundedReceiver<NetworkEvent>,
     shutdown_rx: watch::Receiver<bool>,
-    /// 鉴权运行状态
+    /// Authentication runtime state.
     auth_state: AuthState,
-    /// 与后台刷新任务共享的鉴权缓存
-    auth_cache: Arc<RwLock<AuthCache>>,
-    /// 唤醒后台刷新任务
-    auth_notify: Arc<Notify>,
+    /// Rollback version guard for auth records.
+    auth_versions: AuthVersions,
 }
 
 impl NodeController {
     pub fn new(
         config: ConfigHandle,
         my_peer_id: PeerId,
-        cmd_rx: mpsc::UnboundedReceiver<ControlRequest>,
-        inbound_req_tx: mpsc::UnboundedSender<InboundServiceRequest>,
-        backend_status_rx: mpsc::UnboundedReceiver<BackendStatus>,
+        to_controller_rx: mpsc::UnboundedReceiver<ToController>,
+        to_dispatcher_tx: mpsc::UnboundedSender<ToDispatcher>,
         network: NetworkStart,
         shutdown_rx: watch::Receiver<bool>,
-        auth_cache: Arc<RwLock<AuthCache>>,
-        auth_notify: Arc<Notify>,
     ) -> Self {
         let node_rtts = Arc::new(RwLock::new(HashMap::new()));
         if let Ok(mut map) = node_rtts.write() {
@@ -131,32 +123,30 @@ impl NodeController {
             pending_relays: HashMap::new(),
             relay_failures: HashMap::new(),
             relay_backoff: HashMap::new(),
-            bootstrap_providers: HashSet::new(),
             is_bootstrap_provider: false,
             bootstrap_completed: false,
             backend_ready: HashSet::new(),
             announced_services: HashSet::new(),
             withdraw_deadline: HashMap::new(),
-            cmd_rx,
-            inbound_req_tx,
-            backend_status_rx,
+            to_controller_rx,
+            to_dispatcher_tx,
             swarm,
             event_rx,
             shutdown_rx,
             auth_state,
-            auth_cache,
-            auth_notify,
+            auth_versions: AuthVersions::default(),
         }
     }
 
-    /// 运行节点编排循环，接收 SwarmActor 转发的事件 + backend 命令
+    /// Run the node orchestration loop over actor events and backend commands.
     pub async fn run(mut self) -> Result<(), Box<dyn Error>> {
-        // 周期补约：即使 bootstrap 未完成或中继掉线，也会持续尝试补足目标数量
+        // Periodic top-up: keep trying to reach the relay target even before
+        // bootstrap completes or when relays drop.
         let retry = Duration::from_secs(self.config.relay_retry_interval().max(1) as u64);
         let mut relay_tick = tokio::time::interval_at(tokio::time::Instant::now() + retry, retry);
         relay_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-        // 撤销检查：固定 1s，仅用于处理到期撤销
+        // Withdrawal check: fixed 1s, only for processing due withdrawals.
         let mut service_tick = tokio::time::interval(Duration::from_secs(1));
         service_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -165,18 +155,14 @@ impl NodeController {
                 Some(event) = self.event_rx.recv() => {
                     self.handle_controller_event(event).await?;
                 }
-                Some(cmd) = self.cmd_rx.recv() => {
-                    self.handle_command(cmd).await;
-                }
-                Some(status) = self.backend_status_rx.recv() => {
-                    self.handle_backend_status(status).await;
+                Some(msg) = self.to_controller_rx.recv() => {
+                    self.handle_controller_message(msg).await;
                 }
                 _ = service_tick.tick() => {
                     self.reconcile_services().await;
                 }
                 _ = relay_tick.tick() => {
                     self.announce_bootstrap_provider().await;
-                    self.refresh_bootstrap_providers().await;
                     self.reconcile_relays().await;
                 }
                 _ = self.shutdown_rx.changed() => {
@@ -195,9 +181,7 @@ impl NodeController {
                 self.bootstrap_completed = true;
                 self.announce_local_services().await;
                 self.announce_bootstrap_provider().await;
-                self.refresh_bootstrap_providers().await;
                 self.reconcile_relays().await;
-                self.auth_notify.notify_one();
             }
             NetworkEvent::InboundServiceRequest {
                 peer,
@@ -205,7 +189,7 @@ impl NodeController {
                 service,
                 payload,
                 response_tx,
-            } => match self.authorize(&peer, &service) {
+            } => match self.authorize(&peer, &service).await {
                 Decision::Allow => {
                     self.forward_inbound(request_id, service, payload, response_tx);
                 }
@@ -232,13 +216,12 @@ impl NodeController {
                         success: false,
                         data: format!("unauthorized: {}", reason).into_bytes(),
                     }));
-                    self.auth_notify.notify_one();
                 }
             },
             NetworkEvent::Relay(event) => self.handle_relay(event).await?,
             NetworkEvent::RelayClient(event) => self.handle_relay_client(event).await?,
             NetworkEvent::ListenerClosed { addresses } => {
-                // 中继掉线：立即尝试补足目标数量
+                // Relay dropped: try to top up to the target immediately.
                 if self.handle_listener_closed(addresses).await {
                     self.reconcile_relays().await;
                 }
@@ -247,39 +230,72 @@ impl NodeController {
         Ok(())
     }
 
-    /// 鉴权判定：只读本地缓存，同步返回，不阻塞事件循环
-    fn authorize(&self, peer: &PeerId, service: &str) -> Decision {
-        match &self.auth_state {
+    /// Authorization: fetch records from the DHT on demand and verify signatures
+    /// (raw bytes are cached by the record cache).
+    ///
+    /// Blocking and inline: first/expired fetches wait on a DHT query.
+    async fn authorize(&mut self, peer: &PeerId, service: &str) -> Decision {
+        let net = match &self.auth_state {
             AuthState::Disabled => return Decision::Allow,
             AuthState::Misconfigured(reason) => return Decision::Deny(reason.clone()),
-            AuthState::Active(_) => {}
-        }
+            AuthState::Active(net) => net.clone(),
+        };
         if !self.config.service_requires_auth(service) {
             return Decision::Allow;
         }
 
-        let now = auth::now_unix();
-        let ttl = Duration::from_secs(self.config.auth_cache_ttl() as u64);
-        let Ok(cache) = self.auth_cache.read() else {
-            return Decision::Deny("auth cache poisoned".to_string());
+        // Index: fetch raw bytes -> verify -> rollback check
+        let index_key = kad::RecordKey::new(&net.index_key());
+        let index = match self.swarm.get_record(index_key).await {
+            Ok(kad::GetRecordOk::FoundRecord(peer_record)) => {
+                let now = auth::now_unix();
+                match auth::verify_index(&net, &peer_record.record.value, now) {
+                    Ok(doc) => doc,
+                    Err(e) => return Decision::Deny(format!("index verify failed: {e}")),
+                }
+            }
+            Ok(_) => return Decision::Deny("auth index unavailable".to_string()),
+            Err(e) => return Decision::Deny(format!("auth index query failed: {e}")),
         };
-        let Some(index) = cache.fresh_index(now, ttl) else {
-            return Decision::Deny("auth index unavailable".to_string());
-        };
-        if !index.services.contains_key(service) {
-            return Decision::AllowUnprotected;
+        if self.auth_versions.check_index(index.version).is_err() {
+            return Decision::Deny("auth index rollback".to_string());
         }
-        let Some(whitelist) = cache.fresh_whitelist(service, ttl) else {
-            return Decision::Deny("whitelist unavailable".to_string());
+        let Some(entry) = index.services.iter().find(|e| e.name == service).cloned() else {
+            return Decision::AllowUnprotected;
         };
-        if whitelist.is_member(peer) {
+
+        // Whitelist: fetch raw bytes -> verify (bound to the index hash/length)
+        // -> rollback check
+        let service_key = match net.service_key(service) {
+            Ok(key) => kad::RecordKey::new(&key),
+            Err(_) => return Decision::Deny("invalid service name".to_string()),
+        };
+        let whitelist = match self.swarm.get_record(service_key).await {
+            Ok(kad::GetRecordOk::FoundRecord(peer_record)) => {
+                match auth::verify_whitelist(&net, service, &peer_record.record.value, &entry) {
+                    Ok(doc) => doc,
+                    Err(e) => return Decision::Deny(format!("whitelist verify failed: {e}")),
+                }
+            }
+            Ok(_) => return Decision::Deny("whitelist unavailable".to_string()),
+            Err(e) => return Decision::Deny(format!("whitelist query failed: {e}")),
+        };
+        if self
+            .auth_versions
+            .check_whitelist(service, whitelist.version)
+            .is_err()
+        {
+            return Decision::Deny("whitelist rollback".to_string());
+        }
+        let target = peer.to_string();
+        if whitelist.members.iter().any(|m| m == &target) {
             Decision::Allow
         } else {
             Decision::Deny("peer not authorized".to_string())
         }
     }
 
-    /// 将入站请求转发给 ServiceDispatcher
+    /// Forward an inbound request to the ServiceDispatcher.
     fn forward_inbound(
         &self,
         request_id: String,
@@ -287,12 +303,12 @@ impl NodeController {
         payload: Vec<u8>,
         response_tx: oneshot::Sender<Result<service_protocol::Response, String>>,
     ) {
-        let inbound = InboundServiceRequest {
+        let inbound = InboundRequest {
             service,
             payload,
             response_tx,
         };
-        if let Err(e) = self.inbound_req_tx.send(inbound) {
+        if let Err(e) = self.to_dispatcher_tx.send(ToDispatcher::Inbound(inbound)) {
             let err_resp = service_protocol::Response {
                 success: false,
                 data: format!("service unavailable: {}", e).into_bytes(),
@@ -301,7 +317,7 @@ impl NodeController {
         }
     }
 
-    /// 声明提供某 key，返回错误字符串
+    /// Announce providing a key; returns an error string.
     async fn start_providing_record(&self, key_str: &str) -> Result<(), String> {
         self.swarm
             .start_providing(kad::RecordKey::new(&key_str))
@@ -326,7 +342,9 @@ impl NodeController {
                 if let Ok(mut map) = self.node_rtts.write() {
                     map.remove(&peer);
                 }
-                // 连续失败达 max_failures 时主动断开。阈值每次读配置，支持热调；0 表示不断连
+                // Disconnect once consecutive failures reach max_failures. The
+                // threshold is re-read each time (hot-tunable); 0 means never
+                // disconnect.
                 let max = self.config.ping_max_failures();
                 if max > 0 {
                     let count = self.node_ping_failures.entry(peer).or_insert(0);
@@ -344,11 +362,11 @@ impl NodeController {
     async fn handle_identify(&mut self, event: identify::Event) -> Result<(), Box<dyn Error>> {
         match event {
             identify::Event::Received { peer_id, info, .. } => {
-                if info.agent_version.starts_with("/oahd/") {
+                if info.agent_version.starts_with(AGENT_NAME) {
                     self.add_bootstrap_node_if_new(&info, peer_id).await?;
                 } else {
-                    // 非 OAHD 节点，尝试断开
-                    // 无法直接断开，仅记录
+                    // Non-OAHD node; try to disconnect.
+                    // Cannot disconnect directly; just log.
                     LogStruct::new(
                         LogLevel::Debug,
                         "非 OAHD 节点",
@@ -468,7 +486,7 @@ impl NodeController {
             .map(|(p, _)| *p)
     }
 
-    /// 处理 ServiceDispatcher 上报的后端就绪状态变化
+    /// Handle a backend readiness change reported by the ServiceDispatcher.
     async fn handle_backend_status(&mut self, status: BackendStatus) {
         if status.ready {
             self.backend_ready.insert(status.service.clone());
@@ -478,7 +496,8 @@ impl NodeController {
             }
         } else {
             self.backend_ready.remove(&status.service);
-            // 已宣告的服务掉线后进入宽限期；3s 内重连则不撤销
+            // An announced service that drops enters the grace period; if it
+            // reconnects within 3s it is not withdrawn.
             if self.announced_services.contains(&status.service) {
                 self.withdraw_deadline
                     .entry(status.service)
@@ -487,7 +506,8 @@ impl NodeController {
         }
     }
 
-    /// 处理到期撤销：宽限期已过且后端仍未就绪的已宣告服务，调用 stop_providing
+    /// Process due withdrawals: announced services whose grace period expired and
+    /// whose backend is still not ready get stop_providing.
     async fn reconcile_services(&mut self) {
         let due = due_withdrawals(&self.withdraw_deadline, &self.backend_ready, Instant::now());
         for service in due {
@@ -496,7 +516,8 @@ impl NodeController {
         }
     }
 
-    /// 撤销单个服务的 DHT 宣告。不改动 `/oahd/service/types` 全局类型记录
+    /// Withdraw a single service's DHT announcement. Does not touch the global
+    /// `/oahd/service/types` record.
     async fn withdraw_service(&mut self, service: &str) {
         let key = format!("/oahd/service/{}", service);
         match self.swarm.stop_providing(kad::RecordKey::new(&key)).await {
@@ -515,9 +536,11 @@ impl NodeController {
         }
     }
 
-    /// 宣告「后端已就绪且尚未宣告」的本地服务，并同步全局服务类型记录
+    /// Announce local services whose backend is ready and which are not yet
+    /// announced, and sync the global service-type record.
     ///
-    /// 只在 bootstrap 完成且对应后端握手成功后调用，避免提前宣告不可用的服务
+    /// Called only after bootstrap completes and the backend handshake succeeds,
+    /// to avoid announcing unavailable services early.
     async fn announce_local_services(&mut self) {
         let targets: Vec<String> = self
             .config
@@ -558,7 +581,8 @@ impl NodeController {
         }
     }
 
-    /// 合并已宣告服务类型并写回 DHT 全局记录 `/oahd/service/types`
+    /// Merge announced service types and write them back to the global DHT record
+    /// `/oahd/service/types`.
     async fn update_service_types(&mut self) {
         let types_key = kad::RecordKey::new(b"/oahd/service/types");
         let existing_types = match self.swarm.get_record(types_key.clone()).await {
@@ -582,9 +606,11 @@ impl NodeController {
         }
     }
 
-    /// 消费者侧中继补约：尽力把可用中继补足到目标数量
+    /// Consumer-side relay top-up: best-effort reach the target number of usable
+    /// relays.
     ///
-    /// 触发点：bootstrap 完成、中继监听器关闭、周期 tick。软目标，不强求
+    /// Triggers: bootstrap completion, relay listener closed, periodic tick. Soft
+    /// target.
     async fn reconcile_relays(&mut self) {
         let need_relay = {
             let cfg = self.config.read();
@@ -602,7 +628,7 @@ impl NodeController {
         let now = Instant::now();
         self.expire_pending_relays(now);
 
-        // 去重候选：peer_id -> 首个地址
+        // Deduplicated candidates: peer_id -> first address.
         let mut candidates: Vec<(PeerId, Multiaddr)> = Vec::new();
         let mut seen = HashSet::new();
         for addr in self.config.bootstrap_nodes() {
@@ -649,7 +675,7 @@ impl NodeController {
         }
     }
 
-    /// 处理中继监听器关闭。返回是否有被跟踪的中继因此失效
+    /// Handle a closed relay listener. Returns whether a tracked relay was lost.
     async fn handle_listener_closed(&mut self, addresses: Vec<Multiaddr>) -> bool {
         let mut lost = false;
         for addr in addresses {
@@ -662,7 +688,7 @@ impl NodeController {
             let was_active = self.active_relays.remove(&peer_id);
             let was_pending = self.pending_relays.remove(&peer_id).is_some();
             if !was_active && !was_pending {
-                // 非本次跟踪的预约，忽略
+                // Not a tracked reservation; ignore.
                 continue;
             }
             lost = true;
@@ -674,7 +700,8 @@ impl NodeController {
         lost
     }
 
-    /// 超过一定时间仍未确认的预约视为失败，避免 pending 永久占用名额
+    /// Reservations unconfirmed for too long are treated as failed, so pending
+    /// entries never hold a slot forever.
     fn expire_pending_relays(&mut self, now: Instant) {
         let timeout = Duration::from_secs(
             (self.config.relay_retry_interval() as u64)
@@ -693,7 +720,8 @@ impl NodeController {
         }
     }
 
-    /// 记录一次中继失败并设置指数退避；达到阈值则从 bootstrap 剔除该节点
+    /// Record a relay failure and set exponential backoff; at the threshold,
+    /// evict the node from the bootstrap list.
     fn record_relay_failure(&mut self, peer_id: PeerId, now: Instant) {
         let count = {
             let c = self.relay_failures.entry(peer_id).or_insert(0);
@@ -710,7 +738,7 @@ impl NodeController {
         }
     }
 
-    /// 从 bootstrap 列表移除失效节点并持久化（不保底）
+    /// Remove a failed node from the bootstrap list and persist (no floor kept).
     fn evict_bootstrap(&mut self, peer_id: PeerId) {
         let nodes = self.config.bootstrap_nodes();
         let filtered: Vec<Multiaddr> = nodes
@@ -733,7 +761,7 @@ impl NodeController {
         .emit();
     }
 
-    /// 声明自身为 bootstrap 提供者
+    /// Announce this node as a bootstrap provider.
     async fn announce_bootstrap_provider(&mut self) {
         if self.is_bootstrap_provider || !self.config.allow_bootstrap() {
             return;
@@ -758,22 +786,11 @@ impl NodeController {
         }
     }
 
-    /// 刷新缓存的 bootstrap 提供者集合
-    async fn refresh_bootstrap_providers(&mut self) {
-        let key = kad::RecordKey::new(&BOOTSTRAP_PROVIDER_KEY);
-        match self.swarm.get_providers(key).await {
-            Ok(providers) => {
-                self.bootstrap_providers = providers.into_iter().collect();
-            }
-            Err(e) => {
-                LogStruct::new(LogLevel::Debug, "刷新 bootstrap 提供者失败", e.to_string()).emit();
-            }
-        }
-    }
-
-    /// Identify 命中后，按「先双栈、再 bootstrap」判定是否加入本地 bootstrap 列表
+    /// On an Identify hit, decide (dual-stack first, then bootstrap) whether to
+    /// add the peer to the local bootstrap list.
     ///
-    /// 地址一律取自 Identify 信息，无需 DHT 存地址
+    /// Addresses always come from Identify info (no DHT address storage); bootstrap
+    /// provider status is queried on demand.
     async fn add_bootstrap_node_if_new(
         &self,
         info: &identify::Info,
@@ -782,7 +799,12 @@ impl NodeController {
         if !is_dual_stack_addrs(&info.listen_addrs) {
             return Ok(());
         }
-        if !self.bootstrap_providers.contains(&peer_id) {
+        let key = kad::RecordKey::new(&BOOTSTRAP_PROVIDER_KEY);
+        let is_provider = matches!(
+            self.swarm.get_providers(key).await,
+            Ok(providers) if providers.contains(&peer_id)
+        );
+        if !is_provider {
             return Ok(());
         }
         let candidates = bootstrap_addrs_from(&info.listen_addrs, peer_id);
@@ -811,8 +833,16 @@ impl NodeController {
         Ok(())
     }
 
-    async fn handle_command(&mut self, req: ControlRequest) {
-        let ControlRequest { msg, resp_tx } = req;
+    /// Handle a message arriving from the ServiceDispatcher.
+    async fn handle_controller_message(&mut self, msg: ToController) {
+        match msg {
+            ToController::Control(cmd) => self.handle_command(cmd).await,
+            ToController::BackendStatus(status) => self.handle_backend_status(status).await,
+        }
+    }
+
+    async fn handle_command(&mut self, req: ControlCommand) {
+        let ControlCommand { msg, resp_tx } = req;
 
         let result: Option<Result<Vec<u8>, String>> = match msg {
             Message::ListServices { .. } => {
@@ -875,36 +905,42 @@ impl NodeController {
                 Some(Ok(to_cbor(&result)))
             }
             Message::ReloadConfig { .. } => {
-                // 用当前 config.toml 重建 Swarm。注意：会瞬断连接并清空 DHT 本地存储
+                // Rebuild the Swarm from the current config.toml. Note: it drops
+                // connections and clears the DHT local store.
                 let result = match self.swarm.reload().await {
                     Ok(_) => {
-                        // 旧 Swarm 已丢弃，中继预约与 bootstrap 声明随之失效，清空本地跟踪
+                        // The old Swarm is dropped, invalidating relay reservations
+                        // and the bootstrap announcement; clear local tracking.
                         self.active_relays.clear();
                         self.pending_relays.clear();
                         self.relay_failures.clear();
                         self.relay_backoff.clear();
-                        self.bootstrap_providers.clear();
                         self.is_bootstrap_provider = false;
-                        // DHT 本地存储随 Swarm 重建而清空，服务宣告失效；待下次
-                        // BootstrapCompleted 按 backend_ready 重新宣告。
+                        // The DHT local store is cleared with the rebuild, so service
+                        // announcements are void; re-announce on the next
+                        // BootstrapCompleted based on backend_ready.
                         self.announced_services.clear();
                         self.withdraw_deadline.clear();
                         self.bootstrap_completed = false;
-                        // 鉴权状态随配置重算，缓存清空后由刷新任务重建
+                        // Auth state is recomputed from config; version records cleared.
                         self.auth_state = resolve_auth_state(&self.config);
                         if let AuthState::Misconfigured(reason) = &self.auth_state {
                             LogStruct::new(LogLevel::Warning, "鉴权网络配置错误", reason.clone())
                                 .emit();
                         }
-                        if let Ok(mut cache) = self.auth_cache.write() {
-                            cache.clear();
-                        }
-                        self.auth_notify.notify_one();
+                        self.auth_versions.clear();
                         serde_json::json!({"success": true})
                     }
                     Err(e) => {
                         serde_json::json!({"success": false, "error": e.to_string()})
                     }
+                };
+                Some(Ok(to_cbor(&result)))
+            }
+            Message::RefreshCache { .. } => {
+                let result = match self.swarm.refresh_record_cache().await {
+                    Ok(cleared) => serde_json::json!({"success": true, "cleared": cleared}),
+                    Err(e) => serde_json::json!({"success": false, "error": e.to_string()}),
                 };
                 Some(Ok(to_cbor(&result)))
             }
@@ -941,8 +977,6 @@ impl NodeController {
                     AuthState::Active(_) => ("active", None),
                     AuthState::Misconfigured(r) => ("misconfigured", Some(r.clone())),
                 };
-                let now = auth::now_unix();
-                let ttl = Duration::from_secs(self.config.auth_cache_ttl() as u64);
                 let local_required: Vec<String> = self
                     .config
                     .auth_required_services()
@@ -958,42 +992,16 @@ impl NodeController {
                 if let Some(d) = detail {
                     report["detail"] = serde_json::json!(d);
                 }
-
-                if let Ok(cache) = self.auth_cache.read() {
-                    if let Some(idx) = cache.index() {
-                        report["index"] = serde_json::json!({
-                            "version": idx.version,
-                            "expires_at": idx.expires_at,
-                            "age_secs": idx.fetched_at.elapsed().as_secs(),
-                            "services": idx.services.len(),
-                            "fresh": idx.is_fresh(now, ttl),
-                        });
-                    }
-                    let mut whitelists = serde_json::Map::new();
-                    for name in &local_required {
-                        if let Some(w) = cache.whitelist(name) {
-                            whitelists.insert(
-                                name.clone(),
-                                serde_json::json!({
-                                    "version": w.version,
-                                    "members": w.members.len(),
-                                    "age_secs": w.fetched_at.elapsed().as_secs(),
-                                }),
-                            );
-                        }
-                    }
-                    report["cached_whitelists"] = serde_json::Value::Object(whitelists);
-
-                    let not_in_index: Vec<String> = match cache.index() {
-                        Some(idx) => local_required
-                            .iter()
-                            .filter(|n| !idx.services.contains_key(*n))
-                            .cloned()
-                            .collect(),
-                        None => local_required.clone(),
-                    };
-                    report["required_but_not_in_index"] = serde_json::json!(not_in_index);
+                if let Some(v) = self.auth_versions.index_version() {
+                    report["index_version"] = serde_json::json!(v);
                 }
+                let mut whitelist_versions = serde_json::Map::new();
+                for name in &local_required {
+                    if let Some(v) = self.auth_versions.whitelist_version(name) {
+                        whitelist_versions.insert(name.clone(), serde_json::json!(v));
+                    }
+                }
+                report["whitelist_versions"] = serde_json::Value::Object(whitelist_versions);
 
                 Some(Ok(to_cbor(&report)))
             }
@@ -1121,123 +1129,7 @@ impl NodeController {
     }
 }
 
-/// 鉴权缓存后台刷新任务：周期刷新，并在被 `Notify` 唤醒时刷新
-pub async fn auth_refresher(
-    config: ConfigHandle,
-    swarm: NetworkHandle,
-    cache: Arc<RwLock<AuthCache>>,
-    notify: Arc<Notify>,
-    mut shutdown: watch::Receiver<bool>,
-) {
-    let interval = Duration::from_secs(config.auth_refresh_interval().max(1) as u64);
-    let mut ticker = tokio::time::interval(interval);
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut last = Instant::now()
-        .checked_sub(AUTH_MIN_REFRESH)
-        .unwrap_or_else(Instant::now);
-
-    loop {
-        tokio::select! {
-            _ = ticker.tick() => {}
-            _ = notify.notified() => {}
-            _ = shutdown.changed() => break,
-        }
-        if last.elapsed() < AUTH_MIN_REFRESH {
-            tokio::time::sleep(AUTH_MIN_REFRESH - last.elapsed()).await;
-        }
-        refresh_auth_once(&config, &swarm, &cache).await;
-        last = Instant::now();
-    }
-}
-
-/// 取回并校验索引与所需白名单并写入缓存；失败保留旧缓存（自然过期后失败即拒绝）
-async fn refresh_auth_once(
-    config: &ConfigHandle,
-    swarm: &NetworkHandle,
-    cache: &Arc<RwLock<AuthCache>>,
-) {
-    let net = match resolve_auth_state(config) {
-        AuthState::Disabled => return,
-        AuthState::Active(net) => net,
-        AuthState::Misconfigured(_) => return,
-    };
-
-    let index_key = kad::RecordKey::new(&net.index_key());
-    let doc = match swarm.get_record(index_key).await {
-        Ok(kad::GetRecordOk::FoundRecord(peer_record)) => {
-            let now = auth::now_unix();
-            match auth::verify_index(&net, &peer_record.record.value, now) {
-                Ok(doc) => doc,
-                Err(e) => {
-                    LogStruct::new(LogLevel::Warning, "鉴权索引校验失败", e.to_string()).emit();
-                    return;
-                }
-            }
-        }
-        Ok(_) => {
-            LogStruct::new(LogLevel::Warning, "鉴权索引未找到", net.name.clone()).emit();
-            return;
-        }
-        Err(e) => {
-            LogStruct::new(LogLevel::Warning, "鉴权索引查询失败", e.to_string()).emit();
-            return;
-        }
-    };
-
-    let services = doc.services.clone();
-    if let Ok(mut c) = cache.write()
-        && let Err(e) = c.insert_index(doc)
-    {
-        LogStruct::new(LogLevel::Warning, "鉴权索引写入缓存失败", e.to_string()).emit();
-    }
-
-    for entry in services {
-        if !config.service_requires_auth(&entry.name) {
-            continue;
-        }
-        let key = match net.service_key(&entry.name) {
-            Ok(k) => kad::RecordKey::new(&k),
-            Err(_) => continue,
-        };
-        match swarm.get_record(key).await {
-            Ok(kad::GetRecordOk::FoundRecord(peer_record)) => {
-                match auth::verify_whitelist(&net, &entry.name, &peer_record.record.value, &entry) {
-                    Ok(doc) => {
-                        if let Ok(mut c) = cache.write()
-                            && let Err(e) = c.insert_whitelist(&entry.name, doc)
-                        {
-                            LogStruct::new(
-                                LogLevel::Warning,
-                                "白名单写入缓存失败",
-                                format!("{}: {}", entry.name, e),
-                            )
-                            .emit();
-                        }
-                    }
-                    Err(e) => {
-                        LogStruct::new(
-                            LogLevel::Warning,
-                            "白名单校验失败",
-                            format!("{}: {}", entry.name, e),
-                        )
-                        .emit();
-                    }
-                }
-            }
-            Ok(_) => {}
-            Err(e) => {
-                LogStruct::new(
-                    LogLevel::Warning,
-                    "白名单查询失败",
-                    format!("{}: {}", entry.name, e),
-                )
-                .emit();
-            }
-        }
-    }
-}
-
-/// `whoami` 的结果负载
+/// `whoami` result payload.
 #[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct WhoamiResult {
     peer_id: String,
@@ -1245,7 +1137,7 @@ struct WhoamiResult {
     description: String,
 }
 
-/// `query_key` 的结果负载
+/// `query_key` result payload.
 #[derive(serde::Serialize)]
 struct QueryKeyResult {
     key: String,
@@ -1255,7 +1147,7 @@ struct QueryKeyResult {
     providers: Vec<String>,
 }
 
-/// 将结果序列化为 CBOR
+/// Serialize a result to CBOR.
 fn to_cbor<T: serde::Serialize>(value: &T) -> Vec<u8> {
     let mut buf = Vec::new();
     ciborium::ser::into_writer(value, &mut buf).expect("CBOR 编码失败");
@@ -1272,7 +1164,8 @@ fn extract_peer_id_from_multiaddr(addr: &Multiaddr) -> Option<PeerId> {
     None
 }
 
-/// 选出宽限期已过、且后端仍未就绪的待撤销服务名
+/// Select service names whose grace period expired and whose backend is still not
+/// ready.
 fn due_withdrawals(
     deadlines: &HashMap<String, Instant>,
     ready: &HashSet<String>,
@@ -1285,13 +1178,13 @@ fn due_withdrawals(
         .collect()
 }
 
-/// 连续失败次数 -> 退避秒数
+/// Consecutive failures -> backoff seconds.
 fn relay_backoff_secs(count: u32) -> u64 {
     let shift = count.saturating_sub(1).min(5);
     (30u64 << shift).min(600)
 }
 
-/// 网络地址双栈判断
+/// Whether the given addresses span both IP families (dual-stack).
 fn is_dual_stack_addrs(addrs: &[Multiaddr]) -> bool {
     let mut v4 = false;
     let mut v6 = false;
@@ -1307,7 +1200,8 @@ fn is_dual_stack_addrs(addrs: &[Multiaddr]) -> bool {
     v4 && v6
 }
 
-/// 从 Identify 的监听地址中为每个 IP 族各取一个，补上 `/p2p/<peer_id>`
+/// Take one listen address per IP family from Identify info and append
+/// `/p2p/<peer_id>`.
 fn bootstrap_addrs_from(addrs: &[Multiaddr], peer_id: PeerId) -> Vec<Multiaddr> {
     let mut v4: Option<Multiaddr> = None;
     let mut v6: Option<Multiaddr> = None;

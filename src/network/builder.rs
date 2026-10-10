@@ -15,21 +15,21 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-//! Swarm 构建：传输层 + 行为装配 + 监听地址。
+//! Swarm construction: transport, behaviour wiring and listen addresses.
 
 use crate::config::ConfigHandle;
 use crate::network::NetworkError;
 use crate::network::addr::to_multiaddr;
 use crate::network::behaviour::NetBehaviour;
-use crate::network::dialable_addrs;
 use crate::{LogLevel, LogStruct};
 use libp2p::{Multiaddr, Swarm, SwarmBuilder, identity, noise, tcp, yamux};
 use std::net::IpAddr;
 use std::time::Duration;
 
-/// 依据当前配置构建一个全新的 Swarm 并开始监听。
+/// Build a fresh Swarm from the current config and start listening.
 ///
-/// 该函数同时用于首次启动与 `reload()` 重建，因此不持有任何长期状态。
+/// Used both at first start and for `reload()` rebuilds, so it holds no
+/// long-lived state.
 pub fn build_swarm(
     config: &ConfigHandle,
     keypair: &identity::Keypair,
@@ -79,11 +79,12 @@ pub fn build_swarm(
             .map_err(|e| NetworkError::Build(e.to_string()))?;
     }
 
-    // 确认对外可达地址：供 Identify 广播，并为 Circuit Relay v2 服务端提供
-    // 预约应答中的地址。libp2p 客户端会拒绝地址列表为空的预约应答
-    // （`NoAddressesInReservation`），导致中继预约静默失败。
+    // Confirm externally reachable addresses: broadcast by Identify and used
+    // by the Circuit Relay v2 server for reservation replies. libp2p clients
+    // reject reservation replies with an empty address list
+    // (`NoAddressesInReservation`), silently failing the relay reservation.
     let peer_id = keypair.public().to_peer_id();
-    let external = dialable_addrs(config, peer_id);
+    let external = config.dialable_addrs(peer_id);
     for addr in &external {
         swarm.add_external_address(addr.clone());
     }

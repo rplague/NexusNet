@@ -7,6 +7,7 @@ message = hello / request / reply
         / list-services / discover-providers / query-public-ip
         / whoami
         / reconnect-bootstrap / reannounce-services / reload-config
+        / refresh-cache
         / relay-status / pq-status / auth-status
         / query-key / add-key / service-request / service-request-to
 
@@ -34,6 +35,7 @@ whoami              = { t: "whoami",              id: uuid }
 reconnect-bootstrap = { t: "reconnect_bootstrap", id: uuid }
 reannounce-services = { t: "reannounce_services", id: uuid }
 reload-config       = { t: "reload_config",       id: uuid }
+refresh-cache       = { t: "refresh_cache",       id: uuid }
 relay-status        = { t: "relay_status",        id: uuid }
 pq-status           = { t: "pq_status",           id: uuid }
 auth-status         = { t: "auth_status",         id: uuid }
@@ -56,6 +58,7 @@ service-request-to  = { t: "service_request_to",  id: uuid, service: tstr, peer:
 ;   reconnect_bootstrap -> { success: bool }
 ;   reannounce_services -> { success: bool, ? error: tstr }
 ;   reload_config       -> { success: bool, ? error: tstr }
+;   refresh_cache       -> { success: bool, cleared: uint, ? error: tstr }
 ;   relay_status        -> { need_relay: bool, target: uint, active: [* tstr], pending: [* tstr] }
 ;   pq_status           -> { enabled: bool, transport: bool, identity: bool, required: bool }
 ;   auth_status         -> { network: tstr, state: tstr, local_required: [* tstr], ... }

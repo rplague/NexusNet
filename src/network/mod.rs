@@ -15,27 +15,29 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-//! 网络层门面。
+//! Network layer facade.
 //!
-//! 本模块统一了构建期与运行期：前者包含身份、地址探测、行为装配与 Swarm 构建，
-//! 后者是独占 Swarm 的 Actor 事件循环。对外只暴露一个 [`Network`] 门面：
+//! This module unifies build-time and run-time concerns: the former covers
+//! identity, address probing, behaviour wiring and Swarm construction; the
+//! latter is the Swarm-owning actor event loop. Only the [`Network`] facade is
+//! exposed:
 //!
 //! ```text
 //! Network::start(config, keypair)
-//!     ├─ builder::build_swarm      构建 Swarm：传输层、行为、监听
-//!     └─ actor::spawn              启动 Actor，返回 NetworkStart { handle, events, task }
+//!     ├─ builder::build_swarm      build the Swarm: transport, behaviours, listen
+//!     └─ actor::spawn              start the actor, returning NetworkStart { handle, events, task }
 //! ```
 //!
-//! - [`NetworkHandle`]：异步命令门面，覆盖 DHT、服务调用、传输控制与 reload。
-//! - [`NetworkEvent`]：Actor 上抛的事件流，交给 `NodeController` 处理。
-//! - [`NetworkError`]：统一错误类型，替代原先的 `String` 与 `.expect()`。
+//! - [`NetworkHandle`]: async command facade covering DHT, service calls, transport control and reload.
+//! - [`NetworkEvent`]: event stream raised by the actor, handled by `NodeController`.
+//! - [`NetworkError`]: unified error type replacing the old `String` and `.expect()`.
 //!
-//! 模块划分：
-//! - `identity` — 节点身份：ED25519 与可选 PQ
-//! - `addr`     — 公网 IP 探测与 Multiaddr 转换
-//! - `behaviour`— libp2p 行为聚合与事件枚举
+//! Module layout:
+//! - `identity` — node identity: ED25519 and optional PQ
+//! - `addr`     — public IP probing and Multiaddr conversion
+//! - `behaviour`— libp2p behaviour aggregation and event enum
 //! - `builder`  — `build_swarm`
-//! - `actor`    — Swarm Actor、命令/事件、`NetworkHandle`
+//! - `actor`    — Swarm actor, commands/events, `NetworkHandle`
 
 mod actor;
 mod addr;
@@ -45,28 +47,29 @@ mod identity;
 pub mod pq;
 
 pub use actor::{NetworkEvent, NetworkHandle, NetworkStart};
-pub use addr::{dialable_addrs, update_config_with_public_ip};
+pub use addr::update_config_with_public_ip;
+pub use behaviour::AGENT_NAME;
 pub use identity::KeyManager;
 
 use crate::config::ConfigHandle;
 use std::fmt;
 
-/// 网络层统一错误类型。
+/// Unified network-layer error type.
 #[derive(Debug, Clone)]
 pub enum NetworkError {
-    /// Actor 任务已退出，命令无法送达。
+    /// The actor task has exited; commands cannot be delivered.
     ActorGone,
-    /// 对应协议在配置中被禁用。
+    /// The protocol is disabled by config.
     Disabled,
-    /// 构建 Swarm 失败。
+    /// Failed to build the Swarm.
     Build(String),
-    /// Kademlia 查询失败。
+    /// Kademlia query failed.
     Kad(String),
-    /// 服务请求失败。
+    /// Service request failed.
     Request(String),
-    /// 监听或拨号等传输层操作失败。
+    /// Transport operation (listen/dial) failed.
     Transport(String),
-    /// 因热重载被取消。
+    /// Cancelled by a hot reload.
     Reloaded,
 }
 
@@ -86,11 +89,11 @@ impl fmt::Display for NetworkError {
 
 impl std::error::Error for NetworkError {}
 
-/// 网络层入口门面。
+/// Network layer entry facade.
 pub struct Network;
 
 impl Network {
-    /// 构建 Swarm 并启动 Actor。
+    /// Build the Swarm and start the actor.
     pub fn start(
         config: ConfigHandle,
         keypair: libp2p::identity::Keypair,

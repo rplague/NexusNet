@@ -15,71 +15,75 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-//! 鉴权记录层：TUF-lite over DHT + COSE_Sign1
+//! Authentication record layer: TUF-lite over DHT + COSE_Sign1.
 //!
-//! DHT 是不可信、可覆盖、可重放的存储；本模块只对取回字节做密码学与一致性判定，
-//! 不触碰网络
+//! The DHT is untrusted, overwritable and replayable storage; this module only
+//! performs cryptographic and consistency checks on fetched bytes, never
+//! touching the network.
 //!
-//! - **来源可信**：记录为 COSE_Sign1，用配置固定的权威 ed25519 公钥验签
-//! - **冻结**：索引记录带 `expires_at`，过期即拒
-//! - **回滚**：索引与白名单各带 `version`，缓存拒绝更低版本（仅存活于进程内）
-//! - **mix-and-match**：索引记录每个服务白名单的 `hash`+`length`，取回后校验
-//! - **重放/跨位置**：COSE `external_aad` 绑定记录所在的 DHT key 路径
+//! - **Trusted origin**: records are COSE_Sign1, verified with the authority
+//!   ed25519 public key fixed in config.
+//! - **Freeze**: index records carry `expires_at`; expired means rejected.
+//! - **Rollback**: index and whitelists each carry `version`; lower versions are
+//!   rejected (process lifetime only).
+//! - **mix-and-match**: the index records each service whitelist's `hash` +
+//!   `length`, checked after fetch.
+//! - **Replay / cross-location**: COSE `external_aad` binds the record to its DHT
+//!   key path.
 //!
-//! 记录结构：
+//! Record structure:
 //!
 //! ```text
-//! key:   /oahd/auth/<net_hash>/service     索引
-//! key:   /oahd/auth/<net_hash>/<service>   白名单
-//! value: COSE_Sign1(payload = CBOR(doc), external_aad = key 路径字节)
+//! key:   /oahd/auth/<net_hash>/service     index
+//! key:   /oahd/auth/<net_hash>/<service>   whitelist
+//! value: COSE_Sign1(payload = CBOR(doc), external_aad = key path bytes)
 //! ```
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use coset::{
     CborSerializable, CoseSign1, CoseSign1Builder, HeaderBuilder, RegisteredLabelWithPrivate, iana,
 };
-use libp2p::PeerId;
 use libp2p::identity::{self, ed25519};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-/// 单个记录的字节上限
+/// Maximum size of a single record, in bytes.
 const MAX_DOC_BYTES: usize = 1 << 20;
-/// 白名单成员数上限
+/// Maximum number of whitelist members.
 const MAX_MEMBERS: usize = 100_000;
-/// 索引服务数上限
+/// Maximum number of services in the index.
 const MAX_SERVICES: usize = 10_000;
-/// 索引 key 的保留末段，禁止服务使用该名
+/// Reserved last segment of the index key; services may not use this name.
 pub const RESERVED_SERVICE: &str = "service";
-/// DHT key 前缀
+/// DHT key prefix.
 const AUTH_PREFIX: &str = "/oahd/auth";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthError {
-    /// COSE 信封编解码失败
+    /// COSE envelope encode/decode failed.
     Cose,
-    /// payload 结构或字段非法
+    /// Payload structure or fields are invalid.
     Malformed,
-    /// 配置中的权威公钥无法解析
+    /// The authority public key in config cannot be parsed.
     InvalidAuthority,
-    /// 签名验证失败（含算法不符、aad 不符）
+    /// Signature verification failed (including algorithm or aad mismatch).
     InvalidSignature,
-    /// 索引已过期（冻结防护）
+    /// The index has expired (freeze protection).
     Expired,
-    /// 版本低于已见（回滚防护）
+    /// Version lower than already seen (rollback protection).
     Rollback,
-    /// 白名单与索引记录的 hash/length 不符（mix-and-match 防护）
+    /// Whitelist hash/length does not match the index record (mix-and-match protection).
     HashMismatch,
-    /// 服务不在索引中（非致命：调用方警告并放行）
+    /// Service not in the index (non-fatal: the caller warns and allows).
     NotInIndex,
-    /// 记录或条目数超过上限
+    /// Record or entry count exceeds the limit.
     TooLarge,
-    /// 网络名/服务名非法，或使用了保留名
+    /// Network or service name is invalid, or a reserved name was used.
     InvalidName,
 }
 
@@ -102,34 +106,33 @@ impl fmt::Display for AuthError {
 
 impl std::error::Error for AuthError {}
 
-/// 一个鉴权网络：明文名、DHT key 用的哈希、以及固定的权威公钥
+/// An authentication network: the hash used in DHT keys, plus the fixed
+/// authority public key.
 #[derive(Clone)]
 pub struct AuthNetwork {
-    pub name: String,
-    /// `base64url_nopad(SHA-256(name))`，用作 key 路径段（不含 `/`）
+    /// `base64url_nopad(SHA-256(name))`, used as a key path segment (no `/`).
     pub net_hash: String,
     pub authority: ed25519::PublicKey,
 }
 
 impl AuthNetwork {
-    /// 由网络名与 base64 权威公钥构造
+    /// Build from a network name and a base64 authority public key.
     pub fn new(name: &str, authority_b64: &str) -> Result<Self, AuthError> {
         if !is_valid_network_name(name) {
             return Err(AuthError::InvalidName);
         }
         Ok(Self {
-            name: name.to_string(),
             net_hash: net_hash(name),
             authority: parse_authority(authority_b64)?,
         })
     }
 
-    /// 索引记录 key：`/oahd/auth/<net_hash>/service`
+    /// Index record key: `/oahd/auth/<net_hash>/service`.
     pub fn index_key(&self) -> String {
         format!("{}/{}/{}", AUTH_PREFIX, self.net_hash, RESERVED_SERVICE)
     }
 
-    /// 白名单记录 key：`/oahd/auth/<net_hash>/<service>`
+    /// Whitelist record key: `/oahd/auth/<net_hash>/<service>`.
     pub fn service_key(&self, service: &str) -> Result<String, AuthError> {
         if !is_valid_service_name(service) {
             return Err(AuthError::InvalidName);
@@ -138,17 +141,17 @@ impl AuthNetwork {
     }
 }
 
-/// 索引中的一条服务项，绑定对应白名单记录的字节摘要
+/// A service entry in the index, binding the byte digest of its whitelist record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServiceEntry {
     pub name: String,
-    /// 白名单记录完整字节的 SHA-256
+    /// SHA-256 of the whitelist record's full bytes.
     pub hash: Vec<u8>,
-    /// 白名单记录完整字节的长度
+    /// Length of the whitelist record's full bytes.
     pub length: u64,
 }
 
-/// 索引记录 payload
+/// Index record payload.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexDoc {
     pub version: u64,
@@ -156,7 +159,7 @@ pub struct IndexDoc {
     pub services: Vec<ServiceEntry>,
 }
 
-/// 白名单记录 payload
+/// Whitelist record payload.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WhitelistDoc {
     pub version: u64,
@@ -179,7 +182,7 @@ fn eddsa_header() -> coset::Header {
         .build()
 }
 
-/// 用 `keypair` 对 `payload` 签名，`aad` 为绑定的 key 路径字节
+/// Sign `payload` with `keypair`; `aad` is the bound key path bytes.
 fn sign_payload(
     keypair: &identity::Keypair,
     aad: &[u8],
@@ -193,7 +196,8 @@ fn sign_payload(
     sign1.to_vec().map_err(|_| AuthError::Cose)
 }
 
-/// 验签并返回 payload；payload 原始字节在签名范围内，先验签再解析
+/// Verify and return the payload; the raw payload bytes are within the signature
+/// scope, so verify before parsing.
 fn verify_payload(
     authority: &ed25519::PublicKey,
     aad: &[u8],
@@ -204,7 +208,7 @@ fn verify_payload(
     }
     let sign1 = CoseSign1::from_slice(value).map_err(|_| AuthError::Cose)?;
 
-    // 强制 EdDSA 算法，避免算法混淆
+    // Enforce the EdDSA algorithm to avoid algorithm confusion.
     let expected = RegisteredLabelWithPrivate::Assigned(iana::Algorithm::EdDSA);
     if sign1.protected.header.alg != Some(expected) {
         return Err(AuthError::InvalidSignature);
@@ -223,7 +227,7 @@ fn verify_payload(
     sign1.payload.ok_or(AuthError::Malformed)
 }
 
-/// 构造并签名索引记录，返回可写入 DHT 的完整字节
+/// Build and sign the index record; returns the full bytes to write to the DHT.
 pub fn sign_index(
     keypair: &identity::Keypair,
     net: &AuthNetwork,
@@ -233,7 +237,8 @@ pub fn sign_index(
     sign_payload(keypair, net.index_key().as_bytes(), payload)
 }
 
-/// 构造并签名某服务的白名单记录，返回可写入 DHT 的完整字节
+/// Build and sign a service whitelist record; returns the full bytes to write to
+/// the DHT.
 pub fn sign_whitelist(
     keypair: &identity::Keypair,
     net: &AuthNetwork,
@@ -245,7 +250,8 @@ pub fn sign_whitelist(
     sign_payload(keypair, key.as_bytes(), payload)
 }
 
-/// 校验索引记录：签名、结构、服务名、以及 `expires_at`（冻结防护）
+/// Verify the index record: signature, structure, service names, and
+/// `expires_at` (freeze protection).
 pub fn verify_index(net: &AuthNetwork, value: &[u8], now: u64) -> Result<IndexDoc, AuthError> {
     let payload = verify_payload(&net.authority, net.index_key().as_bytes(), value)?;
     let doc: IndexDoc = cbor_decode(&payload)?;
@@ -267,7 +273,8 @@ pub fn verify_index(net: &AuthNetwork, value: &[u8], now: u64) -> Result<IndexDo
     Ok(doc)
 }
 
-/// 校验白名单记录：先做 hash/length 绑定（mix-and-match），再验签
+/// Verify the whitelist record: first the hash/length binding (mix-and-match),
+/// then the signature.
 pub fn verify_whitelist(
     net: &AuthNetwork,
     service: &str,
@@ -286,112 +293,47 @@ pub fn verify_whitelist(
     Ok(doc)
 }
 
-/// 已校验的索引缓存
-#[derive(Debug, Clone)]
-pub struct CachedIndex {
-    pub services: HashMap<String, ServiceEntry>,
-    pub version: u64,
-    pub expires_at: u64,
-    pub fetched_at: Instant,
-}
-
-impl CachedIndex {
-    /// 新鲜 = 未过文档期 且 未过本地 TTL
-    pub fn is_fresh(&self, now: u64, ttl: Duration) -> bool {
-        now <= self.expires_at && self.fetched_at.elapsed() < ttl
-    }
-}
-
-/// 已校验的白名单缓存
-#[derive(Debug, Clone)]
-pub struct CachedWhitelist {
-    pub members: HashSet<PeerId>,
-    pub version: u64,
-    pub fetched_at: Instant,
-}
-
-impl CachedWhitelist {
-    /// 白名单记录本身无过期时间，缓存新鲜度仅由本地 TTL 决定；是否生效还需索引新鲜
-    pub fn is_fresh(&self, ttl: Duration) -> bool {
-        self.fetched_at.elapsed() < ttl
-    }
-
-    pub fn is_member(&self, peer: &PeerId) -> bool {
-        self.members.contains(peer)
-    }
-}
-
-/// 鉴权缓存；版本回滚防护仅存活于进程生命周期（不落盘）
+/// Rollback guard: highest verified version per record (process lifetime only,
+/// never persisted).
 #[derive(Debug, Default)]
-pub struct AuthCache {
-    index: Option<CachedIndex>,
-    whitelists: HashMap<String, CachedWhitelist>,
+pub struct AuthVersions {
+    index: Option<u64>,
+    whitelists: HashMap<String, u64>,
 }
 
-impl AuthCache {
-    /// 写入索引，拒绝更低版本
-    pub fn insert_index(&mut self, doc: IndexDoc) -> Result<(), AuthError> {
-        if let Some(cur) = &self.index
-            && doc.version < cur.version
+impl AuthVersions {
+    /// Record an index version; returns [`AuthError::Rollback`] if it is lower
+    /// than the highest seen.
+    pub fn check_index(&mut self, version: u64) -> Result<(), AuthError> {
+        if let Some(cur) = self.index
+            && version < cur
         {
             return Err(AuthError::Rollback);
         }
-        let services = doc
-            .services
-            .into_iter()
-            .map(|e| (e.name.clone(), e))
-            .collect();
-        self.index = Some(CachedIndex {
-            services,
-            version: doc.version,
-            expires_at: doc.expires_at,
-            fetched_at: Instant::now(),
-        });
+        self.index = Some(version);
         Ok(())
     }
 
-    /// 写入白名单，解析成员并拒绝更低版本
-    pub fn insert_whitelist(&mut self, service: &str, doc: WhitelistDoc) -> Result<(), AuthError> {
-        if !is_valid_service_name(service) {
-            return Err(AuthError::InvalidName);
-        }
+    /// Record a service whitelist version; returns [`AuthError::Rollback`] if it
+    /// is lower than the highest seen.
+    pub fn check_whitelist(&mut self, service: &str, version: u64) -> Result<(), AuthError> {
         if let Some(cur) = self.whitelists.get(service)
-            && doc.version < cur.version
+            && version < *cur
         {
             return Err(AuthError::Rollback);
         }
-        let mut members = HashSet::with_capacity(doc.members.len());
-        for m in &doc.members {
-            let peer = m.parse::<PeerId>().map_err(|_| AuthError::Malformed)?;
-            members.insert(peer);
-        }
-        self.whitelists.insert(
-            service.to_string(),
-            CachedWhitelist {
-                members,
-                version: doc.version,
-                fetched_at: Instant::now(),
-            },
-        );
+        self.whitelists.insert(service.to_string(), version);
         Ok(())
     }
 
-    pub fn fresh_index(&self, now: u64, ttl: Duration) -> Option<&CachedIndex> {
-        self.index.as_ref().filter(|i| i.is_fresh(now, ttl))
+    /// Highest seen index version, for status queries.
+    pub fn index_version(&self) -> Option<u64> {
+        self.index
     }
 
-    pub fn fresh_whitelist(&self, service: &str, ttl: Duration) -> Option<&CachedWhitelist> {
-        self.whitelists.get(service).filter(|w| w.is_fresh(ttl))
-    }
-
-    /// 当前索引缓存（无论新鲜与否），供状态查询
-    pub fn index(&self) -> Option<&CachedIndex> {
-        self.index.as_ref()
-    }
-
-    /// 指定服务的白名单缓存（无论新鲜与否），供状态查询
-    pub fn whitelist(&self, service: &str) -> Option<&CachedWhitelist> {
-        self.whitelists.get(service)
+    /// Highest seen whitelist version for a service, for status queries.
+    pub fn whitelist_version(&self, service: &str) -> Option<u64> {
+        self.whitelists.get(service).copied()
     }
 
     pub fn clear(&mut self) {
@@ -400,7 +342,7 @@ impl AuthCache {
     }
 }
 
-/// 网络名：非空、≤64、`[A-Za-z0-9_-]`
+/// Network name: non-empty, <= 64, `[A-Za-z0-9_-]`.
 pub fn is_valid_network_name(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 64
@@ -408,12 +350,13 @@ pub fn is_valid_network_name(s: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
-/// 服务名：同网络名规则，且不得为保留名 `service`
+/// Service name: same rule as network names, and it may not be the reserved name
+/// `service`.
 pub fn is_valid_service_name(s: &str) -> bool {
     is_valid_network_name(s) && s != RESERVED_SERVICE
 }
 
-/// 解析 base64 编码的 ed25519 权威公钥
+/// Parse a base64-encoded ed25519 authority public key.
 pub fn parse_authority(b64: &str) -> Result<ed25519::PublicKey, AuthError> {
     let bytes = STANDARD
         .decode(b64)
@@ -421,7 +364,7 @@ pub fn parse_authority(b64: &str) -> Result<ed25519::PublicKey, AuthError> {
     ed25519::PublicKey::try_from_bytes(&bytes).map_err(|_| AuthError::InvalidAuthority)
 }
 
-/// 当前 Unix 时间（秒）
+/// Current Unix time in seconds.
 pub fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -429,12 +372,12 @@ pub fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
-/// 网络名哈希（key 路径段）
+/// Network name hash (key path segment).
 fn net_hash(name: &str) -> String {
     URL_SAFE_NO_PAD.encode(Sha256::digest(name.as_bytes()))
 }
 
-/// 记录内容的 SHA-256
+/// SHA-256 of the record content.
 fn content_hash(value: &[u8]) -> Vec<u8> {
     Sha256::digest(value).to_vec()
 }
@@ -442,6 +385,7 @@ fn content_hash(value: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use libp2p::PeerId;
 
     fn keypair() -> identity::Keypair {
         identity::Keypair::generate_ed25519()
@@ -522,7 +466,7 @@ mod tests {
         let net = network(&kp, "myorg");
         let peer = keypair().public().to_peer_id();
         let value = sign_whitelist(&kp, &net, "cmd", &whitelist(1, &[&peer])).unwrap();
-        // 用同一 value、但以另一个服务的 key 路径验签 -> aad 不符
+        // Same value but verified against another service's key path -> aad mismatch.
         let entry = entry_for("ocr", &value);
         assert_eq!(
             verify_whitelist(&net, "ocr", &value, &entry),
@@ -562,7 +506,7 @@ mod tests {
             },
         )
         .unwrap();
-        // 另一把密钥构成的同名网络，验签应失败
+        // A same-named network built from another key; verification should fail.
         let other = network(&keypair(), "myorg");
         assert_eq!(
             verify_index(&other, &value, now_unix()),
@@ -599,58 +543,22 @@ mod tests {
     }
 
     #[test]
-    fn cache_rejects_rollback() {
-        let mut cache = AuthCache::default();
-        let doc = |v| IndexDoc {
-            version: v,
-            expires_at: now_unix() + 300,
-            services: vec![],
-        };
-        cache.insert_index(doc(2)).unwrap();
-        assert_eq!(cache.insert_index(doc(1)), Err(AuthError::Rollback));
-        cache.insert_index(doc(3)).unwrap();
+    fn versions_reject_index_rollback() {
+        let mut versions = AuthVersions::default();
+        versions.check_index(2).unwrap();
+        assert_eq!(versions.check_index(1), Err(AuthError::Rollback));
+        versions.check_index(3).unwrap();
+        assert_eq!(versions.index_version(), Some(3));
     }
 
     #[test]
-    fn cache_whitelist_rejects_rollback_and_bad_member() {
-        let mut cache = AuthCache::default();
-        let peer = keypair().public().to_peer_id();
-        cache
-            .insert_whitelist("cmd", whitelist(2, &[&peer]))
-            .unwrap();
-        assert_eq!(
-            cache.insert_whitelist("cmd", whitelist(1, &[&peer])),
-            Err(AuthError::Rollback)
-        );
-        let bad = WhitelistDoc {
-            version: 3,
-            members: vec!["not-a-peer-id".into()],
-        };
-        assert_eq!(
-            cache.insert_whitelist("cmd", bad),
-            Err(AuthError::Malformed)
-        );
-    }
-
-    #[test]
-    fn freshness_conditions() {
-        let mut cache = AuthCache::default();
-        let now = now_unix();
-        cache
-            .insert_index(IndexDoc {
-                version: 1,
-                expires_at: now + 300,
-                services: vec![],
-            })
-            .unwrap();
-        assert!(cache.fresh_index(now, Duration::from_secs(300)).is_some());
-        // TTL 为零 -> 视为不新鲜
-        assert!(cache.fresh_index(now, Duration::ZERO).is_none());
-        // 已过文档期 -> 不新鲜
-        assert!(
-            cache
-                .fresh_index(now + 301, Duration::from_secs(300))
-                .is_none()
-        );
+    fn versions_reject_whitelist_rollback() {
+        let mut versions = AuthVersions::default();
+        versions.check_whitelist("cmd", 2).unwrap();
+        assert_eq!(versions.check_whitelist("cmd", 1), Err(AuthError::Rollback));
+        versions.check_whitelist("cmd", 3).unwrap();
+        assert_eq!(versions.whitelist_version("cmd"), Some(3));
+        // Other services are unaffected.
+        assert_eq!(versions.check_whitelist("ocr", 1), Ok(()));
     }
 }

@@ -31,35 +31,49 @@ use crate::log::{LogLevel, LogStruct};
 use crate::service_protocol;
 use crate::sidecar_protocol::{self, Message, PROTOCOL_VERSION, SidecarError};
 
-/// 后端发起的控制指令及其响应通道。
-pub struct ControlRequest {
+/// A backend-issued control command and its reply channel.
+pub struct ControlCommand {
     pub msg: Message,
     pub resp_tx: oneshot::Sender<Result<Vec<u8>, String>>,
 }
 
-/// 后端连接就绪状态变化，由 ServiceDispatcher 上报给 NodeController。
+/// Backend connection readiness change, reported by `ServiceDispatcher` to
+/// `NodeController`.
 pub struct BackendStatus {
     pub service: String,
     pub ready: bool,
 }
 
-/// 单个后端的「id → 响应等待者」挂起表。
+/// All upstream messages from the dispatcher to the controller.
+pub enum ToController {
+    /// A backend-issued control command (with a reply channel).
+    Control(ControlCommand),
+    /// A backend connection readiness change.
+    BackendStatus(BackendStatus),
+}
+
+/// Per-backend pending table of "id -> response waiter".
 type PendingMap = Arc<Mutex<HashMap<Uuid, oneshot::Sender<Result<Vec<u8>, String>>>>>;
-/// 单个后端的写半连接。
+/// Per-backend write half.
 type BackendWriter = Arc<Mutex<OwnedWriteHalf>>;
-/// 服务名 → 写半连接。
+/// Service name -> write half.
 type BackendWriters = Arc<Mutex<HashMap<String, BackendWriter>>>;
 
-pub struct InboundServiceRequest {
+pub struct InboundRequest {
     pub service: String,
     pub payload: Vec<u8>,
     pub response_tx: oneshot::Sender<Result<service_protocol::Response, String>>,
 }
 
+/// All downstream messages from the controller to the dispatcher.
+pub enum ToDispatcher {
+    /// An inbound P2P service request to forward to a local backend.
+    Inbound(InboundRequest),
+}
+
 pub struct ServiceDispatcher {
-    inbound_rx: mpsc::UnboundedReceiver<InboundServiceRequest>,
-    cmd_tx: mpsc::UnboundedSender<ControlRequest>,
-    backend_status_tx: mpsc::UnboundedSender<BackendStatus>,
+    inbound_rx: mpsc::UnboundedReceiver<ToDispatcher>,
+    to_controller_tx: mpsc::UnboundedSender<ToController>,
     config: ConfigHandle,
     local_services: Vec<LocalServiceEntry>,
     shutdown_rx: watch::Receiver<bool>,
@@ -70,14 +84,14 @@ pub struct ServiceDispatcher {
 
 impl ServiceDispatcher {
     pub fn new(
-        inbound_rx: mpsc::UnboundedReceiver<InboundServiceRequest>,
-        cmd_tx: mpsc::UnboundedSender<ControlRequest>,
-        backend_status_tx: mpsc::UnboundedSender<BackendStatus>,
+        inbound_rx: mpsc::UnboundedReceiver<ToDispatcher>,
+        to_controller_tx: mpsc::UnboundedSender<ToController>,
         config: ConfigHandle,
         shutdown_rx: watch::Receiver<bool>,
     ) -> Self {
         let configured = config.read().services.dispatcher.local_services.clone();
-        // 名称非法（保留名 "service" 或含非法字符）的服务不建立后端连接
+        // Services with invalid names (reserved "service" or illegal characters)
+        // get no backend connection.
         let mut local_services = Vec::with_capacity(configured.len());
         let mut rejected = Vec::new();
         for svc in configured {
@@ -106,8 +120,7 @@ impl ServiceDispatcher {
         }
         Self {
             inbound_rx,
-            cmd_tx,
-            backend_status_tx,
+            to_controller_tx,
             config,
             local_services,
             shutdown_rx,
@@ -132,8 +145,8 @@ impl ServiceDispatcher {
         loop {
             tokio::select! {
                 maybe_req = self.inbound_rx.recv() => {
-                    let Some(req) = maybe_req else {
-                        // 所有发送者已关闭，结束
+                    let Some(ToDispatcher::Inbound(req)) = maybe_req else {
+                        // All senders closed; terminate.
                         return;
                     };
                     let pending_map = self.pending_requests.get(&req.service).cloned();
@@ -156,7 +169,7 @@ impl ServiceDispatcher {
                             let _ = req.response_tx.send(response);
                         });
                     } else {
-                        // 没有对应的后端连接，直接返回错误
+                        // No matching backend connection; return an error.
                         let _ = req
                             .response_tx
                             .send(Err(format!("No backend for service {}", req.service)));
@@ -176,14 +189,12 @@ impl ServiceDispatcher {
             let addr = format!("127.0.0.1:{}", service.port);
             let service_name = service.name.clone();
             let pending_map = self.pending_requests.get(&service_name).cloned().unwrap();
-            let cmd_tx = self.cmd_tx.clone();
-            let backend_status_tx = self.backend_status_tx.clone();
+            let to_controller_tx = self.to_controller_tx.clone();
 
             tokio::spawn(Self::backend_read_loop(
                 service_name,
                 pending_map,
-                cmd_tx,
-                backend_status_tx,
+                to_controller_tx,
                 backend_writers.clone(),
                 addr,
                 query_timeout,
@@ -194,14 +205,14 @@ impl ServiceDispatcher {
     async fn backend_read_loop(
         service_name: String,
         pending_map: PendingMap,
-        cmd_tx: mpsc::UnboundedSender<ControlRequest>,
-        backend_status_tx: mpsc::UnboundedSender<BackendStatus>,
+        to_controller_tx: mpsc::UnboundedSender<ToController>,
         backend_writers: BackendWriters,
         addr: String,
         query_timeout: Duration,
     ) {
         let mut backoff = 1u64;
-        // 仅当握手成功后才会向上层宣告就绪；断开时据此上报撤销。
+        // Readiness is announced upstream only after a successful handshake; on
+        // disconnect this drives the withdrawal report.
         let mut was_ready = false;
 
         loop {
@@ -226,15 +237,16 @@ impl ServiceDispatcher {
                     match Self::handshake(&mut read_half, &writer).await {
                         Ok(()) => {
                             was_ready = true;
-                            let _ = backend_status_tx.send(BackendStatus {
-                                service: service_name.clone(),
-                                ready: true,
-                            });
+                            let _ =
+                                to_controller_tx.send(ToController::BackendStatus(BackendStatus {
+                                    service: service_name.clone(),
+                                    ready: true,
+                                }));
                             let _ = Self::read_loop_inner(
                                 read_half,
                                 &service_name,
                                 &pending_map,
-                                &cmd_tx,
+                                &to_controller_tx,
                                 &writer,
                                 query_timeout,
                             )
@@ -254,10 +266,10 @@ impl ServiceDispatcher {
 
                     if was_ready {
                         was_ready = false;
-                        let _ = backend_status_tx.send(BackendStatus {
+                        let _ = to_controller_tx.send(ToController::BackendStatus(BackendStatus {
                             service: service_name.clone(),
                             ready: false,
-                        });
+                        }));
                     }
 
                     LogStruct::new(
@@ -282,7 +294,7 @@ impl ServiceDispatcher {
         }
     }
 
-    /// 与后端交换 hello，校验协议版本。
+    /// Exchange hello with the backend and check the protocol version.
     async fn handshake(
         read_half: &mut OwnedReadHalf,
         writer: &BackendWriter,
@@ -310,7 +322,7 @@ impl ServiceDispatcher {
         mut read_half: OwnedReadHalf,
         service_name: &str,
         pending_map: &PendingMap,
-        cmd_tx: &mpsc::UnboundedSender<ControlRequest>,
+        to_controller_tx: &mpsc::UnboundedSender<ToController>,
         writer: &BackendWriter,
         query_timeout: Duration,
     ) -> Result<(), ()> {
@@ -369,11 +381,11 @@ impl ServiceDispatcher {
                     };
 
                     let (resp_tx, resp_rx) = oneshot::channel();
-                    if cmd_tx
-                        .send(ControlRequest {
+                    if to_controller_tx
+                        .send(ToController::Control(ControlCommand {
                             msg: control,
                             resp_tx,
-                        })
+                        }))
                         .is_err()
                     {
                         let reply = Message::Reply {
@@ -457,7 +469,7 @@ impl ServiceDispatcher {
             Ok(Ok(Err(e))) => Err(e),
             Ok(Err(_)) => Err("backend response channel closed".to_string()),
             Err(_) => {
-                // 超时，清理 pending 条目
+                // Timed out; clean up the pending entry.
                 pending_map.lock().await.remove(&id);
                 Err("backend request timeout".to_string())
             }

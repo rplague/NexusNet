@@ -61,7 +61,7 @@ cargo run -- -p 5001
 # 添加 bootstrap 节点
 cargo run -- -c /ip4/192.168.1.100/tcp/5000/p2p/12D3KooW...
 
-# 覆盖 bootstrap 列表（清空已有，仅连此节点）
+# 覆盖 bootstrap 列表
 cargo run -- --connect-overwrite /ip4/192.168.1.100/tcp/5000/p2p/12D3KooW...
 ```
 

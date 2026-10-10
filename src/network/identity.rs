@@ -15,7 +15,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-//! 节点身份的加载与保存：ED25519 主密钥，可选 PQ 辅助密钥。
+//! Node identity load/save: ED25519 primary key, optional PQ auxiliary keys.
 
 use crate::network::pq::PqKeys;
 use crate::{LogLevel, LogStruct};
@@ -34,9 +34,10 @@ pub struct KeyManager {
 }
 
 impl KeyManager {
-    /// 从指定路径加载密钥，若不存在则生成并原子保存。
+    /// Load the keypair from `path`, generating and atomically saving it if absent.
     ///
-    /// PQ 密钥（`keypair.pq.bin`）若存在则加载；不存在则留待 `ensure_pq_keys`。
+    /// The PQ keys (`keypair.pq.bin`) are loaded if present; otherwise they are
+    /// left to [`ensure_pq_keys`].
     pub fn load_or_create(path: impl AsRef<Path>) -> Result<Self, Box<dyn std::error::Error>> {
         let path = path.as_ref();
         let pq_path = path.with_extension("pq.bin");
@@ -95,23 +96,23 @@ impl KeyManager {
         &self.keypair
     }
 
-    /// 获取 peer id
+    /// Get the node's `PeerId`.
     pub fn peer_id(&self) -> PeerId {
         self.keypair.public().to_peer_id()
     }
 
-    /// 是否已加载 PQ 密钥
+    /// Whether PQ keys are loaded.
     #[allow(dead_code)]
     pub fn has_pq_keys(&self) -> bool {
         self.pq_keys.is_some()
     }
 
-    /// 取出 PQ 密钥所有权（供网络层注入 Actor）。
+    /// Take ownership of the PQ keys (to inject into the network actor).
     pub fn take_pq_keys(&mut self) -> Option<PqKeys> {
         self.pq_keys.take()
     }
 
-    /// 确保 PQ 密钥存在：缺失则生成并原子保存。
+    /// Ensure PQ keys exist, generating and atomically saving them if missing.
     pub fn ensure_pq_keys(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         if self.pq_keys.is_some() {
             return Ok(());
@@ -151,7 +152,7 @@ fn load_pq_keys(pq_path: &Path) -> Option<PqKeys> {
     }
 }
 
-/// 原子写入：先写临时文件，再重命名。
+/// Atomic write: write to a temp file, then rename.
 fn atomic_write(path: &Path, data: &[u8], what: &str) -> Result<(), Box<dyn std::error::Error>> {
     let temp_path = path.with_extension("tmp");
     if let Err(e) = fs::write(&temp_path, data) {

@@ -15,15 +15,19 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-//! 抗量子（PQ）应用层加密原语。
+//! Post-quantum (PQ) application-layer crypto primitives.
 //!
-//! 组合：ML-KEM-768（FIPS 203）+ X25519 混合 KEM、ChaCha20-Poly1305 AEAD、
-//! 可选 ML-DSA-65（FIPS 204）签名。用于服务请求/响应的机密性（HNDL 防护）。
+//! Combines ML-KEM-768 (FIPS 203) + X25519 hybrid KEM, ChaCha20-Poly1305 AEAD,
+//! and optional ML-DSA-65 (FIPS 204) signatures for service request/response
+//! confidentiality (HNDL protection).
 //!
-//! 关键设计：请求方 encaps 到响应方 KEM 公钥，响应方 decaps 后双方共享同一密钥，
-//! 响应直接复用该密钥加密，**无需第二次 KEM、无需在请求中携带请求方公钥**。
+//! Key design: the requester encapsulates to the responder's KEM public key;
+//! after decapsulation both sides share the same key, and the response is
+//! encrypted directly with it: no second KEM and no requester public key in the
+//! request.
 //!
-//! 注意：PQ 公钥用 ED25519 身份签名绑定到 `PeerId`，因此身份绑定本身仍是经典安全。
+//! Note: the PQ public key is bound to the `PeerId` via an ED25519 identity
+//! signature, so the identity binding itself remains classically secure.
 
 use chacha20poly1305::aead::{Aead, KeyInit as _};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
@@ -44,32 +48,32 @@ const ENVELOPE_VERSION: u8 = 1;
 const REQ_INFO: &[u8] = b"oahd/pq/req/v1";
 const RES_INFO: &[u8] = b"oahd/pq/res/v1";
 
-/// PQ 加密服务调用协议 ID。
+/// PQ encrypted service-call protocol ID.
 pub const SERVICE_REQ_PQ_PROTOCOL: &str = "/oahd/service_req/2.0.0";
-/// PQ 身份交换协议 ID（其存在即表示对端支持 PQ）。
+/// PQ identity exchange protocol ID (its presence signals PQ support).
 pub const PQ_IDENTITY_PROTOCOL: &str = "/oahd/pq_identity/1.0.0";
 const NONCE_LEN: usize = 12;
-/// 单个信封密文上限，防止恶意长度触发大分配。
+/// Per-envelope ciphertext cap, preventing large allocations from malicious lengths.
 const MAX_CIPHERTEXT: usize = 1 << 20;
 
-/// ML-KEM-768 参数尺寸（FIPS 203）。
+/// ML-KEM-768 parameter sizes (FIPS 203).
 const MLKEM_CT_LEN: usize = 1088;
 const MLKEM_EK_LEN: usize = 1184;
 const MLKEM_DK_LEN: usize = 2400;
-/// ML-DSA-65 参数尺寸（FIPS 204）。
+/// ML-DSA-65 parameter sizes (FIPS 204).
 const MLDSA_VK_LEN: usize = 1952;
 const MLDSA_SK_LEN: usize = 4032;
 const X25519_LEN: usize = 32;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PqError {
-    /// 身份证明（ED25519 绑定）无效。
+    /// The identity proof (ED25519 binding) is invalid.
     InvalidIdentity,
-    /// 密钥材料非法或长度不符。
+    /// Key material is invalid or has the wrong length.
     InvalidKey,
-    /// 信封格式/尺寸非法。
+    /// The envelope format or size is invalid.
     InvalidEnvelope,
-    /// 解密或验签失败。
+    /// Decryption or signature verification failed.
     Crypto,
 }
 
@@ -87,10 +91,10 @@ impl std::fmt::Display for PqError {
 impl std::error::Error for PqError {}
 
 // ---------------------------------------------------------------------------
-// 密钥
+// Keys
 // ---------------------------------------------------------------------------
 
-/// 本地 PQ 密钥集合（ML-KEM + X25519 + ML-DSA）。
+/// Local PQ key set (ML-KEM + X25519 + ML-DSA).
 pub struct PqKeys {
     kem_dk: DecapsulationKey<MlKem768>,
     kem_ek: EncapsulationKey<MlKem768>,
@@ -100,7 +104,7 @@ pub struct PqKeys {
 }
 
 impl PqKeys {
-    /// 生成全新密钥对。
+    /// Generate a fresh key pair.
     pub fn generate() -> Self {
         let (kem_dk, kem_ek) = MlKem768::generate_keypair();
         let sig_sk = SigningKey::<MlDsa65>::generate();
@@ -115,7 +119,7 @@ impl PqKeys {
         }
     }
 
-    /// 序列化为版本化的长度前缀格式。
+    /// Serialize into a versioned length-prefixed format.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
         out.push(ENVELOPE_VERSION);
@@ -127,7 +131,7 @@ impl PqKeys {
         out
     }
 
-    /// 从序列化字节恢复。
+    /// Restore from serialized bytes.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, PqError> {
         let mut r = Reader::new(bytes);
         if r.u8()? != ENVELOPE_VERSION {
@@ -158,7 +162,7 @@ impl PqKeys {
         })
     }
 
-    /// 构造带 ED25519 身份证明的公开身份。
+    /// Build the public identity with an ED25519 proof.
     pub fn identity(&self, id_keypair: &identity::Keypair) -> Result<PqIdentity, PqError> {
         let kem_pub = self.kem_ek.to_bytes().as_slice().to_vec();
         let x_pub = X25519PublicKey::from(&self.x_secret).to_bytes().to_vec();
@@ -186,10 +190,10 @@ impl PqKeys {
 }
 
 // ---------------------------------------------------------------------------
-// 身份
+// Identity
 // ---------------------------------------------------------------------------
 
-/// 对端的公开 PQ 身份（含 ED25519 绑定证明）。
+/// A remote peer's public PQ identity (with ED25519 binding proof).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PqIdentity {
     pub ed25519_pub: Vec<u8>,
@@ -200,7 +204,7 @@ pub struct PqIdentity {
 }
 
 impl PqIdentity {
-    /// 校验身份证明并把 PQ 公钥绑定到 `expected` PeerId。
+    /// Verify the identity proof and bind the PQ public key to `expected`.
     pub fn verify(&self, expected: &PeerId) -> Result<(), PqError> {
         let ed = identity::ed25519::PublicKey::try_from_bytes(&self.ed25519_pub)
             .map_err(|_| PqError::InvalidIdentity)?;
@@ -235,10 +239,11 @@ impl PqIdentity {
 }
 
 // ---------------------------------------------------------------------------
-// 信封
+// Envelopes
 // ---------------------------------------------------------------------------
 
-/// 加密请求：携带 KEM 密文与（可选）发送方身份/签名。
+/// Encrypted request: carries the KEM ciphertext and (optionally) the sender
+/// identity/signature.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PqRequest {
     pub version: u8,
@@ -249,41 +254,43 @@ pub struct PqRequest {
     pub signature: Option<Vec<u8>>,
 }
 
-/// 加密响应：复用请求建立的共享密钥，无需 KEM。
+/// Encrypted response: reuses the shared key established by the request; no KEM
+/// is needed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PqResponse {
     pub nonce: Vec<u8>,
     pub ciphertext: Vec<u8>,
 }
 
-/// 请求方发出后保留的响应密钥。
+/// Response key retained by the requester after sending.
 pub struct PqOutbound {
     pub request: PqRequest,
     res_key: [u8; 32],
 }
 
 impl PqOutbound {
-    /// 解密响应。
+    /// Decrypt the response.
     pub fn open_response(&self, response: &PqResponse) -> Result<Vec<u8>, PqError> {
         aead_open(&self.res_key, &response.nonce, &response.ciphertext)
     }
 }
 
-/// 响应方处理请求后得到的明文与响应密钥。
+/// Plaintext and response key the responder obtains after processing a request.
 pub struct PqInbound {
     pub plaintext: Vec<u8>,
     res_key: [u8; 32],
 }
 
 impl PqInbound {
-    /// 加密响应。
+    /// Encrypt the response.
     pub fn seal_response(&self, plaintext: &[u8]) -> Result<PqResponse, PqError> {
         let (nonce, ciphertext) = aead_seal(&self.res_key, plaintext)?;
         Ok(PqResponse { nonce, ciphertext })
     }
 }
 
-/// 请求方：加密请求。`sign` 为真时附带 ML-DSA 签名与身份。
+/// Requester side: seal a request. When `sign` is true, attaches an ML-DSA
+/// signature and identity.
 pub fn seal_request(
     keys: &PqKeys,
     recipient: &PqIdentity,
@@ -331,7 +338,7 @@ pub fn seal_request(
     })
 }
 
-/// 响应方：解密请求。
+/// Responder side: open a request.
 pub fn open_request(keys: &PqKeys, request: &PqRequest) -> Result<PqInbound, PqError> {
     if request.version != ENVELOPE_VERSION
         || request.kem.len() != MLKEM_CT_LEN + X25519_LEN
@@ -341,7 +348,7 @@ pub fn open_request(keys: &PqKeys, request: &PqRequest) -> Result<PqInbound, PqE
         return Err(PqError::InvalidEnvelope);
     }
 
-    // 可选签名校验
+    // Optional signature verification.
     if let (Some(id), Some(sig)) = (&request.identity, &request.signature) {
         id.verify(&id_peer_id(id)?)?;
         let vk = id.sig_vk()?;
@@ -377,7 +384,7 @@ pub fn open_request(keys: &PqKeys, request: &PqRequest) -> Result<PqInbound, PqE
 }
 
 // ---------------------------------------------------------------------------
-// 内部工具
+// Internal helpers
 // ---------------------------------------------------------------------------
 
 fn identity_message(kem_pub: &[u8], x25519_pub: &[u8], sig_pub: &[u8]) -> Vec<u8> {
@@ -478,7 +485,7 @@ impl<'a> Reader<'a> {
     }
 }
 
-// 编译期尺寸自检：确保常量与算法实现一致。
+// Compile-time size assertion: ensure the constants match the algorithm.
 const _: () = assert!(MLKEM_CT_LEN == 1088 && MLKEM_EK_LEN == 1184 && MLKEM_DK_LEN == 2400);
 const _: () = assert!(MLDSA_VK_LEN == 1952 && MLDSA_SK_LEN == 4032);
 
