@@ -17,19 +17,24 @@
 
 use std::cmp::min;
 use std::collections::HashMap;
-use std::sync::Arc;
 
+use libp2p::futures::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::sync::{Mutex, mpsc, oneshot, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::{Duration, timeout};
+use tokio_util::codec::Framed;
 use uuid::Uuid;
 
 use crate::auth;
-use crate::config::{ConfigHandle, LocalServiceEntry};
+use crate::config::ConfigHandle;
 use crate::log::{LogLevel, LogStruct};
 use crate::service_protocol;
-use crate::sidecar_protocol::{self, Message, PROTOCOL_VERSION, SidecarError};
+use crate::sidecar_protocol::{Message, PROTOCOL_VERSION, SidecarCodec, SidecarError};
+
+/// Initial reconnect backoff, in seconds.
+const INITIAL_BACKOFF: u64 = 1;
+/// Maximum reconnect backoff, in seconds.
+const MAX_BACKOFF: u64 = 60;
 
 /// A backend-issued control command and its reply channel.
 pub struct ControlCommand {
@@ -52,39 +57,43 @@ pub enum ToController {
     BackendStatus(BackendStatus),
 }
 
-/// Per-backend pending table of "id -> response waiter".
-type PendingMap = Arc<Mutex<HashMap<Uuid, oneshot::Sender<Result<Vec<u8>, String>>>>>;
-/// Per-backend write half.
-type BackendWriter = Arc<Mutex<OwnedWriteHalf>>;
-/// Service name -> write half.
-type BackendWriters = Arc<Mutex<HashMap<String, BackendWriter>>>;
-
+/// An inbound P2P service request to forward to a local backend.
 pub struct InboundRequest {
     pub service: String,
     pub payload: Vec<u8>,
     pub response_tx: oneshot::Sender<Result<service_protocol::Response, String>>,
 }
 
-/// All downstream messages from the controller to the dispatcher.
-pub enum ToDispatcher {
-    /// An inbound P2P service request to forward to a local backend.
-    Inbound(InboundRequest),
+/// Commands from the router to a backend task.
+enum BackendCmd {
+    /// Forward a service request; the result is delivered on its reply channel.
+    Request(InboundRequest),
+    /// Write an already-built frame (e.g. a control reply) to the backend.
+    WriteReply(Message),
 }
 
+/// Events from a backend task to the router.
+enum BackendEvent {
+    /// A backend connection readiness change.
+    Status(BackendStatus),
+    /// A control message received from a backend, to relay to the controller.
+    Control { service: String, msg: Message },
+}
+
+/// Routes between `NodeController` and one persistent task per local backend.
 pub struct ServiceDispatcher {
-    inbound_rx: mpsc::UnboundedReceiver<ToDispatcher>,
+    inbound_rx: mpsc::UnboundedReceiver<InboundRequest>,
+    event_rx: mpsc::UnboundedReceiver<BackendEvent>,
     to_controller_tx: mpsc::UnboundedSender<ToController>,
-    config: ConfigHandle,
-    local_services: Vec<LocalServiceEntry>,
+    /// Service name -> command sender for its backend task.
+    backends: HashMap<String, mpsc::UnboundedSender<BackendCmd>>,
     shutdown_rx: watch::Receiver<bool>,
-    pending_requests: HashMap<String, PendingMap>,
-    backend_writers: BackendWriters,
     query_timeout: Duration,
 }
 
 impl ServiceDispatcher {
     pub fn new(
-        inbound_rx: mpsc::UnboundedReceiver<ToDispatcher>,
+        inbound_rx: mpsc::UnboundedReceiver<InboundRequest>,
         to_controller_tx: mpsc::UnboundedSender<ToController>,
         config: ConfigHandle,
         shutdown_rx: watch::Receiver<bool>,
@@ -114,25 +123,20 @@ impl ServiceDispatcher {
         }
 
         let query_timeout = Duration::from_secs(config.dispatcher_query_timeout().into());
-        let mut pending_requests = HashMap::new();
-        for svc in &local_services {
-            pending_requests.insert(svc.name.clone(), Arc::new(Mutex::new(HashMap::new())));
-        }
-        Self {
-            inbound_rx,
-            to_controller_tx,
-            config,
-            local_services,
-            shutdown_rx,
-            pending_requests,
-            backend_writers: Arc::new(Mutex::new(HashMap::new())),
-            query_timeout,
-        }
-    }
-
-    pub async fn run(mut self) {
-        if self.config.dispatcher_enabled() {
-            self.init_backend_connections().await;
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let mut backends = HashMap::new();
+        if config.dispatcher_enabled() {
+            for svc in &local_services {
+                let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+                backends.insert(svc.name.clone(), cmd_tx);
+                tokio::spawn(backend_task(
+                    svc.name.clone(),
+                    format!("127.0.0.1:{}", svc.port),
+                    cmd_rx,
+                    event_tx.clone(),
+                    shutdown_rx.clone(),
+                ));
+            }
         } else {
             LogStruct::new(
                 LogLevel::Warning,
@@ -142,37 +146,40 @@ impl ServiceDispatcher {
             .emit();
         }
 
+        Self {
+            inbound_rx,
+            event_rx,
+            to_controller_tx,
+            backends,
+            shutdown_rx,
+            query_timeout,
+        }
+    }
+
+    pub async fn run(mut self) {
         loop {
             tokio::select! {
-                maybe_req = self.inbound_rx.recv() => {
-                    let Some(ToDispatcher::Inbound(req)) = maybe_req else {
-                        // All senders closed; terminate.
+                maybe = self.inbound_rx.recv() => {
+                    let Some(req) = maybe else {
                         return;
                     };
-                    let pending_map = self.pending_requests.get(&req.service).cloned();
-                    let writer = {
-                        let map = self.backend_writers.lock().await;
-                        map.get(&req.service).cloned()
-                    };
-
-                    if let (Some(pending_map), Some(writer)) = (pending_map, writer) {
-                        let query_timeout = self.query_timeout;
-                        tokio::spawn(async move {
-                            let response = Self::handle_request_with_backend(
-                                req.service,
-                                req.payload,
-                                pending_map,
-                                writer,
-                                query_timeout,
-                            )
-                            .await;
-                            let _ = req.response_tx.send(response);
-                        });
-                    } else {
-                        // No matching backend connection; return an error.
+                    let Some(cmd_tx) = self.backends.get(&req.service) else {
                         let _ = req
                             .response_tx
                             .send(Err(format!("No backend for service {}", req.service)));
+                        continue;
+                    };
+                    let _ = cmd_tx.send(BackendCmd::Request(req));
+                }
+                maybe = self.event_rx.recv() => {
+                    let Some(event) = maybe else {
+                        return;
+                    };
+                    match event {
+                        BackendEvent::Status(status) => {
+                            let _ = self.to_controller_tx.send(ToController::BackendStatus(status));
+                        }
+                        BackendEvent::Control { service, msg } => self.forward_control(service, msg),
                     }
                 }
                 _ = self.shutdown_rx.changed() => {
@@ -182,176 +189,141 @@ impl ServiceDispatcher {
         }
     }
 
-    async fn init_backend_connections(&mut self) {
-        let backend_writers = self.backend_writers.clone();
-        let query_timeout = self.query_timeout;
-        for service in &self.local_services {
-            let addr = format!("127.0.0.1:{}", service.port);
-            let service_name = service.name.clone();
-            let pending_map = self.pending_requests.get(&service_name).cloned().unwrap();
-            let to_controller_tx = self.to_controller_tx.clone();
-
-            tokio::spawn(Self::backend_read_loop(
-                service_name,
-                pending_map,
-                to_controller_tx,
-                backend_writers.clone(),
-                addr,
-                query_timeout,
-            ));
-        }
-    }
-
-    async fn backend_read_loop(
-        service_name: String,
-        pending_map: PendingMap,
-        to_controller_tx: mpsc::UnboundedSender<ToController>,
-        backend_writers: BackendWriters,
-        addr: String,
-        query_timeout: Duration,
-    ) {
-        let mut backoff = 1u64;
-        // Readiness is announced upstream only after a successful handshake; on
-        // disconnect this drives the withdrawal report.
-        let mut was_ready = false;
-
-        loop {
-            match TcpStream::connect(&addr).await {
-                Ok(stream) => {
-                    backoff = 1;
-                    let (mut read_half, write_half) = stream.into_split();
-                    let writer = Arc::new(Mutex::new(write_half));
-
-                    backend_writers
-                        .lock()
-                        .await
-                        .insert(service_name.clone(), writer.clone());
-
-                    LogStruct::new(
-                        LogLevel::Preset,
-                        "后端连接建立",
-                        format!("{} -> {}", service_name, addr),
-                    )
-                    .emit();
-
-                    match Self::handshake(&mut read_half, &writer).await {
-                        Ok(()) => {
-                            was_ready = true;
-                            let _ =
-                                to_controller_tx.send(ToController::BackendStatus(BackendStatus {
-                                    service: service_name.clone(),
-                                    ready: true,
-                                }));
-                            let _ = Self::read_loop_inner(
-                                read_half,
-                                &service_name,
-                                &pending_map,
-                                &to_controller_tx,
-                                &writer,
-                                query_timeout,
-                            )
-                            .await;
-                        }
-                        Err(e) => {
-                            LogStruct::new(
-                                LogLevel::Warning,
-                                "后端协议握手失败",
-                                format!("{}: {}", service_name, e),
-                            )
-                            .emit();
-                        }
-                    }
-
-                    backend_writers.lock().await.remove(&service_name);
-
-                    if was_ready {
-                        was_ready = false;
-                        let _ = to_controller_tx.send(ToController::BackendStatus(BackendStatus {
-                            service: service_name.clone(),
-                            ready: false,
-                        }));
-                    }
-
-                    LogStruct::new(
-                        LogLevel::Warning,
-                        "后端连接断开",
-                        format!("{} 将在 {} 秒后重连", service_name, backoff),
-                    )
-                    .emit();
-                }
-                Err(e) => {
-                    LogStruct::new(
-                        LogLevel::Warning,
-                        "后端连接失败",
-                        format!("{}: {}, {} 秒后重试", service_name, e, backoff),
-                    )
-                    .emit();
-                }
-            }
-
-            tokio::time::sleep(Duration::from_secs(backoff)).await;
-            backoff = min(backoff * 2, 60);
-        }
-    }
-
-    /// Exchange hello with the backend and check the protocol version.
-    async fn handshake(
-        read_half: &mut OwnedReadHalf,
-        writer: &BackendWriter,
-    ) -> Result<(), String> {
-        let hello = Message::Hello {
-            version: PROTOCOL_VERSION,
+    /// Relay a backend control message to the controller, then route the reply
+    /// back to the originating backend task for writing.
+    fn forward_control(&self, service: String, msg: Message) {
+        let Some(id) = msg.id() else {
+            LogStruct::new(
+                LogLevel::Warning,
+                "后端协议错误",
+                format!("{service}: 非控制消息 {msg:?}"),
+            )
+            .emit();
+            return;
         };
+        let Some(backend_tx) = self.backends.get(&service).cloned() else {
+            return;
+        };
+
+        let (resp_tx, resp_rx) = oneshot::channel();
+        if self
+            .to_controller_tx
+            .send(ToController::Control(ControlCommand { msg, resp_tx }))
+            .is_err()
         {
-            let mut w = writer.lock().await;
-            sidecar_protocol::write_frame(&mut *w, &hello)
-                .await
-                .map_err(|e| e.to_string())?;
+            let _ = backend_tx.send(BackendCmd::WriteReply(Message::Reply {
+                id,
+                ok: false,
+                result: None,
+                error: Some(SidecarError::new("node_gone", "node unavailable")),
+            }));
+            return;
         }
-        match sidecar_protocol::read_frame(read_half).await {
-            Ok(Message::Hello { version }) if version == PROTOCOL_VERSION => Ok(()),
-            Ok(Message::Hello { version }) => Err(format!(
-                "协议版本不兼容: 对端 {version}, 本端 {PROTOCOL_VERSION}"
-            )),
-            Ok(_) => Err("期望 hello 首帧".to_string()),
-            Err(e) => Err(e.to_string()),
-        }
-    }
 
-    async fn read_loop_inner(
-        mut read_half: OwnedReadHalf,
-        service_name: &str,
-        pending_map: &PendingMap,
-        to_controller_tx: &mpsc::UnboundedSender<ToController>,
-        writer: &BackendWriter,
-        query_timeout: Duration,
-    ) -> Result<(), ()> {
-        loop {
-            let msg = match sidecar_protocol::read_frame(&mut read_half).await {
-                Ok(msg) => msg,
-                Err(e) => {
-                    LogStruct::new(
-                        LogLevel::Error,
-                        "后端读错误",
-                        format!("{}: {}", service_name, e),
-                    )
-                    .emit();
-                    return Err(());
-                }
-            };
-
-            match msg {
-                Message::Reply {
+        let query_timeout = self.query_timeout;
+        tokio::spawn(async move {
+            let reply = match timeout(query_timeout, resp_rx).await {
+                Ok(Ok(Ok(result))) => Message::Reply {
                     id,
-                    ok,
-                    result,
-                    error,
-                } => {
-                    let sender = pending_map.lock().await.remove(&id);
-                    match sender {
+                    ok: true,
+                    result: Some(result),
+                    error: None,
+                },
+                Ok(Ok(Err(e))) => Message::Reply {
+                    id,
+                    ok: false,
+                    result: None,
+                    error: Some(SidecarError::new("command_failed", e)),
+                },
+                Ok(Err(_)) => Message::Reply {
+                    id,
+                    ok: false,
+                    result: None,
+                    error: Some(SidecarError::new("node_gone", "command channel closed")),
+                },
+                Err(_) => Message::Reply {
+                    id,
+                    ok: false,
+                    result: None,
+                    error: Some(SidecarError::new("timeout", "command execution timeout")),
+                },
+            };
+            let _ = backend_tx.send(BackendCmd::WriteReply(reply));
+        });
+    }
+}
+
+/// One task per local backend: owns the TCP connection and its reply table.
+async fn backend_task(
+    service: String,
+    addr: String,
+    mut cmd_rx: mpsc::UnboundedReceiver<BackendCmd>,
+    event_tx: mpsc::UnboundedSender<BackendEvent>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    let mut backoff = INITIAL_BACKOFF;
+    loop {
+        let stream = match TcpStream::connect(&addr).await {
+            Ok(stream) => stream,
+            Err(e) => {
+                LogStruct::new(
+                    LogLevel::Warning,
+                    "后端连接失败",
+                    format!("{service}: {e}, {backoff} 秒后重试"),
+                )
+                .emit();
+                if wait_backoff(&mut shutdown_rx, &mut cmd_rx, &service, backoff).await {
+                    return;
+                }
+                backoff = min(backoff * 2, MAX_BACKOFF);
+                continue;
+            }
+        };
+
+        let mut framed = Framed::new(stream, SidecarCodec);
+        if let Err(e) = handshake(&mut framed).await {
+            LogStruct::new(
+                LogLevel::Warning,
+                "后端协议握手失败",
+                format!("{service}: {e}"),
+            )
+            .emit();
+            if wait_backoff(&mut shutdown_rx, &mut cmd_rx, &service, backoff).await {
+                return;
+            }
+            backoff = min(backoff * 2, MAX_BACKOFF);
+            continue;
+        }
+
+        backoff = INITIAL_BACKOFF;
+        LogStruct::new(
+            LogLevel::Preset,
+            "后端连接建立",
+            format!("{service} -> {addr}"),
+        )
+        .emit();
+        let _ = event_tx.send(BackendEvent::Status(BackendStatus {
+            service: service.clone(),
+            ready: true,
+        }));
+
+        // Pending service requests, keyed by request id.
+        let mut pending: HashMap<
+            Uuid,
+            oneshot::Sender<Result<service_protocol::Response, String>>,
+        > = HashMap::new();
+        let mut shutdown = false;
+
+        loop {
+            tokio::select! {
+                frame = framed.next() => match frame {
+                    Some(Ok(Message::Reply { id, ok, result, error })) => match pending.remove(&id) {
                         Some(tx) => {
                             let outcome = if ok {
-                                Ok(result.unwrap_or_default())
+                                Ok(service_protocol::Response {
+                                    success: true,
+                                    data: result.unwrap_or_default(),
+                                })
                             } else {
                                 Err(error
                                     .map(|e| e.message)
@@ -359,120 +331,129 @@ impl ServiceDispatcher {
                             };
                             let _ = tx.send(outcome);
                         }
-                        None => {
-                            LogStruct::new(
-                                LogLevel::Warning,
-                                "未知响应",
-                                format!("{}: 未匹配的 id {}", service_name, id),
-                            )
-                            .emit();
+                        None => LogStruct::new(
+                            LogLevel::Warning,
+                            "未知响应",
+                            format!("{service}: 未匹配的 id {id}"),
+                        )
+                        .emit(),
+                    },
+                    // Control messages are relayed to the controller without
+                    // blocking this read loop.
+                    Some(Ok(control)) => {
+                        let _ = event_tx.send(BackendEvent::Control {
+                            service: service.clone(),
+                            msg: control,
+                        });
+                    }
+                    Some(Err(e)) => {
+                        LogStruct::new(LogLevel::Error, "后端读错误", format!("{service}: {e}")).emit();
+                        break;
+                    }
+                    None => break,
+                },
+                maybe = cmd_rx.recv() => match maybe {
+                    None => {
+                        for (_, tx) in pending.drain() {
+                            let _ = tx.send(Err("dispatcher gone".to_string()));
+                        }
+                        return;
+                    }
+                    Some(BackendCmd::Request(req)) => {
+                        let id = Uuid::new_v4();
+                        let frame = Message::Request {
+                            id,
+                            service: service.clone(),
+                            payload: req.payload,
+                        };
+                        if let Err(e) = framed.send(frame).await {
+                            let _ = req
+                                .response_tx
+                                .send(Err(format!("write to backend failed: {e}")));
+                            break;
+                        }
+                        pending.insert(id, req.response_tx);
+                    }
+                    Some(BackendCmd::WriteReply(msg)) => {
+                        if framed.send(msg).await.is_err() {
+                            break;
                         }
                     }
-                }
-                control => {
-                    let Some(id) = control.id() else {
-                        LogStruct::new(
-                            LogLevel::Warning,
-                            "后端协议错误",
-                            format!("{}: 非控制消息 {:?}", service_name, control),
-                        )
-                        .emit();
-                        continue;
-                    };
-
-                    let (resp_tx, resp_rx) = oneshot::channel();
-                    if to_controller_tx
-                        .send(ToController::Control(ControlCommand {
-                            msg: control,
-                            resp_tx,
-                        }))
-                        .is_err()
-                    {
-                        let reply = Message::Reply {
-                            id,
-                            ok: false,
-                            result: None,
-                            error: Some(SidecarError::new("node_gone", "node unavailable")),
-                        };
-                        let _ = Self::write_msg(writer, &reply).await;
-                        continue;
-                    }
-
-                    let reply = match timeout(query_timeout, resp_rx).await {
-                        Ok(Ok(Ok(result))) => Message::Reply {
-                            id,
-                            ok: true,
-                            result: Some(result),
-                            error: None,
-                        },
-                        Ok(Ok(Err(e))) => Message::Reply {
-                            id,
-                            ok: false,
-                            result: None,
-                            error: Some(SidecarError::new("command_failed", e)),
-                        },
-                        Ok(Err(_)) => Message::Reply {
-                            id,
-                            ok: false,
-                            result: None,
-                            error: Some(SidecarError::new("node_gone", "command channel closed")),
-                        },
-                        Err(_) => Message::Reply {
-                            id,
-                            ok: false,
-                            result: None,
-                            error: Some(SidecarError::new("timeout", "command execution timeout")),
-                        },
-                    };
-                    let _ = Self::write_msg(writer, &reply).await;
+                },
+                _ = shutdown_rx.changed() => {
+                    shutdown = true;
+                    break;
                 }
             }
         }
-    }
 
-    async fn write_msg(writer: &BackendWriter, msg: &Message) -> Result<(), String> {
-        let mut w = writer.lock().await;
-        sidecar_protocol::write_frame(&mut *w, msg)
-            .await
-            .map_err(|e| e.to_string())
-    }
-
-    async fn handle_request_with_backend(
-        service: String,
-        payload: Vec<u8>,
-        pending_map: PendingMap,
-        writer: BackendWriter,
-        query_timeout: Duration,
-    ) -> Result<service_protocol::Response, String> {
-        let id = Uuid::new_v4();
-        let (resp_tx, resp_rx) = oneshot::channel();
-        pending_map.lock().await.insert(id, resp_tx);
-
-        let request = Message::Request {
-            id,
-            service,
-            payload,
-        };
-        {
-            let mut w = writer.lock().await;
-            if let Err(e) = sidecar_protocol::write_frame(&mut *w, &request).await {
-                pending_map.lock().await.remove(&id);
-                return Err(format!("write to backend failed: {}", e));
-            }
+        // Fail everything still in flight.
+        for (_, tx) in pending.drain() {
+            let _ = tx.send(Err("backend disconnected".to_string()));
+        }
+        if shutdown {
+            return;
         }
 
-        match timeout(query_timeout, resp_rx).await {
-            Ok(Ok(Ok(data))) => Ok(service_protocol::Response {
-                success: true,
-                data,
-            }),
-            Ok(Ok(Err(e))) => Err(e),
-            Ok(Err(_)) => Err("backend response channel closed".to_string()),
-            Err(_) => {
-                // Timed out; clean up the pending entry.
-                pending_map.lock().await.remove(&id);
-                Err("backend request timeout".to_string())
-            }
+        let _ = event_tx.send(BackendEvent::Status(BackendStatus {
+            service: service.clone(),
+            ready: false,
+        }));
+        LogStruct::new(
+            LogLevel::Warning,
+            "后端连接断开",
+            format!("{service} 将在 {backoff} 秒后重连"),
+        )
+        .emit();
+        if wait_backoff(&mut shutdown_rx, &mut cmd_rx, &service, backoff).await {
+            return;
+        }
+        backoff = min(backoff * 2, MAX_BACKOFF);
+    }
+}
+
+/// Exchange hello with the backend and check the protocol version.
+async fn handshake(framed: &mut Framed<TcpStream, SidecarCodec>) -> Result<(), String> {
+    framed
+        .send(Message::Hello {
+            version: PROTOCOL_VERSION,
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    match framed.next().await {
+        Some(Ok(Message::Hello { version })) if version == PROTOCOL_VERSION => Ok(()),
+        Some(Ok(Message::Hello { version })) => Err(format!(
+            "协议版本不兼容: 对端 {version}, 本端 {PROTOCOL_VERSION}"
+        )),
+        Some(Ok(_)) => Err("期望 hello 首帧".to_string()),
+        Some(Err(e)) => Err(e.to_string()),
+        None => Err("连接在握手前关闭".to_string()),
+    }
+}
+
+/// Wait out the reconnect delay, honoring shutdown and rejecting inbound
+/// requests while not connected. Returns `true` if the task should exit.
+async fn wait_backoff(
+    shutdown_rx: &mut watch::Receiver<bool>,
+    cmd_rx: &mut mpsc::UnboundedReceiver<BackendCmd>,
+    service: &str,
+    backoff: u64,
+) -> bool {
+    let sleep = tokio::time::sleep(Duration::from_secs(backoff));
+    tokio::pin!(sleep);
+    loop {
+        tokio::select! {
+            _ = &mut sleep => return false,
+            _ = shutdown_rx.changed() => return true,
+            maybe = cmd_rx.recv() => match maybe {
+                None => return true,
+                Some(BackendCmd::Request(req)) => {
+                    let _ = req
+                        .response_tx
+                        .send(Err(format!("backend not connected: {service}")));
+                }
+                Some(BackendCmd::WriteReply(_)) => {}
+            },
         }
     }
 }

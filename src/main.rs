@@ -17,18 +17,18 @@
 
 mod auth;
 mod config;
+mod controller;
 mod log;
 mod network;
-mod node_controller;
 mod paths;
 mod service_dispatcher;
 mod service_protocol;
 mod sidecar_protocol;
 
 use crate::config::ConfigHandle;
+use controller::NodeController;
 use log::{LogLevel, LogStruct};
 use network::{KeyManager, Network};
-use node_controller::NodeController;
 use std::error::Error;
 use tokio::sync::mpsc;
 #[cfg(unix)]
@@ -120,9 +120,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         network,
         shutdown_rx,
     );
-    if let Err(e) = controller.run().await {
-        LogStruct::new(LogLevel::Critical, "节点运行错误", e.to_string()).emit();
-    }
+    controller.run().await;
     Ok(())
 }
 

@@ -7,6 +7,7 @@ name = "NexusNet"
 version = "0.4.6"
 dependencies = [
  "base64 0.22.1",
+ "bytes",
  "chacha20poly1305",
  "chrono",
  "ciborium",
@@ -26,6 +27,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tokio",
+ "tokio-util",
  "toml",
  "uuid",
  "x25519-dalek",

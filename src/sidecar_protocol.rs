@@ -22,8 +22,10 @@
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio_util::codec::{Decoder, Encoder};
 use uuid::Uuid;
+
+use bytes::{Buf, BufMut, BytesMut};
 
 /// Protocol version.
 pub const PROTOCOL_VERSION: u32 = 2;
@@ -204,28 +206,46 @@ pub fn decode_frame(body: &[u8]) -> Result<Message, FrameError> {
     ciborium::de::from_reader(body).map_err(|e| FrameError::Decode(e.to_string()))
 }
 
-/// Read one complete frame.
-pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Message, FrameError> {
-    let mut len_buf = [0u8; 4];
-    reader.read_exact(&mut len_buf).await?;
-    let len = u32::from_be_bytes(len_buf) as usize;
-    if len > MAX_FRAME {
-        return Err(FrameError::TooLarge(len));
+/// A `tokio_util` codec for the sidecar wire format.
+///
+/// Wraps the same `u32_be(len) || cbor(message)` framing as [`encode_frame`] /
+/// [`decode_frame`], so a single `Framed` can be used in a `select!` (its
+/// `Stream::next` is cancel-safe, unlike a raw `read_exact`).
+pub struct SidecarCodec;
+
+impl Decoder for SidecarCodec {
+    type Item = Message;
+    type Error = FrameError;
+
+    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Message>, FrameError> {
+        let Some(len) = src
+            .get(..4)
+            .map(|b| u32::from_be_bytes(b.try_into().unwrap()) as usize)
+        else {
+            return Ok(None);
+        };
+        if len > MAX_FRAME {
+            return Err(FrameError::TooLarge(len));
+        }
+        if src.len() < 4 + len {
+            src.reserve(4 + len - src.len());
+            return Ok(None);
+        }
+        src.advance(4);
+        let body = src.split_to(len);
+        decode_frame(&body).map(Some)
     }
-    let mut body = vec![0u8; len];
-    reader.read_exact(&mut body).await?;
-    decode_frame(&body)
 }
 
-/// Write one complete frame.
-pub async fn write_frame<W: AsyncWrite + Unpin>(
-    writer: &mut W,
-    msg: &Message,
-) -> Result<(), FrameError> {
-    let frame = encode_frame(msg)?;
-    writer.write_all(&frame).await?;
-    writer.flush().await?;
-    Ok(())
+impl Encoder<Message> for SidecarCodec {
+    type Error = FrameError;
+
+    fn encode(&mut self, msg: Message, dst: &mut BytesMut) -> Result<(), FrameError> {
+        let frame = encode_frame(&msg)?;
+        dst.reserve(frame.len());
+        dst.put_slice(&frame);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -241,6 +261,20 @@ mod tests {
             body.len()
         );
         assert_eq!(decode_frame(body).unwrap(), msg);
+    }
+
+    #[test]
+    fn codec_handles_partial_then_full_frame() {
+        let msg = Message::Whoami { id: Uuid::new_v4() };
+        let frame = encode_frame(&msg).unwrap();
+        let (head, tail) = frame.split_at(3);
+
+        let mut buf = BytesMut::new();
+        buf.put_slice(head);
+        assert!(SidecarCodec.decode(&mut buf).unwrap().is_none());
+
+        buf.put_slice(tail);
+        assert_eq!(SidecarCodec.decode(&mut buf).unwrap(), Some(msg));
     }
 
     #[test]
