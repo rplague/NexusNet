@@ -48,6 +48,11 @@ impl SidecarError {
     }
 }
 
+/// Serde default for optional boolean fields that default to `true`.
+fn default_true() -> bool {
+    true
+}
+
 /// Protocol messages are discriminated by a text field `t`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
@@ -118,6 +123,20 @@ pub enum Message {
         #[serde(default)]
         providing: bool,
     },
+    /// Stop providing and/or remove the locally stored record for `key`.
+    ///
+    /// `providing` (default true) stops announcing this node as a provider;
+    /// `record` (default false) removes the locally stored record (only if this
+    /// node is its publisher). Both are local operations; remote copies expire
+    /// on their own TTLs.
+    RemoveKey {
+        id: Uuid,
+        key: String,
+        #[serde(default = "default_true")]
+        providing: bool,
+        #[serde(default)]
+        record: bool,
+    },
     ServiceRequest {
         id: Uuid,
         service: String,
@@ -151,6 +170,7 @@ impl Message {
             | Message::AuthStatus { id }
             | Message::QueryKey { id, .. }
             | Message::AddKey { id, .. }
+            | Message::RemoveKey { id, .. }
             | Message::ServiceRequest { id, .. }
             | Message::ServiceRequestTo { id, .. } => Some(*id),
         }
@@ -308,6 +328,12 @@ mod tests {
             key: "/k".into(),
             value: Some(vec![9, 8, 7]),
             providing: true,
+        });
+        round_trip(Message::RemoveKey {
+            id,
+            key: "/oahd/service/cmd".into(),
+            providing: true,
+            record: false,
         });
         round_trip(Message::ServiceRequestTo {
             id,

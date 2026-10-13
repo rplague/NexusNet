@@ -75,6 +75,11 @@ pub enum SwarmCommand {
         key: kad::RecordKey,
         resp: oneshot::Sender<Result<(), NetworkError>>,
     },
+    /// Remove a locally stored record (only if this node is its publisher).
+    KadRemoveRecord {
+        key: kad::RecordKey,
+        resp: oneshot::Sender<Result<(), NetworkError>>,
+    },
     /// Clear the `get_record` result cache; replies with the number of entries
     /// removed.
     KadCacheRefresh {
@@ -230,6 +235,19 @@ impl NetworkHandle {
     pub async fn stop_providing(&self, key: kad::RecordKey) -> Result<(), NetworkError> {
         match self
             .request(|resp| SwarmCommand::KadStopProviding { key, resp })
+            .await
+        {
+            Ok(inner) => inner,
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Remove a locally stored record. libp2p only removes it if this node is the
+    /// record's publisher; otherwise it is a no-op. Clears the record cache for
+    /// the key so later reads go back to the network.
+    pub async fn remove_record(&self, key: kad::RecordKey) -> Result<(), NetworkError> {
+        match self
+            .request(|resp| SwarmCommand::KadRemoveRecord { key, resp })
             .await
         {
             Ok(inner) => inner,
@@ -1065,6 +1083,19 @@ impl SwarmActor {
                     let _ = resp.send(Err(e));
                 }
             },
+            SwarmCommand::KadRemoveRecord { key, resp } => {
+                self.record_cache.remove(&key);
+                match self.kad() {
+                    Ok(kad) => {
+                        // Local, publisher-only operation (see libp2p docs).
+                        kad.remove_record(&key);
+                        let _ = resp.send(Ok(()));
+                    }
+                    Err(e) => {
+                        let _ = resp.send(Err(e));
+                    }
+                }
+            }
             SwarmCommand::KadCacheRefresh { resp } => {
                 let cleared = self.record_cache.len();
                 self.record_cache.clear();

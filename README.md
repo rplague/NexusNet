@@ -216,10 +216,11 @@ u32_be(len) || cbor(message)      # len <= 16 MiB
 | `hello` | 双向 | 握手与版本协商 |
 | `request` | 节点→后端 | 转发入站服务请求 `{ id, service, payload }` |
 | `reply` | 双向 | 关联回复 `{ id, ok, result?, error? }` |
-| `list_services` / `discover_providers` / `query_public_ip` / `whoami` / `reconnect_bootstrap` / `reannounce_services` / `reload_config` / `relay_status` / `pq_status` / `auth_status` / `query_key` / `add_key` / `service_request` / `service_request_to` | 后端→节点 | 控制指令，节点以 `reply` 应答 |
+| `list_services` / `discover_providers` / `query_public_ip` / `whoami` / `reconnect_bootstrap` / `reannounce_services` / `reload_config` / `relay_status` / `pq_status` / `auth_status` / `query_key` / `add_key` / `remove_key` / `service_request` / `service_request_to` | 后端→节点 | 控制指令，节点以 `reply` 应答 |
 
 - 关联 id 为 UUID；`reply.result` 是该 op 自定的 **CBOR** 字节。
 - `add_key` 的 `value` 为 `bstr`，二进制安全（无需 base64）。
+- `remove_key`：撤销 provider 宣告 / 删除本地记录，`{ key, ? providing=true, ? record=false }`。两项均为**本地操作**——远端 provider 记录需待对端 provider TTL 过期才消失，远端 value 副本按 `record_ttl` 过期；撤销只影响发现，不阻止直接 `service_request_to` 调用。
 - 默认超时 30 秒，超时以 `error{code:"timeout"}` 应答。
 
 ## P2P 服务调用流程

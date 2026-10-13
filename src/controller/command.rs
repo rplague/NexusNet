@@ -88,6 +88,12 @@ impl NodeController {
                 providing,
                 ..
             } => Some(self.cmd_add_key(key, value, providing).await),
+            Message::RemoveKey {
+                key,
+                providing,
+                record,
+                ..
+            } => Some(self.cmd_remove_key(key, providing, record).await),
             Message::QueryKey { key, .. } => Some(self.cmd_query_key(key).await),
             Message::ServiceRequest {
                 service, payload, ..
@@ -256,6 +262,44 @@ impl NodeController {
             }
             None => Err("at least one of 'value' or 'providing' is required".to_string()),
         }
+    }
+
+    /// Revoke a provider announcement and/or remove a locally stored record.
+    ///
+    /// `providing` stops this node announcing as a provider for `key`
+    /// (`stop_providing`); `record` removes the locally stored value record (only
+    /// if this node is its publisher). Both are local operations: remote provider
+    /// records and value copies expire on their own TTLs.
+    async fn cmd_remove_key(
+        &mut self,
+        key: String,
+        providing: bool,
+        record: bool,
+    ) -> Result<Vec<u8>, String> {
+        if key.is_empty() {
+            return Err("missing 'key' field".to_string());
+        }
+        if !providing && !record {
+            return Err("at least one of 'providing' or 'record' is required".to_string());
+        }
+        if providing {
+            self.swarm
+                .stop_providing(kad::RecordKey::new(&key))
+                .await
+                .map_err(|e| format!("stop_providing failed: {e}"))?;
+        }
+        if record {
+            self.swarm
+                .remove_record(kad::RecordKey::new(&key))
+                .await
+                .map_err(|e| format!("remove_record failed: {e}"))?;
+        }
+        Ok(to_cbor(&serde_json::json!({
+            "success": true,
+            "key": key,
+            "providing": providing,
+            "record": record,
+        })))
     }
 
     async fn cmd_query_key(&self, key: String) -> Result<Vec<u8>, String> {
