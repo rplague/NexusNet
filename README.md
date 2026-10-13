@@ -124,6 +124,7 @@ bootstrap_nodes = []
 enabled = true
 query_timeout_secs = 60
 record_ttl_secs = 3600
+types_sync_secs = 300
 
 [[services.dispatcher.local_services]]
 name = "cmd"
@@ -243,8 +244,8 @@ u32_be(len) || cbor(message)      # len <= 16 MiB
 - 仅当 DHT bootstrap 完成**且**对应后端 TCP 握手（`hello`）成功后，才自动调用 `start_providing`，key 为 `/oahd/service/<name>`——避免提前宣告尚不可用的服务
 - 后端连接断开后进入 3 秒宽限期：期间重连则不撤销；超过 3 秒仍未恢复则 `stop_providing` 撤销宣告
 - 撤销为本地行为，远端 provider 记录需待 provider TTL 过期才会消失
-- 同步 `/oahd/service/types` 全局服务类型记录（`put_record`/`get_record`，仅新增、不清理）
-- `list_services` → 查询全局服务类型
+- 同步 `/oahd/service/types` 全局服务类型记录（仅新增、不清理）：本地维护一个**单调并集**，并周期（`services.dispatcher.types_sync_secs`，默认 300s）从 DHT 对端读取（绕过本地 store 副本与 60s 缓存，避免自我遮蔽）后重新发布，使各节点即使遭遇并发覆盖也能收敛到完整列表
+- `list_services` → 读取并合并 DHT 对端与本地已知的全部服务类型
 - `discover_providers` → DHT get_providers 获取提供者列表
 - `service_request` → 查询提供者，RTT 排序选优，P2P 调用
 
