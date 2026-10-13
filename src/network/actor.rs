@@ -50,6 +50,14 @@ pub enum SwarmCommand {
         key: kad::RecordKey,
         resp: oneshot::Sender<Result<kad::GetRecordOk, NetworkError>>,
     },
+    /// Like `KadGetRecord`, but ignores the local store copy and the record
+    /// cache so the freshest value held by peers is returned. Used to build the
+    /// merged global service-type index without a node's own publisher record
+    /// shadowing remote updates.
+    KadGetRecordNetwork {
+        key: kad::RecordKey,
+        resp: oneshot::Sender<Result<kad::GetRecordOk, NetworkError>>,
+    },
     KadGetProviders {
         key: kad::RecordKey,
         resp: oneshot::Sender<Result<Vec<PeerId>, NetworkError>>,
@@ -151,6 +159,21 @@ impl NetworkHandle {
     pub async fn get_record(&self, key: kad::RecordKey) -> Result<kad::GetRecordOk, NetworkError> {
         match self
             .request(|resp| SwarmCommand::KadGetRecord { key, resp })
+            .await
+        {
+            Ok(inner) => inner,
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Fetch a record from the DHT peers, ignoring the local store copy and the
+    /// 60s result cache. See `SwarmCommand::KadGetRecordNetwork`.
+    pub async fn get_record_network(
+        &self,
+        key: kad::RecordKey,
+    ) -> Result<kad::GetRecordOk, NetworkError> {
+        match self
+            .request(|resp| SwarmCommand::KadGetRecordNetwork { key, resp })
             .await
         {
             Ok(inner) => inner,
@@ -281,6 +304,9 @@ enum KadPending {
     GetRecord {
         key: kad::RecordKey,
         resp: oneshot::Sender<Result<kad::GetRecordOk, NetworkError>>,
+        /// When set, the local store copy (`peer == None`) is ignored and only a
+        /// record obtained from the DHT finalizes the query.
+        network_only: bool,
     },
     GetProviders {
         resp: oneshot::Sender<Result<Vec<PeerId>, NetworkError>>,
@@ -652,14 +678,38 @@ impl SwarmActor {
                 }
             }
             kad::QueryResult::GetRecord(result) => {
-                if let Some(KadPending::GetRecord { key, resp }) = self.pending_kad.remove(&id) {
+                // A network-only read must not be satisfied by the local store
+                // copy; keep waiting for a peer record or the terminal event.
+                let network_only = matches!(
+                    self.pending_kad.get(&id),
+                    Some(KadPending::GetRecord {
+                        network_only: true,
+                        ..
+                    })
+                );
+                if network_only
+                    && let Ok(kad::GetRecordOk::FoundRecord(peer_record)) = &result
+                    && peer_record.peer.is_none()
+                {
+                    return;
+                }
+                if let Some(KadPending::GetRecord {
+                    key,
+                    resp,
+                    network_only,
+                }) = self.pending_kad.remove(&id)
+                {
                     let value = match &result {
                         Ok(kad::GetRecordOk::FoundRecord(peer_record)) => {
                             Some(peer_record.record.value.clone())
                         }
                         _ => None,
                     };
-                    self.insert_cached(key, value);
+                    // Never negative-cache a network-only miss: the local store
+                    // may still hold a valid copy for regular reads.
+                    if value.is_some() || !network_only {
+                        self.insert_cached(key, value);
+                    }
                     let _ = resp.send(result.map_err(|e| NetworkError::Kad(format!("{e:?}"))));
                 }
             }
@@ -924,8 +974,34 @@ impl SwarmActor {
                         return true;
                     }
                 };
-                self.pending_kad
-                    .insert(query_id, KadPending::GetRecord { key, resp });
+                self.pending_kad.insert(
+                    query_id,
+                    KadPending::GetRecord {
+                        key,
+                        resp,
+                        network_only: false,
+                    },
+                );
+            }
+            SwarmCommand::KadGetRecordNetwork { key, resp } => {
+                // Drop the cached entry so it cannot shadow the network value,
+                // then ignore the local store copy while the query runs.
+                self.record_cache.remove(&key);
+                let query_id = match self.kad() {
+                    Ok(kad) => kad.get_record(key.clone()),
+                    Err(e) => {
+                        let _ = resp.send(Err(e));
+                        return true;
+                    }
+                };
+                self.pending_kad.insert(
+                    query_id,
+                    KadPending::GetRecord {
+                        key,
+                        resp,
+                        network_only: true,
+                    },
+                );
             }
             SwarmCommand::KadGetProviders { key, resp } => {
                 let query_id = match self.kad() {

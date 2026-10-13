@@ -15,7 +15,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use libp2p::kad;
@@ -29,10 +29,26 @@ use crate::service_dispatcher::BackendStatus;
 /// Grace period before withdrawing a service announcement after a backend drops.
 const WITHDRAW_GRACE: Duration = Duration::from_secs(3);
 
-/// Manages the DHT lifecycle of the node's local service announcements.
+/// Key of the global, append-only service-type index.
+const TYPES_KEY: &[u8] = b"/oahd/service/types";
+
+fn types_key() -> kad::RecordKey {
+    kad::RecordKey::new(&TYPES_KEY)
+}
+
+/// Manages the DHT lifecycle of the node's local service announcements and the
+/// global service-type index.
 ///
-/// Renewal of the provider/type records is handled by libp2p's periodic
-/// publications; this component only seeds them and withdraws on backend loss.
+/// Renewal of provider records is handled by libp2p's periodic publications;
+/// this component only seeds them and withdraws on backend loss.
+///
+/// The type index (`/oahd/service/types`) is a last-writer-wins DHT record with
+/// no compare-and-swap, so we treat it as a best-effort replicated set and make
+/// it converge by keeping a **monotonic** local union (`known_types`), reading
+/// it back from the DHT peers (bypassing the local store copy, which would
+/// otherwise shadow remote updates), and periodically re-publishing the union.
+/// Because the union never shrinks, a node can never drop a type it has already
+/// observed, even if a concurrent writer temporarily clobbers the record.
 pub struct ServiceRegistry {
     config: ConfigHandle,
     swarm: NetworkHandle,
@@ -44,6 +60,10 @@ pub struct ServiceRegistry {
     announced: HashSet<String>,
     /// Deadlines awaiting withdrawal after a backend drops.
     withdraw_deadline: HashMap<String, Instant>,
+    /// Monotonic union of every service type seen locally or read from the DHT.
+    known_types: BTreeSet<String>,
+    /// Next scheduled reconciliation with the DHT.
+    next_types_sync: Option<Instant>,
 }
 
 impl ServiceRegistry {
@@ -55,6 +75,8 @@ impl ServiceRegistry {
             backend_ready: HashSet::new(),
             announced: HashSet::new(),
             withdraw_deadline: HashMap::new(),
+            known_types: BTreeSet::new(),
+            next_types_sync: None,
         }
     }
 
@@ -82,14 +104,16 @@ impl ServiceRegistry {
     pub async fn on_bootstrap_completed(&mut self) {
         self.bootstrapped = true;
         self.announce().await;
+        self.reconcile_types().await;
     }
 
     /// Re-run the announcement pass (e.g. after `reannounce_services`).
     pub async fn reannounce(&mut self) {
         self.announce().await;
+        self.reconcile_types().await;
     }
 
-    /// Process due withdrawals.
+    /// Process due withdrawals and the periodic type-index reconciliation.
     pub async fn tick(&mut self) {
         let now = Instant::now();
         let due: Vec<String> = self
@@ -102,6 +126,10 @@ impl ServiceRegistry {
             self.withdraw_deadline.remove(&service);
             self.withdraw_service(&service).await;
         }
+
+        if self.next_types_sync.is_some_and(|deadline| now >= deadline) {
+            self.reconcile_types().await;
+        }
     }
 
     /// Reset DHT-related tracking after a Swarm rebuild.
@@ -109,10 +137,22 @@ impl ServiceRegistry {
         self.bootstrapped = false;
         self.announced.clear();
         self.withdraw_deadline.clear();
+        // Keep the monotonic union so known types survive the reload; the
+        // periodic reconciliation will re-publish it to the rebuilt DHT.
+        self.next_types_sync = None;
+    }
+
+    /// Return the current global service-type list, merging in a fresh read
+    /// from the DHT peers. Used to serve `list_services`.
+    pub async fn list_types(&mut self) -> Vec<String> {
+        let network_types = self.read_types_from_network().await;
+        self.known_types.extend(network_types);
+        self.known_types.extend(self.announced.iter().cloned());
+        self.known_types.iter().cloned().collect()
     }
 
     /// Announce local services whose backend is ready and which are not yet
-    /// announced, and sync the global service-type record.
+    /// announced, then sync the global service-type index.
     async fn announce(&mut self) {
         let targets: Vec<String> = self
             .config
@@ -148,12 +188,12 @@ impl ServiceRegistry {
         }
 
         if !newly.is_empty() {
-            self.update_service_types().await;
+            self.reconcile_types().await;
         }
     }
 
     /// Withdraw a single service's DHT announcement. Does not touch the global
-    /// `/oahd/service/types` record.
+    /// `/oahd/service/types` record (the type index is append-only).
     async fn withdraw_service(&mut self, service: &str) {
         let key = format!("/oahd/service/{}", service);
         match self.swarm.stop_providing(kad::RecordKey::new(&key)).await {
@@ -172,28 +212,63 @@ impl ServiceRegistry {
         }
     }
 
-    /// Merge announced service types and write them back to the global DHT record
-    /// `/oahd/service/types`.
-    async fn update_service_types(&mut self) {
-        let types_key = kad::RecordKey::new(b"/oahd/service/types");
-        let existing_types = match self.swarm.get_record(types_key.clone()).await {
+    /// Merge the DHT type index with the local union and re-publish it.
+    async fn reconcile_types(&mut self) {
+        let interval = Duration::from_secs(self.config.dispatcher_types_sync_interval() as u64);
+        self.next_types_sync = Some(Instant::now() + interval);
+
+        let network_set: BTreeSet<String> =
+            self.read_types_from_network().await.into_iter().collect();
+        self.known_types.extend(network_set.iter().cloned());
+        self.known_types.extend(self.announced.iter().cloned());
+
+        if self.known_types.is_empty() {
+            // Never write an empty index: it would clobber types published by
+            // other nodes.
+            return;
+        }
+        // Skip the write only when the DHT already reflects our union. If a peer
+        // clobbered the record with a smaller set, our union differs and we
+        // re-assert the superset.
+        if self.known_types == network_set {
+            return;
+        }
+
+        let list: Vec<String> = self.known_types.iter().cloned().collect();
+        let Ok(value) = serde_json::to_vec(&list) else {
+            return;
+        };
+        if let Err(e) = self.swarm.put_record(types_key(), value).await {
+            LogStruct::new(LogLevel::Warning, "更新服务类型列表失败", e.to_string()).emit();
+        }
+    }
+
+    /// Read the type index from the DHT peers, ignoring the local store copy so
+    /// remote additions are never shadowed.
+    async fn read_types_from_network(&self) -> Vec<String> {
+        match self.swarm.get_record_network(types_key()).await {
             Ok(kad::GetRecordOk::FoundRecord(peer_record)) => {
                 serde_json::from_slice::<Vec<String>>(&peer_record.record.value).unwrap_or_default()
             }
             _ => Vec::new(),
-        };
-
-        let mut all_types = existing_types;
-        for t in &self.announced {
-            if !all_types.contains(t) {
-                all_types.push(t.clone());
-            }
         }
+    }
+}
 
-        if let Ok(types_json) = serde_json::to_vec(&all_types)
-            && let Err(e) = self.swarm.put_record(types_key, types_json).await
-        {
-            LogStruct::new(LogLevel::Warning, "更新服务类型列表失败", e.to_string()).emit();
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The union must be monotonic and de-duplicated.
+    #[test]
+    fn known_types_union_is_monotonic() {
+        let mut known: BTreeSet<String> = BTreeSet::new();
+        known.extend(["a".to_string()]);
+        known.extend(["a".to_string(), "b".to_string()]);
+        known.extend(["c".to_string()]);
+        assert_eq!(
+            known.iter().cloned().collect::<Vec<_>>(),
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
     }
 }

@@ -56,6 +56,7 @@ default_u32_fn!(default_replication_factor, 20);
 default_u32_fn!(default_query_timeout_seconds, 60);
 default_u32_fn!(default_relay_retry_interval, 60);
 default_u32_fn!(default_relay_max_failures, 3);
+default_u32_fn!(default_types_sync_seconds, 300);
 
 fn default_auth_network() -> String {
     "none".to_string()
@@ -315,6 +316,9 @@ pub struct DispatcherConfig {
     pub query_timeout_secs: u32,
     #[serde(default = "default_record_ttl_seconds")]
     pub record_ttl_secs: u32,
+    /// How often to reconcile the global service-type index with the DHT.
+    #[serde(default = "default_types_sync_seconds")]
+    pub types_sync_secs: u32,
     #[serde(default = "Vec::new")]
     pub local_services: Vec<LocalServiceEntry>,
 }
@@ -325,6 +329,7 @@ impl Default for DispatcherConfig {
             enabled: bool_true(),
             query_timeout_secs: default_query_timeout_seconds(),
             record_ttl_secs: default_record_ttl_seconds(),
+            types_sync_secs: default_types_sync_seconds(),
             local_services: vec![],
         }
     }
@@ -493,6 +498,11 @@ impl ConfigHandle {
 
     pub fn dispatcher_query_timeout(&self) -> u32 {
         self.read().services.dispatcher.query_timeout_secs
+    }
+
+    /// Interval, in seconds, between global service-type index reconciliations.
+    pub fn dispatcher_types_sync_interval(&self) -> u32 {
+        self.read().services.dispatcher.types_sync_secs.max(1)
     }
 
     pub fn relay_retry_interval(&self) -> u32 {

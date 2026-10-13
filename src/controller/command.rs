@@ -102,14 +102,10 @@ impl NodeController {
         }
     }
 
-    async fn cmd_list_services(&self) -> Result<Vec<u8>, String> {
-        let types_key = kad::RecordKey::new(b"/oahd/service/types");
-        let types = match self.swarm.get_record(types_key).await {
-            Ok(kad::GetRecordOk::FoundRecord(peer_record)) => {
-                serde_json::from_slice::<Vec<String>>(&peer_record.record.value).unwrap_or_default()
-            }
-            _ => Vec::new(),
-        };
+    async fn cmd_list_services(&mut self) -> Result<Vec<u8>, String> {
+        // Read through the registry so the result is the union of the DHT peers'
+        // view and every type this node has already observed (never stale-local).
+        let types = self.services.list_types().await;
         Ok(to_cbor(&types))
     }
 
