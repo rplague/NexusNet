@@ -80,6 +80,23 @@ enum BackendEvent {
     Control { service: String, msg: Message },
 }
 
+fn command_timeout(msg: &Message, base: Duration, kad: Duration) -> Duration {
+    let required = match msg {
+        Message::ServiceRequest { .. } => kad.saturating_add(
+            service_protocol::REQUEST_TIMEOUT
+                .saturating_mul(service_protocol::MAX_PROVIDER_ATTEMPTS as u32),
+        ),
+        Message::ServiceRequestTo { .. } => service_protocol::REQUEST_TIMEOUT,
+        Message::QueryKey { .. } => kad.saturating_add(kad),
+        Message::ListServices { .. }
+        | Message::DiscoverProviders { .. }
+        | Message::ReannounceServices { .. } => kad,
+        Message::AddKey { .. } => kad.saturating_add(kad),
+        _ => Duration::ZERO,
+    };
+    required.max(base).saturating_add(Duration::from_secs(5))
+}
+
 /// Routes between `NodeController` and one persistent task per local backend.
 pub struct ServiceDispatcher {
     inbound_rx: mpsc::UnboundedReceiver<InboundRequest>,
@@ -89,6 +106,7 @@ pub struct ServiceDispatcher {
     backends: HashMap<String, mpsc::UnboundedSender<BackendCmd>>,
     shutdown_rx: watch::Receiver<bool>,
     query_timeout: Duration,
+    kad_timeout: Duration,
 }
 
 impl ServiceDispatcher {
@@ -123,6 +141,7 @@ impl ServiceDispatcher {
         }
 
         let query_timeout = Duration::from_secs(config.dispatcher_query_timeout().into());
+        let kad_timeout = Duration::from_secs(config.kademlia_query_timeout().into());
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let mut backends = HashMap::new();
         if config.dispatcher_enabled() {
@@ -153,6 +172,7 @@ impl ServiceDispatcher {
             backends,
             shutdown_rx,
             query_timeout,
+            kad_timeout,
         }
     }
 
@@ -205,6 +225,7 @@ impl ServiceDispatcher {
             return;
         };
 
+        let budget = command_timeout(&msg, self.query_timeout, self.kad_timeout);
         let (resp_tx, resp_rx) = oneshot::channel();
         if self
             .to_controller_tx
@@ -220,9 +241,8 @@ impl ServiceDispatcher {
             return;
         }
 
-        let query_timeout = self.query_timeout;
         tokio::spawn(async move {
-            let reply = match timeout(query_timeout, resp_rx).await {
+            let reply = match timeout(budget, resp_rx).await {
                 Ok(Ok(Ok(result))) => Message::Reply {
                     id,
                     ok: true,
@@ -455,5 +475,68 @@ async fn wait_backoff(
                 Some(BackendCmd::WriteReply(_)) => {}
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uuid::Uuid;
+
+    const KAD: Duration = Duration::from_secs(60);
+    const BASE: Duration = Duration::from_secs(60);
+    const MARGIN: Duration = Duration::from_secs(5);
+
+    fn id() -> Uuid {
+        Uuid::new_v4()
+    }
+
+    #[test]
+    fn service_request_budget_covers_provider_failover() {
+        let msg = Message::ServiceRequest {
+            id: id(),
+            service: "cmd".into(),
+            payload: vec![],
+        };
+        let expected = KAD
+            .saturating_add(
+                service_protocol::REQUEST_TIMEOUT
+                    .saturating_mul(service_protocol::MAX_PROVIDER_ATTEMPTS as u32),
+            )
+            .saturating_add(MARGIN);
+        assert_eq!(command_timeout(&msg, BASE, KAD), expected);
+    }
+
+    #[test]
+    fn query_key_budget_covers_two_dht_queries() {
+        let msg = Message::QueryKey {
+            id: id(),
+            key: "/k".into(),
+        };
+        assert_eq!(
+            command_timeout(&msg, BASE, KAD),
+            KAD.saturating_add(KAD).saturating_add(MARGIN)
+        );
+    }
+
+    #[test]
+    fn dht_query_budget_tracks_kademlia_timeout() {
+        let msg = Message::DiscoverProviders {
+            id: id(),
+            service: "cmd".into(),
+        };
+        assert_eq!(
+            command_timeout(&msg, Duration::from_secs(5), KAD),
+            KAD.saturating_add(MARGIN)
+        );
+    }
+
+    #[test]
+    fn local_command_keeps_the_base_timeout() {
+        let msg = Message::Whoami { id: id() };
+        assert_eq!(
+            command_timeout(&msg, BASE, KAD),
+            BASE.saturating_add(MARGIN)
+        );
     }
 }

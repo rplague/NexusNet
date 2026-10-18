@@ -117,7 +117,7 @@ impl From<relay::client::Event> for NetBehaviourEvent {
 }
 
 fn request_response_config() -> request_response::Config {
-    request_response::Config::default().with_request_timeout(Duration::from_secs(30))
+    request_response::Config::default().with_request_timeout(service_protocol::REQUEST_TIMEOUT)
 }
 
 impl NetBehaviour {
