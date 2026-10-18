@@ -86,10 +86,7 @@ enum BackendEvent {
 
 fn command_timeout(msg: &Message, base: Duration, kad: Duration) -> Duration {
     let required = match msg {
-        Message::ServiceRequest { .. } => kad.saturating_add(
-            service_protocol::REQUEST_TIMEOUT
-                .saturating_mul(service_protocol::MAX_PROVIDER_ATTEMPTS as u32),
-        ),
+        Message::ServiceRequest { .. } => kad.saturating_add(service_protocol::REQUEST_TIMEOUT),
         Message::ServiceRequestTo { .. } => service_protocol::REQUEST_TIMEOUT,
         Message::QueryKey { .. } => kad.saturating_add(kad),
         Message::ListServices { .. }
@@ -520,17 +517,14 @@ mod tests {
     }
 
     #[test]
-    fn service_request_budget_covers_provider_failover() {
+    fn service_request_budget_covers_dht_and_request() {
         let msg = Message::ServiceRequest {
             id: id(),
             service: "cmd".into(),
             payload: vec![],
         };
         let expected = KAD
-            .saturating_add(
-                service_protocol::REQUEST_TIMEOUT
-                    .saturating_mul(service_protocol::MAX_PROVIDER_ATTEMPTS as u32),
-            )
+            .saturating_add(service_protocol::REQUEST_TIMEOUT)
             .saturating_add(MARGIN);
         assert_eq!(command_timeout(&msg, BASE, KAD), expected);
     }

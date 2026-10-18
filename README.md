@@ -139,8 +139,8 @@ authority = "<base64 ed25519 公钥>"
 可选字段省略即取默认值；`local_services[].name` 与 `port` 必填。节点固定连接
 `127.0.0.1:<port>`，不支持自定义 host。
 
-`services.dispatcher.query_timeout_secs` 是控制指令的基础超时；涉及 DHT 查询或 provider
-重试的命令会按实际需要自动延长。
+`services.dispatcher.query_timeout_secs` 是控制指令的基础超时；涉及 DHT 查询的命令会按
+实际需要自动延长。
 
 配置路径由环境变量决定（见 `src/paths.rs`）：`NEXUSNET_CONFIG_PATH`、
 `NEXUSNET_KEYPAIR_PATH`、`NEXUSNET_LOG_PATH`（均为目录；`NEXUSNET_LOG_PATH` 仅文件输出
