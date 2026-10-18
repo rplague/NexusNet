@@ -663,20 +663,27 @@ impl ConfigHandle {
     pub fn dialable_addrs(&self, peer_id: PeerId) -> Vec<Multiaddr> {
         let cfg = self.read();
         let port = cfg.network.port as u16;
-        [cfg.network.ipv4_address, cfg.network.ipv6_address]
-            .into_iter()
-            .flatten()
-            .map(|ip| {
-                let mut a = Multiaddr::empty();
-                match ip {
-                    IpAddr::V4(v4) => a.push(Protocol::Ip4(v4)),
-                    IpAddr::V6(v6) => a.push(Protocol::Ip6(v6)),
-                }
-                a.push(Protocol::Tcp(port));
-                a.push(Protocol::P2p(peer_id));
-                a
-            })
-            .collect()
+        let mut addrs = Vec::with_capacity(2);
+        for (enabled, ip) in [
+            (cfg.network.ipv4_enabled, cfg.network.ipv4_address),
+            (cfg.network.ipv6_enabled, cfg.network.ipv6_address),
+        ] {
+            if !enabled {
+                continue;
+            }
+            let Some(ip) = ip else {
+                continue;
+            };
+            let mut a = Multiaddr::empty();
+            match ip {
+                IpAddr::V4(v4) => a.push(Protocol::Ip4(v4)),
+                IpAddr::V6(v6) => a.push(Protocol::Ip6(v6)),
+            }
+            a.push(Protocol::Tcp(port));
+            a.push(Protocol::P2p(peer_id));
+            addrs.push(a);
+        }
+        addrs
     }
 
     pub fn listen_port(&self) -> u32 {
@@ -751,7 +758,9 @@ mod tests {
     fn dialable_addrs_appends_peer_id() {
         let mut cfg = NodeConfig::default();
         cfg.network.port = 5000;
+        cfg.network.ipv4_enabled = true;
         cfg.network.ipv4_address = Some(IpAddr::V4(std::net::Ipv4Addr::new(1, 2, 3, 4)));
+        cfg.network.ipv6_enabled = true;
         cfg.network.ipv6_address = Some("2001:db8::1".parse().unwrap());
         let handle = ConfigHandle::new(cfg);
         let pid = peer();
@@ -771,6 +780,7 @@ mod tests {
     #[test]
     fn dialable_addrs_only_ipv6() {
         let mut cfg = NodeConfig::default();
+        cfg.network.ipv6_enabled = true;
         cfg.network.ipv6_address = Some("2001:db8::1".parse().unwrap());
         let handle = ConfigHandle::new(cfg);
         let pid = peer();
@@ -778,6 +788,20 @@ mod tests {
         let addrs = handle.dialable_addrs(pid);
         assert_eq!(addrs.len(), 1);
         assert!(addrs[0].to_string().ends_with(&format!("/p2p/{pid}")));
+    }
+
+    #[test]
+    fn dialable_addrs_skips_disabled_families() {
+        let mut cfg = NodeConfig::default();
+        cfg.network.ipv4_enabled = true;
+        cfg.network.ipv4_address = Some(IpAddr::V4(std::net::Ipv4Addr::new(1, 2, 3, 4)));
+        cfg.network.ipv6_address = Some("2001:db8::1".parse().unwrap());
+        let handle = ConfigHandle::new(cfg);
+        let pid = peer();
+
+        let addrs = handle.dialable_addrs(pid);
+        assert_eq!(addrs.len(), 1);
+        assert!(addrs[0].to_string().starts_with("/ip4/1.2.3.4/"));
     }
 
     #[test]
