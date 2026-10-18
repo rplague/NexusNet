@@ -638,6 +638,8 @@ impl SwarmActor {
                 if num_established == 0 {
                     self.peer_protocols.remove(&peer_id);
                     self.pq_identities.remove(&peer_id);
+                    self.pending_pq_identity
+                        .retain(|_, pending_peer| *pending_peer != peer_id);
                 }
             }
             SwarmEvent::ListenerClosed { addresses, .. } => {
@@ -870,6 +872,8 @@ impl SwarmActor {
                     request, channel, ..
                 } => {
                     let Some(keys) = self.pq_keys.as_ref() else {
+                        LogStruct::new(LogLevel::Warning, "PQ 请求无法处理", "本地未加载 PQ 密钥")
+                            .emit();
                         return;
                     };
                     let inbound = match pq::open_request(keys, &request) {
@@ -881,6 +885,17 @@ impl SwarmActor {
                         }
                     };
                     let Some(req) = decode_request(&inbound.plaintext) else {
+                        LogStruct::new(LogLevel::Warning, "PQ 请求格式错误", "").emit();
+                        if let Ok(response) =
+                            inbound.seal_response(&encode_response(&service_protocol::Response {
+                                success: false,
+                                data: b"invalid PQ request payload".to_vec(),
+                            }))
+                            && let Some(behaviour) =
+                                self.swarm.behaviour_mut().service_req_pq.as_mut()
+                        {
+                            let _ = behaviour.send_response(channel, response);
+                        }
                         return;
                     };
                     let request_id = Uuid::new_v4().to_string();
@@ -950,35 +965,42 @@ impl SwarmActor {
     /// Handle PQ identity exchange (request reply + cached response
     /// verification).
     async fn handle_pq_identity(&mut self, event: request_response::Event<(), PqIdentity>) {
-        let request_response::Event::Message { message, .. } = event else {
-            return;
-        };
-        match message {
-            request_response::Message::Request { channel, .. } => {
-                let identity = self
-                    .pq_keys
-                    .as_ref()
-                    .and_then(|k| k.identity(&self.keypair).ok());
-                if let Some(identity) = identity
-                    && let Some(b) = self.swarm.behaviour_mut().pq_identity.as_mut()
-                {
-                    let _ = b.send_response(channel, identity);
-                }
-            }
-            request_response::Message::Response {
-                request_id,
-                response,
-                ..
-            } => {
-                if let Some(expected) = self.pending_pq_identity.remove(&request_id) {
-                    if response.verify(&expected).is_ok() {
-                        self.pq_identities.insert(expected, response);
-                    } else {
-                        LogStruct::new(LogLevel::Warning, "PQ 身份校验失败", expected.to_string())
-                            .emit();
+        match event {
+            request_response::Event::Message { message, .. } => match message {
+                request_response::Message::Request { channel, .. } => {
+                    let identity = self
+                        .pq_keys
+                        .as_ref()
+                        .and_then(|k| k.identity(&self.keypair).ok());
+                    if let Some(identity) = identity
+                        && let Some(b) = self.swarm.behaviour_mut().pq_identity.as_mut()
+                    {
+                        let _ = b.send_response(channel, identity);
                     }
                 }
+                request_response::Message::Response {
+                    request_id,
+                    response,
+                    ..
+                } => {
+                    if let Some(expected) = self.pending_pq_identity.remove(&request_id) {
+                        if response.verify(&expected).is_ok() {
+                            self.pq_identities.insert(expected, response);
+                        } else {
+                            LogStruct::new(
+                                LogLevel::Warning,
+                                "PQ 身份校验失败",
+                                expected.to_string(),
+                            )
+                            .emit();
+                        }
+                    }
+                }
+            },
+            request_response::Event::OutboundFailure { request_id, .. } => {
+                self.pending_pq_identity.remove(&request_id);
             }
+            _ => {}
         }
     }
 
