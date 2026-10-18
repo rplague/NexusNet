@@ -41,7 +41,7 @@ pub struct NodeController {
     pub(super) config: ConfigHandle,
     pub(super) my_peer_id: PeerId,
     pub(super) swarm: NetworkHandle,
-    to_controller_rx: mpsc::UnboundedReceiver<ToController>,
+    to_controller_rx: mpsc::Receiver<ToController>,
     event_rx: mpsc::UnboundedReceiver<NetworkEvent>,
     shutdown_rx: watch::Receiver<bool>,
     pub(super) peers: PeerTracker,
@@ -57,8 +57,8 @@ impl NodeController {
     pub fn new(
         config: ConfigHandle,
         my_peer_id: PeerId,
-        to_controller_rx: mpsc::UnboundedReceiver<ToController>,
-        to_dispatcher_tx: mpsc::UnboundedSender<InboundRequest>,
+        to_controller_rx: mpsc::Receiver<ToController>,
+        to_dispatcher_tx: mpsc::Sender<InboundRequest>,
         network: NetworkStart,
         shutdown_rx: watch::Receiver<bool>,
     ) -> Self {
@@ -250,12 +250,12 @@ struct AuthJob {
 async fn auth_worker(
     gate: AuthGate,
     mut rx: mpsc::Receiver<AuthJob>,
-    to_dispatcher_tx: mpsc::UnboundedSender<InboundRequest>,
+    to_dispatcher_tx: mpsc::Sender<InboundRequest>,
     swarm: NetworkHandle,
 ) {
     while let Some(job) = rx.recv().await {
         match gate.authorize(&job.peer, &job.service).await {
-            Decision::Allow => forward_auth_job(&to_dispatcher_tx, &swarm, job),
+            Decision::Allow => forward_auth_job(&to_dispatcher_tx, &swarm, job).await,
             Decision::AllowUnprotected => {
                 LogStruct::new(
                     LogLevel::Warning,
@@ -266,7 +266,7 @@ async fn auth_worker(
                     ),
                 )
                 .emit();
-                forward_auth_job(&to_dispatcher_tx, &swarm, job);
+                forward_auth_job(&to_dispatcher_tx, &swarm, job).await;
             }
             Decision::Deny(reason) => {
                 LogStruct::new(
@@ -287,8 +287,8 @@ async fn auth_worker(
     }
 }
 
-fn forward_auth_job(
-    to_dispatcher_tx: &mpsc::UnboundedSender<InboundRequest>,
+async fn forward_auth_job(
+    to_dispatcher_tx: &mpsc::Sender<InboundRequest>,
     swarm: &NetworkHandle,
     job: AuthJob,
 ) {
@@ -304,7 +304,7 @@ fn forward_auth_job(
         payload,
         response_tx,
     };
-    if let Err(e) = to_dispatcher_tx.send(inbound) {
+    if let Err(e) = to_dispatcher_tx.send(inbound).await {
         let err_resp = service_protocol::Response {
             success: false,
             data: format!("service unavailable: {}", e).into_bytes(),

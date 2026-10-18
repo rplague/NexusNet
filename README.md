@@ -41,6 +41,7 @@ graph TD
 - **ServiceDispatcher** — 独立后台任务。节点启动时主动连接所有配置的本地后端，断线后按 1–60 秒指数退避重连，维持持久 TCP 连接。P2P 入站请求经 `inbound_req_tx` 转发到此处，再由对应后端任务通过 UUID 帧协议发送给后端进程，等待响应后返回。
 - **后端透明** — 后端只需要理解 UUID 帧协议即可接入，语言/框架无关。后端也可主动发起控制指令。
 - **CBOR 协议** — P2P 层使用 libp2p CBOR 协议，`Request { service, payload }` / `Response { success, data }`。
+- **背压** — 鉴权队列（4×32）、dispatcher 入站队列（256）、控制队列（128）、每后端命令/事件队列（各 64）均有界；过载时请求立即返回 `authentication overloaded` / `backend overloaded`，不会无限堆积。
 
 ## 快速开始
 
