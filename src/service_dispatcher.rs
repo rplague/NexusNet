@@ -35,6 +35,10 @@ use crate::sidecar_protocol::{Message, PROTOCOL_VERSION, SidecarCodec, SidecarEr
 const INITIAL_BACKOFF: u64 = 1;
 /// Maximum reconnect backoff, in seconds.
 const MAX_BACKOFF: u64 = 60;
+/// Maximum queued requests per backend.
+const BACKEND_QUEUE_CAPACITY: usize = 64;
+/// Maximum queued backend events for the dispatcher.
+const EVENT_QUEUE_CAPACITY: usize = 64;
 
 /// A backend-issued control command and its reply channel.
 pub struct ControlCommand {
@@ -80,21 +84,36 @@ enum BackendEvent {
     Control { service: String, msg: Message },
 }
 
+fn command_timeout(msg: &Message, base: Duration, kad: Duration) -> Duration {
+    let required = match msg {
+        Message::ServiceRequest { .. } => kad.saturating_add(service_protocol::REQUEST_TIMEOUT),
+        Message::ServiceRequestTo { .. } => service_protocol::REQUEST_TIMEOUT,
+        Message::QueryKey { .. } => kad.saturating_add(kad),
+        Message::ListServices { .. }
+        | Message::DiscoverProviders { .. }
+        | Message::ReannounceServices { .. } => kad,
+        Message::AddKey { .. } => kad.saturating_add(kad),
+        _ => Duration::ZERO,
+    };
+    required.max(base).saturating_add(Duration::from_secs(5))
+}
+
 /// Routes between `NodeController` and one persistent task per local backend.
 pub struct ServiceDispatcher {
-    inbound_rx: mpsc::UnboundedReceiver<InboundRequest>,
-    event_rx: mpsc::UnboundedReceiver<BackendEvent>,
-    to_controller_tx: mpsc::UnboundedSender<ToController>,
+    inbound_rx: mpsc::Receiver<InboundRequest>,
+    event_rx: mpsc::Receiver<BackendEvent>,
+    to_controller_tx: mpsc::Sender<ToController>,
     /// Service name -> command sender for its backend task.
-    backends: HashMap<String, mpsc::UnboundedSender<BackendCmd>>,
+    backends: HashMap<String, mpsc::Sender<BackendCmd>>,
     shutdown_rx: watch::Receiver<bool>,
     query_timeout: Duration,
+    kad_timeout: Duration,
 }
 
 impl ServiceDispatcher {
     pub fn new(
-        inbound_rx: mpsc::UnboundedReceiver<InboundRequest>,
-        to_controller_tx: mpsc::UnboundedSender<ToController>,
+        inbound_rx: mpsc::Receiver<InboundRequest>,
+        to_controller_tx: mpsc::Sender<ToController>,
         config: ConfigHandle,
         shutdown_rx: watch::Receiver<bool>,
     ) -> Self {
@@ -123,11 +142,12 @@ impl ServiceDispatcher {
         }
 
         let query_timeout = Duration::from_secs(config.dispatcher_query_timeout().into());
-        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let kad_timeout = Duration::from_secs(config.kademlia_query_timeout().into());
+        let (event_tx, event_rx) = mpsc::channel(EVENT_QUEUE_CAPACITY);
         let mut backends = HashMap::new();
         if config.dispatcher_enabled() {
             for svc in &local_services {
-                let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+                let (cmd_tx, cmd_rx) = mpsc::channel(BACKEND_QUEUE_CAPACITY);
                 backends.insert(svc.name.clone(), cmd_tx);
                 tokio::spawn(backend_task(
                     svc.name.clone(),
@@ -153,6 +173,7 @@ impl ServiceDispatcher {
             backends,
             shutdown_rx,
             query_timeout,
+            kad_timeout,
         }
     }
 
@@ -169,7 +190,19 @@ impl ServiceDispatcher {
                             .send(Err(format!("No backend for service {}", req.service)));
                         continue;
                     };
-                    let _ = cmd_tx.send(BackendCmd::Request(req));
+                    if let Err(e) = cmd_tx.try_send(BackendCmd::Request(req)) {
+                        let (cmd, reason) = match e {
+                            mpsc::error::TrySendError::Full(cmd) => (cmd, "backend overloaded"),
+                            mpsc::error::TrySendError::Closed(cmd) => {
+                                (cmd, "No backend for service")
+                            }
+                        };
+                        if let BackendCmd::Request(req) = cmd {
+                            let _ = req
+                                .response_tx
+                                .send(Err(format!("{reason} {}", req.service)));
+                        }
+                    }
                 }
                 maybe = self.event_rx.recv() => {
                     let Some(event) = maybe else {
@@ -177,9 +210,14 @@ impl ServiceDispatcher {
                     };
                     match event {
                         BackendEvent::Status(status) => {
-                            let _ = self.to_controller_tx.send(ToController::BackendStatus(status));
+                            let _ = self
+                                .to_controller_tx
+                                .send(ToController::BackendStatus(status))
+                                .await;
                         }
-                        BackendEvent::Control { service, msg } => self.forward_control(service, msg),
+                        BackendEvent::Control { service, msg } => {
+                            self.forward_control(service, msg).await
+                        }
                     }
                 }
                 _ = self.shutdown_rx.changed() => {
@@ -191,7 +229,7 @@ impl ServiceDispatcher {
 
     /// Relay a backend control message to the controller, then route the reply
     /// back to the originating backend task for writing.
-    fn forward_control(&self, service: String, msg: Message) {
+    async fn forward_control(&self, service: String, msg: Message) {
         let Some(id) = msg.id() else {
             LogStruct::new(
                 LogLevel::Warning,
@@ -205,13 +243,15 @@ impl ServiceDispatcher {
             return;
         };
 
+        let budget = command_timeout(&msg, self.query_timeout, self.kad_timeout);
         let (resp_tx, resp_rx) = oneshot::channel();
         if self
             .to_controller_tx
             .send(ToController::Control(ControlCommand { msg, resp_tx }))
+            .await
             .is_err()
         {
-            let _ = backend_tx.send(BackendCmd::WriteReply(Message::Reply {
+            let _ = backend_tx.try_send(BackendCmd::WriteReply(Message::Reply {
                 id,
                 ok: false,
                 result: None,
@@ -220,9 +260,8 @@ impl ServiceDispatcher {
             return;
         }
 
-        let query_timeout = self.query_timeout;
         tokio::spawn(async move {
-            let reply = match timeout(query_timeout, resp_rx).await {
+            let reply = match timeout(budget, resp_rx).await {
                 Ok(Ok(Ok(result))) => Message::Reply {
                     id,
                     ok: true,
@@ -248,7 +287,7 @@ impl ServiceDispatcher {
                     error: Some(SidecarError::new("timeout", "command execution timeout")),
                 },
             };
-            let _ = backend_tx.send(BackendCmd::WriteReply(reply));
+            let _ = backend_tx.send(BackendCmd::WriteReply(reply)).await;
         });
     }
 }
@@ -257,8 +296,8 @@ impl ServiceDispatcher {
 async fn backend_task(
     service: String,
     addr: String,
-    mut cmd_rx: mpsc::UnboundedReceiver<BackendCmd>,
-    event_tx: mpsc::UnboundedSender<BackendEvent>,
+    mut cmd_rx: mpsc::Receiver<BackendCmd>,
+    event_tx: mpsc::Sender<BackendEvent>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     let mut backoff = INITIAL_BACKOFF;
@@ -302,10 +341,12 @@ async fn backend_task(
             format!("{service} -> {addr}"),
         )
         .emit();
-        let _ = event_tx.send(BackendEvent::Status(BackendStatus {
-            service: service.clone(),
-            ready: true,
-        }));
+        let _ = event_tx
+            .send(BackendEvent::Status(BackendStatus {
+                service: service.clone(),
+                ready: true,
+            }))
+            .await;
 
         // Pending service requests, keyed by request id.
         let mut pending: HashMap<
@@ -341,10 +382,12 @@ async fn backend_task(
                     // Control messages are relayed to the controller without
                     // blocking this read loop.
                     Some(Ok(control)) => {
-                        let _ = event_tx.send(BackendEvent::Control {
-                            service: service.clone(),
-                            msg: control,
-                        });
+                        let _ = event_tx
+                            .send(BackendEvent::Control {
+                                service: service.clone(),
+                                msg: control,
+                            })
+                            .await;
                     }
                     Some(Err(e)) => {
                         LogStruct::new(LogLevel::Error, "后端读错误", format!("{service}: {e}")).emit();
@@ -395,10 +438,12 @@ async fn backend_task(
             return;
         }
 
-        let _ = event_tx.send(BackendEvent::Status(BackendStatus {
-            service: service.clone(),
-            ready: false,
-        }));
+        let _ = event_tx
+            .send(BackendEvent::Status(BackendStatus {
+                service: service.clone(),
+                ready: false,
+            }))
+            .await;
         LogStruct::new(
             LogLevel::Warning,
             "后端连接断开",
@@ -435,7 +480,7 @@ async fn handshake(framed: &mut Framed<TcpStream, SidecarCodec>) -> Result<(), S
 /// requests while not connected. Returns `true` if the task should exit.
 async fn wait_backoff(
     shutdown_rx: &mut watch::Receiver<bool>,
-    cmd_rx: &mut mpsc::UnboundedReceiver<BackendCmd>,
+    cmd_rx: &mut mpsc::Receiver<BackendCmd>,
     service: &str,
     backoff: u64,
 ) -> bool {
@@ -455,5 +500,65 @@ async fn wait_backoff(
                 Some(BackendCmd::WriteReply(_)) => {}
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uuid::Uuid;
+
+    const KAD: Duration = Duration::from_secs(60);
+    const BASE: Duration = Duration::from_secs(60);
+    const MARGIN: Duration = Duration::from_secs(5);
+
+    fn id() -> Uuid {
+        Uuid::new_v4()
+    }
+
+    #[test]
+    fn service_request_budget_covers_dht_and_request() {
+        let msg = Message::ServiceRequest {
+            id: id(),
+            service: "cmd".into(),
+            payload: vec![],
+        };
+        let expected = KAD
+            .saturating_add(service_protocol::REQUEST_TIMEOUT)
+            .saturating_add(MARGIN);
+        assert_eq!(command_timeout(&msg, BASE, KAD), expected);
+    }
+
+    #[test]
+    fn query_key_budget_covers_two_dht_queries() {
+        let msg = Message::QueryKey {
+            id: id(),
+            key: "/k".into(),
+        };
+        assert_eq!(
+            command_timeout(&msg, BASE, KAD),
+            KAD.saturating_add(KAD).saturating_add(MARGIN)
+        );
+    }
+
+    #[test]
+    fn dht_query_budget_tracks_kademlia_timeout() {
+        let msg = Message::DiscoverProviders {
+            id: id(),
+            service: "cmd".into(),
+        };
+        assert_eq!(
+            command_timeout(&msg, Duration::from_secs(5), KAD),
+            KAD.saturating_add(MARGIN)
+        );
+    }
+
+    #[test]
+    fn local_command_keeps_the_base_timeout() {
+        let msg = Message::Whoami { id: id() };
+        assert_eq!(
+            command_timeout(&msg, BASE, KAD),
+            BASE.saturating_add(MARGIN)
+        );
     }
 }

@@ -64,7 +64,7 @@ WhitelistDoc = {
 ```
 
 - `hash` = **SHA-256(该服务白名单记录的完整 value 字节)**，`length` = 该字节长度，用于 mix-and-match 防护。
-- 索引的 `expires_at` 决定索引新鲜度；白名单无自身过期时间，其新鲜度由「被新鲜索引引用 + 本地缓存 TTL」保证。
+- 索引的 `expires_at` 决定索引新鲜度；白名单无自身过期时间，其新鲜度由「被新鲜索引引用 + 60 秒记录缓存」保证。
 
 ## 5. 发布流程（边车）
 
@@ -78,6 +78,8 @@ add_key { t:"add_key", id:<uuid>, key:"/oahd/auth/<net_hash>/service", value:<bs
 ```
 
    **顺序**：先发各服务白名单，再发索引（索引引用其 hash）。
+   控制层仅允许写 `/oahd/auth/...` 与 `/oahd/service/<name>`；`/oahd/service/types` 和
+   `/oahd/bootstrap` 由节点维护，后端不可写。
 4. 在 `expires_at` 之前**重发续期**；否则记录过期后节点 fail-closed，拒绝相关服务。
 
 > 本地后端协议见 README「后端协议（TCP，v2）」；规范见 `docs/sidecar.cddl`。
@@ -88,32 +90,32 @@ add_key { t:"add_key", id:<uuid>, key:"/oahd/auth/<net_hash>/service", value:<bs
 
 1. 若节点 `auth.network == "none"` → 放行。
 2. 若该服务本地 `require_auth == false` → 放行。
-3. 取本地缓存的索引：
-   - 缺失/不新鲜 → **拒绝**。
-   - 服务不在索引 → **放行**，并自动将本地该服务 `require_auth` 置为 `false`（「DHT 为准」的网络同步），记 Warning。
-4. 取本地缓存的该服务白名单：
+3. 通过本地记录缓存读取索引（未命中时按需查询 DHT，结果缓存 60 秒）：
+   - 缺失/过期 → **拒绝**。
+   - 服务不在索引 → 本次**放行**并记 Warning；不修改本地 `require_auth`，索引恢复后自动重新生效。
+4. 通过本地记录缓存读取该服务白名单：
    - 缺失/不新鲜 → **拒绝**。
    - `peer ∈ members` → 放行，否则 **拒绝**。
 
-缓存刷新由后台任务完成（周期 + 事件触发），失败保留旧缓存；旧缓存随 TTL / `expires_at` 自然失效，从而 fail-closed。
+记录由请求路径按需读取，网络层对 `get_record` 结果缓存 60 秒；没有独立的后台刷新任务，
+取回或验签失败一律拒绝。索引过期后即使仍在缓存中也会被拒绝，从而 fail-closed。
 
 ## 7. 配置
 
 ```toml
 [auth]
 network = "none"                 # "none" = 不鉴权
-cache_ttl_secs = 300
-refresh_interval_secs = 60
 
 [auth.networks.myorg]            # 每个网络的信任锚
 authority = "<base64 ed25519 公钥>"
 
 [[services.dispatcher.local_services]]
 name = "cmd"
-host = "127.0.0.1"
 port = 5014
 require_auth = true
 ```
+
+节点固定连接 `127.0.0.1:<port>`；鉴权记录没有独立的缓存 TTL 或后台刷新配置。
 
 - `authority`：标准 base64 编码的 ed25519 公钥（32 字节）。
 - 若 `network != "none"` 但该网络未配置/非法 `authority`，节点进入 **fail-closed**：拒绝所有 `require_auth` 服务。
@@ -124,17 +126,18 @@ require_auth = true
 
 ```json
 { "network": "myorg", "state": "active",
-  "index": { "version": 3, "expires_at": 1700003600, "age_secs": 12, "services": 2, "fresh": true },
   "local_required": ["cmd"],
-  "cached_whitelists": { "cmd": { "version": 7, "members": 5, "age_secs": 10 } },
-  "required_but_not_in_index": [] }
+  "index_version": 3,
+  "whitelist_versions": { "cmd": 7 } }
 ```
+
+`state = "misconfigured"` 时额外返回 `detail`。版本号只在当前进程内跟踪，重载后清空。
 
 `state` 取值：`disabled` / `active` / `misconfigured`（后者附 `detail`）。
 
 ## 8. 安全说明
 
-- **撤销**依赖 `expires_at` 与缓存 TTL：权威不续发即失效；撤销延迟 ≈ `cache_ttl_secs`（默认 300s）。
+- **撤销**依赖 `expires_at` 与 60 秒记录缓存：权威不续发即过期失效；已缓存的正记录最多再存活 60 秒。
 - **不防枚举**：`net_hash` 仅隐藏网络名明文，知道名字即可算出哈希；白名单成员 PeerId 公开可读。
 - **无密钥轮换**：当前版本权威公钥固定在配置，轮换需改配置重启（后续可能扩展 root 委派）。
 - **保留名** `service` 不得用作服务名。

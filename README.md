@@ -38,9 +38,10 @@ graph TD
 ### 微内核 + 边车
 
 - **NodeController** — 单一异步事件循环，集成所有 libp2p 事件处理（Ping/Identify/Kademlia/Request-Response）和后端命令路由。
-- **ServiceDispatcher** — 独立后台任务。节点启动时主动连接所有配置的本地后端（重试 3 次），维持持久 TCP 连接。P2P 入站请求经 `inbound_req_tx` 转发到此处，由 `handle_request_with_backend()` 通过 UUID 帧协议发送给后端进程，等待响应后返回。
+- **ServiceDispatcher** — 独立后台任务。节点启动时主动连接所有配置的本地后端，断线后按 1–60 秒指数退避重连，维持持久 TCP 连接。P2P 入站请求经 `inbound_req_tx` 转发到此处，再由对应后端任务通过 UUID 帧协议发送给后端进程，等待响应后返回。
 - **后端透明** — 后端只需要理解 UUID 帧协议即可接入，语言/框架无关。后端也可主动发起控制指令。
 - **CBOR 协议** — P2P 层使用 libp2p CBOR 协议，`Request { service, payload }` / `Response { success, data }`。
+- **背压** — 鉴权队列（4×32）、dispatcher 入站队列（256）、控制队列（128）、每后端命令/事件队列（各 64）均有界；过载时请求立即返回 `authentication overloaded` / `backend overloaded`，不会无限堆积。
 
 ## 快速开始
 
@@ -52,20 +53,9 @@ cargo run
 
 未设置任何环境变量时，运行回退当前目录，首次运行自动生成 `./config.toml` 和 `./keypair.bin`。
 
-### 命令行参数
+### 配置
 
-```bash
-# 指定监听端口
-cargo run -- -p 5001
-
-# 添加 bootstrap 节点
-cargo run -- -c /ip4/192.168.1.100/tcp/5000/p2p/12D3KooW...
-
-# 覆盖 bootstrap 列表
-cargo run -- --connect-overwrite /ip4/192.168.1.100/tcp/5000/p2p/12D3KooW...
-```
-
-所有 CLI 变更自动写回 `config.toml`。
+监听端口、bootstrap 节点等均通过 `config.toml` 配置；程序不解析命令行参数。
 
 ## 部署（systemd / deb）
 
@@ -98,14 +88,14 @@ Windows 侧提供交叉编译产出的 NSIS 安装器与便携 zip（NSSM 托管
 name = "未设置的p2p节点"
 description = "无详细描述"
 allow_bootstrap = true
+accept_bootstrap_providers = false   # 是否自动采纳 Identify 发现的 bootstrap 节点
 
 [network]
 ipv4_enabled = false
 ipv4_address = "x.x.x.x"       # 可选，不设则自动检测
 ipv6_enabled = false
-ipv6_address = "x:x::x"        # 可选
+ipv6_address = "x:x::x"         # 可选
 port = 5000
-announce_addresses = []         # 手动指定宣告地址
 
 [services.ping]
 enabled = true
@@ -123,12 +113,10 @@ bootstrap_nodes = []
 [services.dispatcher]
 enabled = true
 query_timeout_secs = 60
-record_ttl_secs = 3600
 types_sync_secs = 300
 
 [[services.dispatcher.local_services]]
 name = "cmd"
-host = "127.0.0.1"
 port = 5014
 require_auth = false
 
@@ -143,37 +131,37 @@ pq_required = false
 
 [auth]
 network = "none"                 # "none" = 不鉴权
-cache_ttl_secs = 300
-refresh_interval_secs = 60
 
 [auth.networks.myorg]            # 每个鉴权网络的信任锚
 authority = "<base64 ed25519 公钥>"
 ```
 
-所有字段均有 `#[serde(default)]`，省略即默认值。
+可选字段省略即取默认值；`local_services[].name` 与 `port` 必填。节点固定连接
+`127.0.0.1:<port>`，不支持自定义 host。
 
-配置路径由环境变量决定（见 `src/paths.rs`）：`NEXUSNET_CONFIG`、`NEXUSNET_KEYPAIR`、
-`NEXUSNET_LOG_PATH`（仅文件输出模式用；systemd 下日志走 journald）、`NEXUSNET_HOME`；
-未设置时回退当前目录。
+`services.dispatcher.query_timeout_secs` 是控制指令的基础超时；涉及 DHT 查询的命令会按
+实际需要自动延长。
+
+配置路径由环境变量决定（见 `src/paths.rs`）：`NEXUSNET_CONFIG_PATH`、
+`NEXUSNET_KEYPAIR_PATH`、`NEXUSNET_LOG_PATH`（均为目录；`NEXUSNET_LOG_PATH` 仅文件输出
+模式使用，systemd 下日志走 journald）、`NEXUSNET_LOG_MODE`；未设置时回退当前目录。
 
 ## 启动流程
 
 ```
-boot::init()
+main()
   ├─ 读取 config.toml（损坏/不存在 → 创建默认）
-  ├─ CLI 参数覆盖 & 写回
   ├─ 更新公网 IP 到配置
   ├─ 加载/生成 keypair.bin（ED25519 节点身份）
   ├─ 尝试加载 keypair.pq.bin（PQ 密钥，可选，不存在则跳过）
   ├─ Network::start() → 构建 Swarm 并启动 SwarmActor
   ├─ 拨号所有 bootstrap 节点
   ├─ 启动 ServiceDispatcher（后台 tokio::spawn）
-  ├─ 启动 auth_refresher（后台鉴权缓存刷新）
+  ├─ 启动鉴权 worker 池（4 个 worker，每个队列 32）
    └─ NodeController::run()（主协程）
         tokio::select! {
             event_rx          → 网络事件
-            cmd_rx            → 后端命令
-            backend_status_rx → 后端就绪/断开状态
+            to_controller_rx  → 后端命令/就绪状态
             service_tick      → 到期撤销服务宣告（1s）
             relay_tick        → 中继补约
             shutdown          → SIGTERM/Ctrl-C 优雅退出
@@ -184,8 +172,7 @@ boot::init()
 
 | 模块 | 职责 |
 |------|------|
-| **boot** | 初始化 |
-| **main** | 程序入口 |
+| **main** | 程序入口与启动编排 |
 | **paths** | 统一路径解析（环境变量锚定，本地回退当前目录） |
 | **node_controller** | 事件循环统一处理、服务自动宣告（后端就绪门控）、处理远程查询和内部命令 |
 | **service_dispatcher** | 后端连接管理与就绪状态上报 |
@@ -216,11 +203,12 @@ u32_be(len) || cbor(message)      # len <= 16 MiB
 | `hello` | 双向 | 握手与版本协商 |
 | `request` | 节点→后端 | 转发入站服务请求 `{ id, service, payload }` |
 | `reply` | 双向 | 关联回复 `{ id, ok, result?, error? }` |
-| `list_services` / `discover_providers` / `query_public_ip` / `whoami` / `reconnect_bootstrap` / `reannounce_services` / `reload_config` / `relay_status` / `pq_status` / `auth_status` / `query_key` / `add_key` / `remove_key` / `service_request` / `service_request_to` | 后端→节点 | 控制指令，节点以 `reply` 应答 |
+| `list_services` / `discover_providers` / `query_public_ip` / `whoami` / `reconnect_bootstrap` / `reannounce_services` / `reload_config` / `refresh_cache` / `relay_status` / `pq_status` / `auth_status` / `query_key` / `add_key` / `remove_key` / `service_request` / `service_request_to` | 后端→节点 | 控制指令，节点以 `reply` 应答 |
 
 - 关联 id 为 UUID；`reply.result` 是该 op 自定的 **CBOR** 字节。
 - `add_key` 的 `value` 为 `bstr`，二进制安全（无需 base64）。
-- `remove_key`：撤销 provider 宣告 / 删除本地记录，`{ key, ? providing=true, ? record=false }`。两项均为**本地操作**——远端 provider 记录需待对端 provider TTL 过期才消失，远端 value 副本按 `record_ttl` 过期；撤销只影响发现，不阻止直接 `service_request_to` 调用。
+- `remove_key`：撤销 provider 宣告 / 删除本地记录，`{ key, ? providing=true, ? record=false }`。两项均为**本地操作**——远端 provider 记录需待对端 provider TTL 过期才消失，远端 value 副本按 `services.kademlia.record_ttl_seconds` 过期；撤销只影响发现，不阻止直接 `service_request_to` 调用。
+- `add_key` / `remove_key` 仅允许 `/oahd/service/<name>` 与 `/oahd/auth/...`；`/oahd/service/types` 和 `/oahd/bootstrap` 由节点自身维护，后端不可写。
 - 默认超时 30 秒，超时以 `error{code:"timeout"}` 应答。
 
 ## P2P 服务调用流程
@@ -233,8 +221,8 @@ u32_be(len) || cbor(message)      # len <= 16 MiB
   → RTT 排序选最优点
   → send_request_to_peer(peer, service, payload)
   → CBOR Request-Response (libp2p)
-  → 远程 NodeController → InboundServiceRequest(inbound_req_tx)
-  → 远程 ServiceDispatcher.handle_request_with_backend()
+  → 远程 NodeController → InboundServiceRequest(to_dispatcher_tx)
+  → 远程 ServiceDispatcher → backend_task
   → request 帧 → 远程后端进程
   → reply 沿原路返回
 ```
@@ -243,8 +231,9 @@ u32_be(len) || cbor(message)      # len <= 16 MiB
 
 - 本地服务列表由 `config.services.dispatcher.local_services` 定义
 - 仅当 DHT bootstrap 完成**且**对应后端 TCP 握手（`hello`）成功后，才自动调用 `start_providing`，key 为 `/oahd/service/<name>`——避免提前宣告尚不可用的服务
-- 后端连接断开后进入 3 秒宽限期：期间重连则不撤销；超过 3 秒仍未恢复则 `stop_providing` 撤销宣告
+- 后端连接断开后进入 3 秒宽限期（由 1 秒 tick 检查，实际撤销窗口约 3–4 秒）：期间重连则不撤销；超时仍未恢复则 `stop_providing` 撤销宣告
 - 撤销为本地行为，远端 provider 记录需待 provider TTL 过期才会消失
+- 双栈节点在 `allow_bootstrap = true` 时声明为 `/oahd/bootstrap` provider；其他节点仅在 `accept_bootstrap_providers = true` 时才会把 Identify 发现的 provider 自动写入 bootstrap 列表
 - 同步 `/oahd/service/types` 全局服务类型记录（仅新增、不清理）：本地维护一个**单调并集**，并周期（`services.dispatcher.types_sync_secs`，默认 300s）从 DHT 对端读取（绕过本地 store 副本与 60s 缓存，避免自我遮蔽）后重新发布，使各节点即使遭遇并发覆盖也能收敛到完整列表
 - `list_services` → 读取并合并 DHT 对端与本地已知的全部服务类型
 - `discover_providers` → DHT get_providers 获取提供者列表
@@ -257,14 +246,15 @@ u32_be(len) || cbor(message)      # len <= 16 MiB
 - **算法**：ML-KEM-768+ X25519 混合 KEM、ChaCha20-Poly1305 AEAD、可选 ML-DSA-65（FIPS 204）签名。
 - **协议**：`/oahd/service_req/2.0.0`与 `/oahd/pq_identity/1.0.0`，仅在启用时注册。
 - **流程**：请求方 encaps 到响应方 KEM 公钥，响应方 decaps 后双方共享同一密钥，响应复用该密钥加密——无需第二次 KEM，也不在请求里携带请求方公钥。
-- **回退**：对端不支持 PQ 时回退明文 `/oahd/service_req/1.0.0`；`crypto.pq_required = true` 则拒绝非 PQ 对端。
+- **回退**：仅当已确认对端不支持 PQ 时回退明文 `/oahd/service_req/1.0.0`；对端能力未知或身份尚未就绪时返回可重试错误，不会静默降级。`crypto.pq_required = true` 则拒绝非 PQ 对端。
+- **身份**：`pq_identity_enabled` 要求入站请求携带 ML-DSA 签名，并把签名身份绑定到传输层 PeerId；该选项需要 `pq_transport_enabled = true`。
 - **密钥**：`keypair.pq.bin`。
 - `@pq_status` → 查看启用状态。
 
 | 配置 | 含义 |
 |---|---|
 | `crypto.pq_transport_enabled` | 启用加密服务调用 |
-| `crypto.pq_identity_enabled` | 附带并校验 ML-DSA 签名 |
+| `crypto.pq_identity_enabled` | 要求并校验 ML-DSA 签名（需启用 transport） |
 | `crypto.pq_required` | 强制 PQ，拒绝非 PQ 对端 |
 
 ## 鉴权
@@ -277,10 +267,11 @@ u32_be(len) || cbor(message)      # len <= 16 MiB
   值为 COSE_Sign1；`net_hash = base64url_nopad(SHA-256(network))`。
 - **服务开关**：`services.dispatcher.local_services[].require_auth`。
 - **判定**：鉴权关闭或服务未要求鉴权 → 放行；索引/白名单缺失、过期、验签失败 → 拒绝；
-  服务不在索引 → 放行并自动把本地 `require_auth` 置为 `false`（网络同步）。
+  服务不在索引 → 本次放行并记录 Warning，不修改本地 `require_auth`；索引恢复后自动重新生效。
 - **边车发布**：签名记录经本地后端控制消息 `add_key { key, value }` 发布（`value` 为 `bstr`，二进制安全）；
   在 `expires_at` 前重发续期。
 - **状态查询**：`auth_status`。
+- **并发**：鉴权查询在独立 worker 池中执行，不阻塞 NodeController；队列满时入站请求立即返回 `authentication overloaded`。
 
 完整记录格式、发布流程与验证算法见 [docs/auth.md](./docs/auth.md)。
 
@@ -288,9 +279,9 @@ u32_be(len) || cbor(message)      # len <= 16 MiB
 |---|---|
 | `auth.network` | 鉴权网络名；`"none"` 表示不鉴权 |
 | `auth.networks.<name>.authority` | 该网络权威 ed25519 公钥（base64） |
-| `auth.cache_ttl_secs` | 白名单/索引本地缓存有效期（默认 300s） |
-| `auth.refresh_interval_secs` | 后台刷新间隔（默认 60s） |
 | `require_auth` | 单个本地服务是否要求鉴权 |
+
+鉴权记录按需从 DHT 读取，经 60 秒本地记录缓存；没有独立的鉴权缓存或后台刷新任务。
 
 ## 日志
 
@@ -308,7 +299,7 @@ u32_be(len) || cbor(message)      # len <= 16 MiB
 
 ## 开发状态
 
-当前版本：**0.4.4** — 完成度 **5.5/10**
+当前版本：**0.5.0** — 完成度 **5.5/10**
 
 ## 许可
 

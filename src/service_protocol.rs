@@ -23,6 +23,9 @@ use std::time::Duration;
 /// Protocol ID.
 pub const SERVICE_REQ_PROTOCOL: &str = "/oahd/service_req/1.0.0";
 
+/// Timeout for one P2P service request/response exchange.
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Request structure.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Request {
@@ -39,7 +42,7 @@ pub struct Response {
 
 /// Create a request-response behaviour with the default config.
 pub fn new_service_req_behaviour() -> cbor::Behaviour<Request, Response> {
-    let cfg = Config::default().with_request_timeout(Duration::from_secs(30));
+    let cfg = Config::default().with_request_timeout(REQUEST_TIMEOUT);
 
     // Convert &str to StreamProtocol.
     let protocol = StreamProtocol::new(SERVICE_REQ_PROTOCOL);

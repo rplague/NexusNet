@@ -23,8 +23,9 @@ NexusNet 以原生的 Debian 打包（`.deb`）分发，由 `dpkg`/`apt` 管理�
 | 二进制 | `/usr/bin/<bin>` | `root:root 0755` | 主程序 |
 | 单元 | `/lib/systemd/system/<pkg>.service` | `root:root 0644` | systemd 单元 |
 
-路径由 `NEXUSNET_HOME` / `NEXUSNET_CONFIG` / `NEXUSNET_KEYPAIR` / `NEXUSNET_LOG_PATH` 环境变量锚定，
-见 `src/paths.rs`。本地 `cargo run`（不设任何环境变量）仍回退当前目录 `./config.toml` / `./keypair.bin` / `./log`。
+路径由 `NEXUSNET_CONFIG_PATH` / `NEXUSNET_KEYPAIR_PATH` / `NEXUSNET_LOG_PATH`（均为目录）
+与 `NEXUSNET_LOG_MODE` 环境变量锚定，见 `src/paths.rs`。本地 `cargo run`（不设任何环境变量）
+仍回退当前目录 `./config.toml` / `./keypair.bin` / `./log`。
 
 ## 安装
 
@@ -66,10 +67,10 @@ apt purge <pkg>              # 彻底清除包配置
 
 | 变量 | 作用 | 默认（systemd） |
 |---|---|---|
-| `NEXUSNET_HOME` | 数据根目录 | `/var/lib/<pkg>` |
-| `NEXUSNET_CONFIG` | 配置文件路径 | `/etc/<pkg>/config.toml` |
-| `NEXUSNET_KEYPAIR` | 节点身份密钥路径 | `<NEXUSNET_HOME>/keypair.bin` |
-| `NEXUSNET_LOG_PATH` | 日志路径 | `/var/lib/<pkg>`（journald 模式下不写文件） |
+| `NEXUSNET_CONFIG_PATH` | 配置目录 | `/etc/<pkg>/` |
+| `NEXUSNET_KEYPAIR_PATH` | 身份密钥目录 | `/var/lib/<pkg>/` |
+| `NEXUSNET_LOG_PATH` | 日志目录 | `/var/lib/<pkg>/`（journald 模式下不写文件） |
+| `NEXUSNET_LOG_MODE` | 日志模式（`journald` / `nssm` / `file`） | `journald` |
 
 `JOURNAL_STREAM` 存在时自动切换为 journald 模式（由 systemd 设置）；`NO_COLOR` 或非 TTY 时去色。
 
@@ -135,8 +136,9 @@ NSSM 由脚本按固定版本（2.24）+ SHA256 下载缓存到 `target/nssm-cac
 | 配置 | `%ProgramData%\<pkg>\config.toml` | 首启自动生成 |
 | 数据/日志 | `%ProgramData%\<pkg>` | 身份/日志文件 `log` 与轮转 `.gz` 同目录 |
 
-路径经 `NEXUSNET_HOME` / `NEXUSNET_CONFIG` / `NEXUSNET_LOG_PATH` 锚定，由安装器以
-NSSM `AppEnvironmentExtra` 注入，与 systemd 单元同一契约。
+路径经 `NEXUSNET_CONFIG_PATH` / `NEXUSNET_KEYPAIR_PATH` / `NEXUSNET_LOG_PATH` 与
+`NEXUSNET_LOG_MODE=nssm` 锚定，由安装器以 NSSM `AppEnvironmentExtra` 注入，与 systemd
+单元同一契约。
 
 ### 安装 / 升级 / 卸载
 
@@ -194,9 +196,10 @@ Get-WinEvent -ProviderName nssm -MaxEvents 50            # NSSM 服务级事件
 
 前台直跑（快速排障，直接看终端输出）：
 ```powershell
-$env:NEXUSNET_HOME="$env:ProgramData\<pkg>"
-$env:NEXUSNET_CONFIG="$env:ProgramData\<pkg>\config.toml"
+$env:NEXUSNET_CONFIG_PATH="$env:ProgramData\<pkg>"
+$env:NEXUSNET_KEYPAIR_PATH="$env:ProgramData\<pkg>"
 $env:NEXUSNET_LOG_PATH="$env:ProgramData\<pkg>"
+$env:NEXUSNET_LOG_MODE="file"
 & "$env:ProgramFiles\<pkg>\<bin>.exe"
 ```
 

@@ -382,6 +382,19 @@ struct CachedRecord {
 /// Returns `None` once the query finalized and the result was sent via `resp`;
 /// `Some` means more events are needed (the pending entry is returned as-is).
 /// Non-`GetProviders` entries are returned as-is.
+fn cacheable_record(
+    result: &Result<kad::GetRecordOk, kad::GetRecordError>,
+    network_only: bool,
+) -> Option<Option<Vec<u8>>> {
+    match result {
+        Ok(kad::GetRecordOk::FoundRecord(peer_record)) => {
+            Some(Some(peer_record.record.value.clone()))
+        }
+        Ok(kad::GetRecordOk::FinishedWithNoAdditionalRecord { .. }) if !network_only => Some(None),
+        _ => None,
+    }
+}
+
 fn apply_get_providers(
     pending: KadPending,
     result: Result<kad::GetProvidersOk, kad::GetProvidersError>,
@@ -434,6 +447,47 @@ enum PendingInbound {
 struct PqOutboundPending {
     resp: oneshot::Sender<Result<service_protocol::Response, NetworkError>>,
     out: pq::PqOutbound,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SendSecurity {
+    Pq,
+    Plaintext,
+    WaitIdentity,
+    MissingKeys,
+    MissingTransport,
+    Unsupported,
+}
+
+fn send_security(
+    transport: bool,
+    required: bool,
+    keys_available: bool,
+    identity_available: bool,
+    supports_pq: Option<bool>,
+) -> SendSecurity {
+    if required && !transport {
+        return SendSecurity::MissingTransport;
+    }
+    if required && !identity_available {
+        return match supports_pq {
+            Some(false) => SendSecurity::Unsupported,
+            _ => SendSecurity::WaitIdentity,
+        };
+    }
+    if !transport {
+        return SendSecurity::Plaintext;
+    }
+    if !keys_available {
+        return SendSecurity::MissingKeys;
+    }
+    if identity_available {
+        return SendSecurity::Pq;
+    }
+    match supports_pq {
+        Some(true) | None => SendSecurity::WaitIdentity,
+        Some(false) => SendSecurity::Plaintext,
+    }
 }
 
 pub(crate) struct SwarmActor {
@@ -625,6 +679,8 @@ impl SwarmActor {
                 if num_established == 0 {
                     self.peer_protocols.remove(&peer_id);
                     self.pq_identities.remove(&peer_id);
+                    self.pending_pq_identity
+                        .retain(|_, pending_peer| *pending_peer != peer_id);
                 }
             }
             SwarmEvent::ListenerClosed { addresses, .. } => {
@@ -717,15 +773,7 @@ impl SwarmActor {
                     network_only,
                 }) = self.pending_kad.remove(&id)
                 {
-                    let value = match &result {
-                        Ok(kad::GetRecordOk::FoundRecord(peer_record)) => {
-                            Some(peer_record.record.value.clone())
-                        }
-                        _ => None,
-                    };
-                    // Never negative-cache a network-only miss: the local store
-                    // may still hold a valid copy for regular reads.
-                    if value.is_some() || !network_only {
+                    if let Some(value) = cacheable_record(&result, network_only) {
                         self.insert_cached(key, value);
                     }
                     let _ = resp.send(result.map_err(|e| NetworkError::Kad(format!("{e:?}"))));
@@ -865,9 +913,11 @@ impl SwarmActor {
                     request, channel, ..
                 } => {
                     let Some(keys) = self.pq_keys.as_ref() else {
+                        LogStruct::new(LogLevel::Warning, "PQ 请求无法处理", "本地未加载 PQ 密钥")
+                            .emit();
                         return;
                     };
-                    let inbound = match pq::open_request(keys, &request) {
+                    let inbound = match pq::open_request(keys, &peer, &request) {
                         Ok(v) => v,
                         Err(e) => {
                             LogStruct::new(LogLevel::Warning, "PQ 请求解密失败", e.to_string())
@@ -875,7 +925,33 @@ impl SwarmActor {
                             return;
                         }
                     };
+                    if self.config.pq_identity_enabled() && request.identity.is_none() {
+                        LogStruct::new(LogLevel::Warning, "PQ 请求缺少签名", peer.to_string())
+                            .emit();
+                        if let Ok(response) =
+                            inbound.seal_response(&encode_response(&service_protocol::Response {
+                                success: false,
+                                data: b"PQ signature required".to_vec(),
+                            }))
+                            && let Some(behaviour) =
+                                self.swarm.behaviour_mut().service_req_pq.as_mut()
+                        {
+                            let _ = behaviour.send_response(channel, response);
+                        }
+                        return;
+                    }
                     let Some(req) = decode_request(&inbound.plaintext) else {
+                        LogStruct::new(LogLevel::Warning, "PQ 请求格式错误", "").emit();
+                        if let Ok(response) =
+                            inbound.seal_response(&encode_response(&service_protocol::Response {
+                                success: false,
+                                data: b"invalid PQ request payload".to_vec(),
+                            }))
+                            && let Some(behaviour) =
+                                self.swarm.behaviour_mut().service_req_pq.as_mut()
+                        {
+                            let _ = behaviour.send_response(channel, response);
+                        }
                         return;
                     };
                     let request_id = Uuid::new_v4().to_string();
@@ -945,35 +1021,42 @@ impl SwarmActor {
     /// Handle PQ identity exchange (request reply + cached response
     /// verification).
     async fn handle_pq_identity(&mut self, event: request_response::Event<(), PqIdentity>) {
-        let request_response::Event::Message { message, .. } = event else {
-            return;
-        };
-        match message {
-            request_response::Message::Request { channel, .. } => {
-                let identity = self
-                    .pq_keys
-                    .as_ref()
-                    .and_then(|k| k.identity(&self.keypair).ok());
-                if let Some(identity) = identity
-                    && let Some(b) = self.swarm.behaviour_mut().pq_identity.as_mut()
-                {
-                    let _ = b.send_response(channel, identity);
-                }
-            }
-            request_response::Message::Response {
-                request_id,
-                response,
-                ..
-            } => {
-                if let Some(expected) = self.pending_pq_identity.remove(&request_id) {
-                    if response.verify(&expected).is_ok() {
-                        self.pq_identities.insert(expected, response);
-                    } else {
-                        LogStruct::new(LogLevel::Warning, "PQ 身份校验失败", expected.to_string())
-                            .emit();
+        match event {
+            request_response::Event::Message { message, .. } => match message {
+                request_response::Message::Request { channel, .. } => {
+                    let identity = self
+                        .pq_keys
+                        .as_ref()
+                        .and_then(|k| k.identity(&self.keypair).ok());
+                    if let Some(identity) = identity
+                        && let Some(b) = self.swarm.behaviour_mut().pq_identity.as_mut()
+                    {
+                        let _ = b.send_response(channel, identity);
                     }
                 }
+                request_response::Message::Response {
+                    request_id,
+                    response,
+                    ..
+                } => {
+                    if let Some(expected) = self.pending_pq_identity.remove(&request_id) {
+                        if response.verify(&expected).is_ok() {
+                            self.pq_identities.insert(expected, response);
+                        } else {
+                            LogStruct::new(
+                                LogLevel::Warning,
+                                "PQ 身份校验失败",
+                                expected.to_string(),
+                            )
+                            .emit();
+                        }
+                    }
+                }
+            },
+            request_response::Event::OutboundFailure { request_id, .. } => {
+                self.pending_pq_identity.remove(&request_id);
             }
+            _ => {}
         }
     }
 
@@ -1106,17 +1189,48 @@ impl SwarmActor {
                 request,
                 resp,
             } => {
-                // pq_required: reject non-PQ peers.
-                if self.config.pq_required() && !self.pq_identities.contains_key(&peer) {
-                    let _ = resp.send(Err(NetworkError::Request(
-                        "PQ required but peer is not PQ-capable".into(),
-                    )));
-                    return true;
-                }
+                let pq_protocol = StreamProtocol::new(pq::SERVICE_REQ_PQ_PROTOCOL);
+                let supports_pq = self
+                    .peer_protocols
+                    .get(&peer)
+                    .map(|protocols| protocols.contains(&pq_protocol));
+                let security = send_security(
+                    self.config.pq_transport_enabled(),
+                    self.config.pq_required(),
+                    self.pq_keys.is_some(),
+                    self.pq_identities.contains_key(&peer),
+                    supports_pq,
+                );
 
-                let use_pq = self.config.pq_transport_enabled()
-                    && self.pq_keys.is_some()
-                    && self.pq_identities.contains_key(&peer);
+                let use_pq = match security {
+                    SendSecurity::Pq => true,
+                    SendSecurity::Plaintext => false,
+                    SendSecurity::WaitIdentity => {
+                        self.maybe_fetch_pq_identity(peer);
+                        let _ = resp.send(Err(NetworkError::Request(
+                            "PQ identity not ready; retry after Identify".into(),
+                        )));
+                        return true;
+                    }
+                    SendSecurity::MissingKeys => {
+                        let _ = resp.send(Err(NetworkError::Request(
+                            "PQ transport enabled but local PQ keys are unavailable".into(),
+                        )));
+                        return true;
+                    }
+                    SendSecurity::MissingTransport => {
+                        let _ = resp.send(Err(NetworkError::Request(
+                            "PQ required but transport is disabled".into(),
+                        )));
+                        return true;
+                    }
+                    SendSecurity::Unsupported => {
+                        let _ = resp.send(Err(NetworkError::Request(
+                            "PQ required but peer is not PQ-capable".into(),
+                        )));
+                        return true;
+                    }
+                };
 
                 if use_pq {
                     let recipient = self.pq_identities.get(&peer).cloned().unwrap();
@@ -1220,10 +1334,49 @@ impl SwarmActor {
         true
     }
 
-    /// Rebuild the Swarm from the current config: clear pending tables,
-    /// rebuild, re-dial bootstrap.
+    fn reject_inbound(&mut self, pending: PendingInbound) {
+        let message = service_protocol::Response {
+            success: false,
+            data: b"node reloading".to_vec(),
+        };
+        match pending {
+            PendingInbound::Plain(channel) => {
+                let _ = self
+                    .swarm
+                    .behaviour_mut()
+                    .service_req
+                    .send_response(channel, message);
+            }
+            PendingInbound::Pq { channel, inbound } => {
+                if let Ok(sealed) = inbound.seal_response(&encode_response(&message))
+                    && let Some(behaviour) = self.swarm.behaviour_mut().service_req_pq.as_mut()
+                {
+                    let _ = behaviour.send_response(channel, sealed);
+                }
+            }
+        }
+    }
+
+    /// Rebuild the Swarm from the current config. The new Swarm is built first,
+    /// so a build failure leaves the old one untouched.
     async fn reload(&mut self) -> Result<(), NetworkError> {
-        // 1. Backfill all pending requests so callers never wait forever.
+        let new_swarm = build_swarm(&self.config, &self.keypair)?;
+
+        let inbound: Vec<PendingInbound> = self
+            .pending_inbound
+            .drain()
+            .map(|(_, (_, pending))| pending)
+            .collect();
+        for pending in inbound {
+            self.reject_inbound(pending);
+        }
+        let _ = tokio::time::timeout(Duration::from_millis(250), async {
+            loop {
+                let _ = self.swarm.select_next_some().await;
+            }
+        })
+        .await;
+
         for (_, pending) in self.pending_kad.drain() {
             pending.fail(NetworkError::Reloaded);
         }
@@ -1236,16 +1389,11 @@ impl SwarmActor {
         self.pending_pq_identity.clear();
         self.pq_identities.clear();
         self.peer_protocols.clear();
-        self.pending_inbound.clear();
         self.record_cache.clear();
 
-        // 2. Rebuild the Swarm. The old one is dropped here, closing connections
-        // and listeners.
-        let new_swarm = build_swarm(&self.config, &self.keypair)?;
         self.swarm = new_swarm;
         self.bootstrap_triggered = false;
 
-        // 3. Re-dial the static bootstrap nodes.
         for addr in self.config.bootstrap_nodes() {
             let _ = self.swarm.dial(addr);
         }
@@ -1375,5 +1523,73 @@ mod tests {
         };
         assert!(apply_get_providers(pending, Err(err)).is_none());
         assert!(rx.try_recv().unwrap().is_err());
+    }
+
+    #[test]
+    fn cacheable_record_ignores_transport_errors() {
+        let key = kad::RecordKey::new(b"k");
+        let err = kad::GetRecordError::Timeout { key };
+        assert_eq!(cacheable_record(&Err(err), false), None);
+    }
+
+    #[test]
+    fn cacheable_record_positive_on_found() {
+        let key = kad::RecordKey::new(b"k");
+        let value = b"v".to_vec();
+        let ok = kad::GetRecordOk::FoundRecord(kad::PeerRecord {
+            peer: None,
+            record: kad::Record::new(key, value.clone()),
+        });
+        assert_eq!(cacheable_record(&Ok(ok), false), Some(Some(value)));
+    }
+
+    #[test]
+    fn cacheable_record_negative_only_on_regular_miss() {
+        let ok = kad::GetRecordOk::FinishedWithNoAdditionalRecord {
+            cache_candidates: Default::default(),
+        };
+        assert_eq!(cacheable_record(&Ok(ok), false), Some(None));
+
+        let ok = kad::GetRecordOk::FinishedWithNoAdditionalRecord {
+            cache_candidates: Default::default(),
+        };
+        assert_eq!(cacheable_record(&Ok(ok), true), None);
+    }
+
+    #[test]
+    fn send_security_never_downgrades_silently() {
+        use SendSecurity::*;
+
+        assert_eq!(send_security(true, false, true, true, Some(true)), Pq);
+        assert_eq!(
+            send_security(true, false, true, false, Some(true)),
+            WaitIdentity
+        );
+        assert_eq!(send_security(true, false, true, false, None), WaitIdentity);
+        assert_eq!(
+            send_security(true, false, true, false, Some(false)),
+            Plaintext
+        );
+        assert_eq!(
+            send_security(true, false, false, false, Some(true)),
+            MissingKeys
+        );
+        assert_eq!(
+            send_security(false, false, true, false, Some(false)),
+            Plaintext
+        );
+        assert_eq!(
+            send_security(true, true, true, false, Some(false)),
+            Unsupported
+        );
+        assert_eq!(
+            send_security(true, true, true, false, Some(true)),
+            WaitIdentity
+        );
+        assert_eq!(
+            send_security(false, true, true, false, Some(true)),
+            MissingTransport
+        );
+        assert_eq!(send_security(true, true, true, true, Some(true)), Pq);
     }
 }

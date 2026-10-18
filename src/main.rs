@@ -85,8 +85,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     //                       backend status to NodeController
     //   to_dispatcher_tx -> NodeController forwards inbound service requests to
     //                       ServiceDispatcher
-    let (to_controller_tx, to_controller_rx) = mpsc::unbounded_channel();
-    let (to_dispatcher_tx, to_dispatcher_rx) = mpsc::unbounded_channel();
+    let (to_controller_tx, to_controller_rx) = mpsc::channel(128);
+    let (to_dispatcher_tx, to_dispatcher_rx) = mpsc::channel(256);
 
     // Signal handling: SIGINT/SIGTERM/Ctrl-C trigger shutdown; SIGHUP requests a
     // hot reload (unix only).
@@ -126,9 +126,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
 /// Request a hot reload on SIGHUP (fire-and-forget).
 #[cfg(unix)]
-fn request_reload(reload_tx: &mpsc::UnboundedSender<ToController>) {
+fn request_reload(reload_tx: &mpsc::Sender<ToController>) {
     let (resp_tx, _resp_rx) = oneshot::channel();
-    let _ = reload_tx.send(ToController::Control(ControlCommand {
+    let _ = reload_tx.try_send(ToController::Control(ControlCommand {
         msg: Message::ReloadConfig {
             id: uuid::Uuid::new_v4(),
         },
@@ -138,7 +138,7 @@ fn request_reload(reload_tx: &mpsc::UnboundedSender<ToController>) {
 
 /// Wait for an exit signal, handling SIGHUP reloads while waiting.
 #[cfg(unix)]
-async fn wait_for_signal(reload_tx: mpsc::UnboundedSender<ToController>) {
+async fn wait_for_signal(reload_tx: mpsc::Sender<ToController>) {
     use tokio::signal::unix::{SignalKind, signal};
 
     let mut sigint = signal(SignalKind::interrupt()).expect("无法安装 SIGINT 处理器");
@@ -158,7 +158,7 @@ async fn wait_for_signal(reload_tx: mpsc::UnboundedSender<ToController>) {
 }
 
 #[cfg(windows)]
-async fn wait_for_signal(_reload_tx: mpsc::UnboundedSender<ToController>) {
+async fn wait_for_signal(_reload_tx: mpsc::Sender<ToController>) {
     // Windows service (NSSM) triggers graceful shutdown via Ctrl+C; no SIGHUP
     // hot reload.
     let _ = tokio::signal::ctrl_c().await;
