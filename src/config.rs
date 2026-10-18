@@ -233,6 +233,9 @@ pub struct NodeInfo {
     /// a DHT provider record).
     #[serde(default = "bool_true")]
     pub allow_bootstrap: bool,
+    /// Whether to automatically add bootstrap providers discovered via Identify.
+    #[serde(default = "bool_false")]
+    pub accept_bootstrap_providers: bool,
 }
 
 impl Default for NodeInfo {
@@ -241,6 +244,7 @@ impl Default for NodeInfo {
             name: default_name(),
             description: default_description(),
             allow_bootstrap: bool_true(),
+            accept_bootstrap_providers: bool_false(),
         }
     }
 }
@@ -536,6 +540,10 @@ impl ConfigHandle {
     // ========== Convenience getters ==========
     pub fn allow_bootstrap(&self) -> bool {
         self.read().node.allow_bootstrap
+    }
+
+    pub fn accept_bootstrap_providers(&self) -> bool {
+        self.read().node.accept_bootstrap_providers
     }
 
     pub fn ping_enabled(&self) -> bool {
@@ -867,5 +875,13 @@ mod tests {
         config.services.dispatcher.local_services[1].name = "ocr".to_string();
         config.services.dispatcher.local_services[1].port = 0;
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn bootstrap_provider_auto_discovery_is_opt_in() {
+        assert!(!NodeConfig::default().node.accept_bootstrap_providers);
+        let config: NodeConfig =
+            toml::from_str("[node]\naccept_bootstrap_providers = true\n").unwrap();
+        assert!(config.node.accept_bootstrap_providers);
     }
 }

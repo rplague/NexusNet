@@ -78,6 +78,9 @@ impl BootstrapDiscovery {
     /// Addresses always come from Identify info (no DHT address storage); bootstrap
     /// provider status is queried on demand.
     pub async fn on_identify(&self, info: &identify::Info, peer_id: PeerId) {
+        if !self.config.accept_bootstrap_providers() {
+            return;
+        }
         if !is_dual_stack_addrs(&info.listen_addrs) {
             return;
         }

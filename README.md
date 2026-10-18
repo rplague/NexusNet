@@ -52,20 +52,9 @@ cargo run
 
 未设置任何环境变量时，运行回退当前目录，首次运行自动生成 `./config.toml` 和 `./keypair.bin`。
 
-### 命令行参数
+### 配置
 
-```bash
-# 指定监听端口
-cargo run -- -p 5001
-
-# 添加 bootstrap 节点
-cargo run -- -c /ip4/192.168.1.100/tcp/5000/p2p/12D3KooW...
-
-# 覆盖 bootstrap 列表
-cargo run -- --connect-overwrite /ip4/192.168.1.100/tcp/5000/p2p/12D3KooW...
-```
-
-所有 CLI 变更自动写回 `config.toml`。
+监听端口、bootstrap 节点等均通过 `config.toml` 配置；程序不解析命令行参数。
 
 ## 部署（systemd / deb）
 
@@ -98,6 +87,7 @@ Windows 侧提供交叉编译产出的 NSIS 安装器与便携 zip（NSSM 托管
 name = "未设置的p2p节点"
 description = "无详细描述"
 allow_bootstrap = true
+accept_bootstrap_providers = false   # 是否自动采纳 Identify 发现的 bootstrap 节点
 
 [network]
 ipv4_enabled = false
@@ -238,6 +228,7 @@ u32_be(len) || cbor(message)      # len <= 16 MiB
 - 仅当 DHT bootstrap 完成**且**对应后端 TCP 握手（`hello`）成功后，才自动调用 `start_providing`，key 为 `/oahd/service/<name>`——避免提前宣告尚不可用的服务
 - 后端连接断开后进入 3 秒宽限期（由 1 秒 tick 检查，实际撤销窗口约 3–4 秒）：期间重连则不撤销；超时仍未恢复则 `stop_providing` 撤销宣告
 - 撤销为本地行为，远端 provider 记录需待 provider TTL 过期才会消失
+- 双栈节点在 `allow_bootstrap = true` 时声明为 `/oahd/bootstrap` provider；其他节点仅在 `accept_bootstrap_providers = true` 时才会把 Identify 发现的 provider 自动写入 bootstrap 列表
 - 同步 `/oahd/service/types` 全局服务类型记录（仅新增、不清理）：本地维护一个**单调并集**，并周期（`services.dispatcher.types_sync_secs`，默认 300s）从 DHT 对端读取（绕过本地 store 副本与 60s 缓存，避免自我遮蔽）后重新发布，使各节点即使遭遇并发覆盖也能收敛到完整列表
 - `list_services` → 读取并合并 DHT 对端与本地已知的全部服务类型
 - `discover_providers` → DHT get_providers 获取提供者列表
