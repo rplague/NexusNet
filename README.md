@@ -92,9 +92,9 @@ accept_bootstrap_providers = false   # 是否自动采纳 Identify 发现的 boo
 
 [network]
 ipv4_enabled = false
-ipv4_address = "x.x.x.x"       # 可选；显式设置时不会被自动探测覆盖
+ipv4_address = "x.x.x.x"       # 可选，不设则自动检测
 ipv6_enabled = false
-ipv6_address = "x:x::x"         # 可选；显式设置时不会被自动探测覆盖
+ipv6_address = "x:x::x"         # 可选
 port = 5000
 
 [services.ping]
@@ -141,9 +141,6 @@ authority = "<base64 ed25519 公钥>"
 
 `services.dispatcher.query_timeout_secs` 是控制指令的基础超时；涉及 DHT 查询或 provider
 重试的命令会按实际需要自动延长。
-
-启动时仅在 `ipv4_address` / `ipv6_address` 未设置时填入探测到的公网 IP；不会关闭已启用的
-地址族，也不会覆盖显式配置的地址。
 
 配置路径由环境变量决定（见 `src/paths.rs`）：`NEXUSNET_CONFIG_PATH`、
 `NEXUSNET_KEYPAIR_PATH`、`NEXUSNET_LOG_PATH`（均为目录；`NEXUSNET_LOG_PATH` 仅文件输出

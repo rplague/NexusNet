@@ -17,10 +17,7 @@
 
 //! Local public-address probing and Multiaddr conversion.
 
-use crate::{
-    LogLevel, LogStruct,
-    config::{ConfigHandle, NodeConfig},
-};
+use crate::{LogLevel, LogStruct, config::ConfigHandle};
 use libp2p::Multiaddr;
 use std::net::IpAddr;
 
@@ -75,112 +72,56 @@ pub fn update_config_with_public_ip(
     config: &ConfigHandle,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let public_ips = get_public_ips();
-    let ipv4 = public_ips.iter().find(|ip| ip.is_ipv4()).copied();
-    let ipv6 = public_ips.iter().find(|ip| ip.is_ipv6()).copied();
+    let ipv4_addrs: Vec<IpAddr> = public_ips
+        .iter()
+        .filter(|ip| ip.is_ipv4())
+        .copied()
+        .collect();
+    let ipv6_addrs: Vec<IpAddr> = public_ips
+        .iter()
+        .filter(|ip| ip.is_ipv6())
+        .copied()
+        .collect();
 
-    if ipv4.is_none() && ipv6.is_none() {
-        LogStruct::new(LogLevel::Warning, "未发现公网IP", "保留现有网络配置").emit();
+    if ipv4_addrs.is_empty() && ipv6_addrs.is_empty() {
+        LogStruct::new(LogLevel::Warning, "未发现公网IP", "无法自动更新网络配置").emit();
         return Ok(());
     }
 
-    let changed = {
+    {
+        let cfg = config.read();
+        if cfg.network.ipv4_address == ipv4_addrs.first().copied()
+            && cfg.network.ipv6_address == ipv6_addrs.first().copied()
+        {
+            return Ok(());
+        }
+    }
+
+    {
         let mut cfg = config.write();
-        apply_public_ips(&mut cfg, ipv4, ipv6)
-    };
-    if !changed {
-        return Ok(());
+        if !ipv4_addrs.is_empty() {
+            cfg.network.ipv4_enabled = true;
+            cfg.network.ipv4_address = ipv4_addrs.first().copied();
+        } else {
+            cfg.network.ipv4_enabled = false;
+            cfg.network.ipv4_address = None;
+        }
+        if !ipv6_addrs.is_empty() {
+            cfg.network.ipv6_enabled = true;
+            cfg.network.ipv6_address = ipv6_addrs.first().copied();
+        } else {
+            cfg.network.ipv6_enabled = false;
+            cfg.network.ipv6_address = None;
+        }
     }
 
+    // Atomically persist to disk.
     config.save_to_default();
     LogStruct::new(
         LogLevel::Preset,
         "网络配置已自动更新",
-        format!("IPv4: {ipv4:?}, IPv6: {ipv6:?}"),
+        format!("IPv4: {:?}, IPv6: {:?}", ipv4_addrs, ipv6_addrs),
     )
     .emit();
     Ok(())
-}
-
-fn apply_public_ips(config: &mut NodeConfig, ipv4: Option<IpAddr>, ipv6: Option<IpAddr>) -> bool {
-    let before = (
-        config.network.ipv4_enabled,
-        config.network.ipv4_address,
-        config.network.ipv6_enabled,
-        config.network.ipv6_address,
-    );
-
-    if let Some(ip) = ipv4
-        && config.network.ipv4_address.is_none()
-    {
-        config.network.ipv4_address = Some(ip);
-        config.network.ipv4_enabled = true;
-    }
-    if let Some(ip) = ipv6
-        && config.network.ipv6_address.is_none()
-    {
-        config.network.ipv6_address = Some(ip);
-        config.network.ipv6_enabled = true;
-    }
-
-    before
-        != (
-            config.network.ipv4_enabled,
-            config.network.ipv4_address,
-            config.network.ipv6_enabled,
-            config.network.ipv6_address,
-        )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::config::NodeConfig;
-
-    fn ipv4(last: u8) -> IpAddr {
-        IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, last))
-    }
-
-    fn ipv6(last: u16) -> IpAddr {
-        IpAddr::V6(std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, last))
-    }
-
-    #[test]
-    fn explicit_address_is_not_overwritten() {
-        let mut config = NodeConfig::default();
-        config.network.ipv4_enabled = true;
-        config.network.ipv4_address = Some(ipv4(10));
-        assert!(!apply_public_ips(&mut config, Some(ipv4(20)), None));
-        assert_eq!(config.network.ipv4_address, Some(ipv4(10)));
-    }
-
-    #[test]
-    fn unset_address_is_filled_and_enabled() {
-        let mut config = NodeConfig::default();
-        assert!(apply_public_ips(&mut config, Some(ipv4(20)), None));
-        assert!(config.network.ipv4_enabled);
-        assert_eq!(config.network.ipv4_address, Some(ipv4(20)));
-    }
-
-    #[test]
-    fn missing_family_does_not_disable_existing_config() {
-        let mut config = NodeConfig::default();
-        config.network.ipv4_enabled = true;
-        config.network.ipv4_address = Some(ipv4(10));
-        config.network.ipv6_enabled = true;
-        config.network.ipv6_address = Some(ipv6(1));
-        assert!(!apply_public_ips(&mut config, None, None));
-        assert!(config.network.ipv4_enabled);
-        assert!(config.network.ipv6_enabled);
-    }
-
-    #[test]
-    fn one_family_can_be_updated_without_touching_the_other() {
-        let mut config = NodeConfig::default();
-        config.network.ipv4_enabled = true;
-        config.network.ipv4_address = Some(ipv4(10));
-        assert!(apply_public_ips(&mut config, Some(ipv4(20)), Some(ipv6(2))));
-        assert_eq!(config.network.ipv4_address, Some(ipv4(10)));
-        assert!(config.network.ipv6_enabled);
-        assert_eq!(config.network.ipv6_address, Some(ipv6(2)));
-    }
 }
