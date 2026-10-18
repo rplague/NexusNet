@@ -1334,10 +1334,49 @@ impl SwarmActor {
         true
     }
 
-    /// Rebuild the Swarm from the current config: clear pending tables,
-    /// rebuild, re-dial bootstrap.
+    fn reject_inbound(&mut self, pending: PendingInbound) {
+        let message = service_protocol::Response {
+            success: false,
+            data: b"node reloading".to_vec(),
+        };
+        match pending {
+            PendingInbound::Plain(channel) => {
+                let _ = self
+                    .swarm
+                    .behaviour_mut()
+                    .service_req
+                    .send_response(channel, message);
+            }
+            PendingInbound::Pq { channel, inbound } => {
+                if let Ok(sealed) = inbound.seal_response(&encode_response(&message))
+                    && let Some(behaviour) = self.swarm.behaviour_mut().service_req_pq.as_mut()
+                {
+                    let _ = behaviour.send_response(channel, sealed);
+                }
+            }
+        }
+    }
+
+    /// Rebuild the Swarm from the current config. The new Swarm is built first,
+    /// so a build failure leaves the old one untouched.
     async fn reload(&mut self) -> Result<(), NetworkError> {
-        // 1. Backfill all pending requests so callers never wait forever.
+        let new_swarm = build_swarm(&self.config, &self.keypair)?;
+
+        let inbound: Vec<PendingInbound> = self
+            .pending_inbound
+            .drain()
+            .map(|(_, (_, pending))| pending)
+            .collect();
+        for pending in inbound {
+            self.reject_inbound(pending);
+        }
+        let _ = tokio::time::timeout(Duration::from_millis(250), async {
+            loop {
+                let _ = self.swarm.select_next_some().await;
+            }
+        })
+        .await;
+
         for (_, pending) in self.pending_kad.drain() {
             pending.fail(NetworkError::Reloaded);
         }
@@ -1350,16 +1389,11 @@ impl SwarmActor {
         self.pending_pq_identity.clear();
         self.pq_identities.clear();
         self.peer_protocols.clear();
-        self.pending_inbound.clear();
         self.record_cache.clear();
 
-        // 2. Rebuild the Swarm. The old one is dropped here, closing connections
-        // and listeners.
-        let new_swarm = build_swarm(&self.config, &self.keypair)?;
         self.swarm = new_swarm;
         self.bootstrap_triggered = false;
 
-        // 3. Re-dial the static bootstrap nodes.
         for addr in self.config.bootstrap_nodes() {
             let _ = self.swarm.dial(addr);
         }
