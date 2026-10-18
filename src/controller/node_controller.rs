@@ -217,7 +217,7 @@ impl NodeController {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(job)) => {
                 LogStruct::new(LogLevel::Warning, "鉴权队列已满", job.service.clone()).emit();
-                let _ = self.swarm.send_response(
+                self.swarm.send_response(
                     job.request_id,
                     service_protocol::Response {
                         success: false,
@@ -227,7 +227,7 @@ impl NodeController {
             }
             Err(mpsc::error::TrySendError::Closed(job)) => {
                 LogStruct::new(LogLevel::Error, "鉴权队列不可用", job.service.clone()).emit();
-                let _ = self.swarm.send_response(
+                self.swarm.send_response(
                     job.request_id,
                     service_protocol::Response {
                         success: false,
@@ -275,7 +275,7 @@ async fn auth_worker(
                     format!("{} -> {}: {}", job.peer, job.service, reason),
                 )
                 .emit();
-                let _ = swarm.send_response(
+                swarm.send_response(
                     job.request_id,
                     service_protocol::Response {
                         success: false,
@@ -309,6 +309,6 @@ async fn forward_auth_job(
             success: false,
             data: format!("service unavailable: {}", e).into_bytes(),
         };
-        let _ = swarm.send_response(request_id, err_resp);
+        swarm.send_response(request_id, err_resp);
     }
 }
