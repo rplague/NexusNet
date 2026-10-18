@@ -338,8 +338,13 @@ pub fn seal_request(
     })
 }
 
-/// Responder side: open a request.
-pub fn open_request(keys: &PqKeys, request: &PqRequest) -> Result<PqInbound, PqError> {
+/// Responder side: open a request. The sender identity, when present, must bind
+/// to the transport-level `expected_sender` peer.
+pub fn open_request(
+    keys: &PqKeys,
+    expected_sender: &PeerId,
+    request: &PqRequest,
+) -> Result<PqInbound, PqError> {
     if request.version != ENVELOPE_VERSION
         || request.kem.len() != MLKEM_CT_LEN + X25519_LEN
         || request.nonce.len() != NONCE_LEN
@@ -348,21 +353,24 @@ pub fn open_request(keys: &PqKeys, request: &PqRequest) -> Result<PqInbound, PqE
         return Err(PqError::InvalidEnvelope);
     }
 
-    // Optional signature verification.
-    if let (Some(id), Some(sig)) = (&request.identity, &request.signature) {
-        id.verify(&id_peer_id(id)?)?;
-        let vk = id.sig_vk()?;
-        let sig = DsaSignature::<MlDsa65>::try_from(sig.as_slice())
-            .map_err(|_| PqError::InvalidIdentity)?;
-        if vk
-            .verify(
-                &signed_message(&request.kem, &request.nonce, &request.ciphertext),
-                &sig,
-            )
-            .is_err()
-        {
-            return Err(PqError::InvalidIdentity);
+    match (&request.identity, &request.signature) {
+        (Some(id), Some(sig)) => {
+            id.verify(expected_sender)?;
+            let vk = id.sig_vk()?;
+            let sig = DsaSignature::<MlDsa65>::try_from(sig.as_slice())
+                .map_err(|_| PqError::InvalidIdentity)?;
+            if vk
+                .verify(
+                    &signed_message(&request.kem, &request.nonce, &request.ciphertext),
+                    &sig,
+                )
+                .is_err()
+            {
+                return Err(PqError::InvalidIdentity);
+            }
         }
+        (None, None) => {}
+        _ => return Err(PqError::InvalidIdentity),
     }
 
     let (kem_bytes, x_bytes) = request.kem.split_at(MLKEM_CT_LEN);
@@ -403,12 +411,6 @@ fn signed_message(kem: &[u8], nonce: &[u8], ciphertext: &[u8]) -> Vec<u8> {
     m.extend_from_slice(nonce);
     m.extend_from_slice(ciphertext);
     m
-}
-
-fn id_peer_id(id: &PqIdentity) -> Result<PeerId, PqError> {
-    let ed = identity::ed25519::PublicKey::try_from_bytes(&id.ed25519_pub)
-        .map_err(|_| PqError::InvalidIdentity)?;
-    Ok(identity::PublicKey::from(ed).to_peer_id())
 }
 
 fn combine(kem_ss: &[u8], x_ss: &[u8]) -> [u8; 32] {
@@ -508,6 +510,7 @@ mod tests {
 
         let requester = PqKeys::generate();
         let requester_id_kp = id_keypair();
+        let requester_peer = requester_id_kp.public().to_peer_id();
 
         let out = seal_request(
             &requester,
@@ -518,7 +521,7 @@ mod tests {
         )
         .unwrap();
 
-        let inbound = open_request(&responder, &out.request).unwrap();
+        let inbound = open_request(&responder, &requester_peer, &out.request).unwrap();
         assert_eq!(inbound.plaintext, b"hello pq");
 
         let resp = inbound.seal_response(b"world pq").unwrap();
@@ -534,6 +537,7 @@ mod tests {
 
         let requester = PqKeys::generate();
         let requester_id_kp = id_keypair();
+        let requester_peer = requester_id_kp.public().to_peer_id();
 
         let out = seal_request(
             &requester,
@@ -546,8 +550,65 @@ mod tests {
         assert!(out.request.signature.is_some());
         assert!(out.request.identity.is_some());
 
-        let inbound = open_request(&responder, &out.request).unwrap();
+        let inbound = open_request(&responder, &requester_peer, &out.request).unwrap();
         assert_eq!(inbound.plaintext, b"signed");
+    }
+
+    #[test]
+    fn signed_request_is_bound_to_transport_peer() {
+        let responder = PqKeys::generate();
+        let responder_id_kp = id_keypair();
+        let responder_identity = responder.identity(&responder_id_kp).unwrap();
+
+        let requester = PqKeys::generate();
+        let requester_id_kp = id_keypair();
+        let out = seal_request(
+            &requester,
+            &responder_identity,
+            b"bound",
+            true,
+            &requester_id_kp,
+        )
+        .unwrap();
+
+        let wrong_peer = id_keypair().public().to_peer_id();
+        assert_eq!(
+            open_request(&responder, &wrong_peer, &out.request).err(),
+            Some(PqError::InvalidIdentity)
+        );
+    }
+
+    #[test]
+    fn partial_identity_fields_are_rejected() {
+        let responder = PqKeys::generate();
+        let responder_id_kp = id_keypair();
+        let responder_identity = responder.identity(&responder_id_kp).unwrap();
+
+        let requester = PqKeys::generate();
+        let requester_id_kp = id_keypair();
+        let requester_peer = requester_id_kp.public().to_peer_id();
+        let out = seal_request(
+            &requester,
+            &responder_identity,
+            b"partial",
+            true,
+            &requester_id_kp,
+        )
+        .unwrap();
+
+        let mut without_signature = out.request.clone();
+        without_signature.signature = None;
+        assert_eq!(
+            open_request(&responder, &requester_peer, &without_signature).err(),
+            Some(PqError::InvalidIdentity)
+        );
+
+        let mut without_identity = out.request;
+        without_identity.identity = None;
+        assert_eq!(
+            open_request(&responder, &requester_peer, &without_identity).err(),
+            Some(PqError::InvalidIdentity)
+        );
     }
 
     #[test]
@@ -558,6 +619,7 @@ mod tests {
 
         let requester = PqKeys::generate();
         let requester_id_kp = id_keypair();
+        let requester_peer = requester_id_kp.public().to_peer_id();
         let mut out = seal_request(
             &requester,
             &responder_identity,
@@ -569,7 +631,7 @@ mod tests {
 
         out.request.ciphertext[0] ^= 0xff;
         assert!(matches!(
-            open_request(&responder, &out.request),
+            open_request(&responder, &requester_peer, &out.request),
             Err(PqError::Crypto)
         ));
     }

@@ -249,14 +249,15 @@ u32_be(len) || cbor(message)      # len <= 16 MiB
 - **算法**：ML-KEM-768+ X25519 混合 KEM、ChaCha20-Poly1305 AEAD、可选 ML-DSA-65（FIPS 204）签名。
 - **协议**：`/oahd/service_req/2.0.0`与 `/oahd/pq_identity/1.0.0`，仅在启用时注册。
 - **流程**：请求方 encaps 到响应方 KEM 公钥，响应方 decaps 后双方共享同一密钥，响应复用该密钥加密——无需第二次 KEM，也不在请求里携带请求方公钥。
-- **回退**：对端不支持 PQ 时回退明文 `/oahd/service_req/1.0.0`；`crypto.pq_required = true` 则拒绝非 PQ 对端。
+- **回退**：仅当已确认对端不支持 PQ 时回退明文 `/oahd/service_req/1.0.0`；对端能力未知或身份尚未就绪时返回可重试错误，不会静默降级。`crypto.pq_required = true` 则拒绝非 PQ 对端。
+- **身份**：`pq_identity_enabled` 要求入站请求携带 ML-DSA 签名，并把签名身份绑定到传输层 PeerId；该选项需要 `pq_transport_enabled = true`。
 - **密钥**：`keypair.pq.bin`。
 - `@pq_status` → 查看启用状态。
 
 | 配置 | 含义 |
 |---|---|
 | `crypto.pq_transport_enabled` | 启用加密服务调用 |
-| `crypto.pq_identity_enabled` | 附带并校验 ML-DSA 签名 |
+| `crypto.pq_identity_enabled` | 要求并校验 ML-DSA 签名（需启用 transport） |
 | `crypto.pq_required` | 强制 PQ，拒绝非 PQ 对端 |
 
 ## 鉴权

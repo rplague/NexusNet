@@ -127,6 +127,12 @@ impl NodeConfig {
                 "crypto.pq_required = true 需要 crypto.pq_transport_enabled = true".to_string(),
             );
         }
+        if self.crypto.pq_identity_enabled && !self.crypto.pq_transport_enabled {
+            return Err(
+                "crypto.pq_identity_enabled = true 需要 crypto.pq_transport_enabled = true"
+                    .to_string(),
+            );
+        }
         Ok(())
     }
 
@@ -844,6 +850,13 @@ mod tests {
     fn rejects_pq_required_without_transport() {
         let mut config = NodeConfig::default();
         config.crypto.pq_required = true;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_pq_identity_without_transport() {
+        let mut config = NodeConfig::default();
+        config.crypto.pq_identity_enabled = true;
         assert!(config.validate().is_err());
     }
 

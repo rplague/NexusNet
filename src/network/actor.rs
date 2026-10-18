@@ -449,6 +449,47 @@ struct PqOutboundPending {
     out: pq::PqOutbound,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SendSecurity {
+    Pq,
+    Plaintext,
+    WaitIdentity,
+    MissingKeys,
+    MissingTransport,
+    Unsupported,
+}
+
+fn send_security(
+    transport: bool,
+    required: bool,
+    keys_available: bool,
+    identity_available: bool,
+    supports_pq: Option<bool>,
+) -> SendSecurity {
+    if required && !transport {
+        return SendSecurity::MissingTransport;
+    }
+    if required && !identity_available {
+        return match supports_pq {
+            Some(false) => SendSecurity::Unsupported,
+            _ => SendSecurity::WaitIdentity,
+        };
+    }
+    if !transport {
+        return SendSecurity::Plaintext;
+    }
+    if !keys_available {
+        return SendSecurity::MissingKeys;
+    }
+    if identity_available {
+        return SendSecurity::Pq;
+    }
+    match supports_pq {
+        Some(true) | None => SendSecurity::WaitIdentity,
+        Some(false) => SendSecurity::Plaintext,
+    }
+}
+
 pub(crate) struct SwarmActor {
     swarm: Swarm<NetBehaviour>,
     config: ConfigHandle,
@@ -876,7 +917,7 @@ impl SwarmActor {
                             .emit();
                         return;
                     };
-                    let inbound = match pq::open_request(keys, &request) {
+                    let inbound = match pq::open_request(keys, &peer, &request) {
                         Ok(v) => v,
                         Err(e) => {
                             LogStruct::new(LogLevel::Warning, "PQ 请求解密失败", e.to_string())
@@ -884,6 +925,21 @@ impl SwarmActor {
                             return;
                         }
                     };
+                    if self.config.pq_identity_enabled() && request.identity.is_none() {
+                        LogStruct::new(LogLevel::Warning, "PQ 请求缺少签名", peer.to_string())
+                            .emit();
+                        if let Ok(response) =
+                            inbound.seal_response(&encode_response(&service_protocol::Response {
+                                success: false,
+                                data: b"PQ signature required".to_vec(),
+                            }))
+                            && let Some(behaviour) =
+                                self.swarm.behaviour_mut().service_req_pq.as_mut()
+                        {
+                            let _ = behaviour.send_response(channel, response);
+                        }
+                        return;
+                    }
                     let Some(req) = decode_request(&inbound.plaintext) else {
                         LogStruct::new(LogLevel::Warning, "PQ 请求格式错误", "").emit();
                         if let Ok(response) =
@@ -1133,17 +1189,48 @@ impl SwarmActor {
                 request,
                 resp,
             } => {
-                // pq_required: reject non-PQ peers.
-                if self.config.pq_required() && !self.pq_identities.contains_key(&peer) {
-                    let _ = resp.send(Err(NetworkError::Request(
-                        "PQ required but peer is not PQ-capable".into(),
-                    )));
-                    return true;
-                }
+                let pq_protocol = StreamProtocol::new(pq::SERVICE_REQ_PQ_PROTOCOL);
+                let supports_pq = self
+                    .peer_protocols
+                    .get(&peer)
+                    .map(|protocols| protocols.contains(&pq_protocol));
+                let security = send_security(
+                    self.config.pq_transport_enabled(),
+                    self.config.pq_required(),
+                    self.pq_keys.is_some(),
+                    self.pq_identities.contains_key(&peer),
+                    supports_pq,
+                );
 
-                let use_pq = self.config.pq_transport_enabled()
-                    && self.pq_keys.is_some()
-                    && self.pq_identities.contains_key(&peer);
+                let use_pq = match security {
+                    SendSecurity::Pq => true,
+                    SendSecurity::Plaintext => false,
+                    SendSecurity::WaitIdentity => {
+                        self.maybe_fetch_pq_identity(peer);
+                        let _ = resp.send(Err(NetworkError::Request(
+                            "PQ identity not ready; retry after Identify".into(),
+                        )));
+                        return true;
+                    }
+                    SendSecurity::MissingKeys => {
+                        let _ = resp.send(Err(NetworkError::Request(
+                            "PQ transport enabled but local PQ keys are unavailable".into(),
+                        )));
+                        return true;
+                    }
+                    SendSecurity::MissingTransport => {
+                        let _ = resp.send(Err(NetworkError::Request(
+                            "PQ required but transport is disabled".into(),
+                        )));
+                        return true;
+                    }
+                    SendSecurity::Unsupported => {
+                        let _ = resp.send(Err(NetworkError::Request(
+                            "PQ required but peer is not PQ-capable".into(),
+                        )));
+                        return true;
+                    }
+                };
 
                 if use_pq {
                     let recipient = self.pq_identities.get(&peer).cloned().unwrap();
@@ -1433,5 +1520,42 @@ mod tests {
             cache_candidates: Default::default(),
         };
         assert_eq!(cacheable_record(&Ok(ok), true), None);
+    }
+
+    #[test]
+    fn send_security_never_downgrades_silently() {
+        use SendSecurity::*;
+
+        assert_eq!(send_security(true, false, true, true, Some(true)), Pq);
+        assert_eq!(
+            send_security(true, false, true, false, Some(true)),
+            WaitIdentity
+        );
+        assert_eq!(send_security(true, false, true, false, None), WaitIdentity);
+        assert_eq!(
+            send_security(true, false, true, false, Some(false)),
+            Plaintext
+        );
+        assert_eq!(
+            send_security(true, false, false, false, Some(true)),
+            MissingKeys
+        );
+        assert_eq!(
+            send_security(false, false, true, false, Some(false)),
+            Plaintext
+        );
+        assert_eq!(
+            send_security(true, true, true, false, Some(false)),
+            Unsupported
+        );
+        assert_eq!(
+            send_security(true, true, true, false, Some(true)),
+            WaitIdentity
+        );
+        assert_eq!(
+            send_security(false, true, true, false, Some(true)),
+            MissingTransport
+        );
+        assert_eq!(send_security(true, true, true, true, Some(true)), Pq);
     }
 }
