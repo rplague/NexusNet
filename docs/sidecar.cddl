@@ -43,14 +43,14 @@ query-key           = { t: "query_key",           id: uuid, key: tstr }
 add-key             = {
   t: "add_key",
   id: uuid,
-  key: tstr,
+  key: tstr,            ; 仅 /oahd/service/<name> 或 /oahd/auth/...
   ? value: bstr,
   ? providing: bool,
 }
 remove-key          = {
   t: "remove_key",
   id: uuid,
-  key: tstr,
+  key: tstr,            ; 仅 /oahd/service/<name> 或 /oahd/auth/...
   ? providing: bool,    ; 默认 true：停止作为 provider 宣告（本地操作）
   ? record: bool,       ; 默认 false：删除本地存储的 value 记录（仅 publisher）
 }

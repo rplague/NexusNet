@@ -78,6 +78,8 @@ add_key { t:"add_key", id:<uuid>, key:"/oahd/auth/<net_hash>/service", value:<bs
 ```
 
    **顺序**：先发各服务白名单，再发索引（索引引用其 hash）。
+   控制层仅允许写 `/oahd/auth/...` 与 `/oahd/service/<name>`；`/oahd/service/types` 和
+   `/oahd/bootstrap` 由节点维护，后端不可写。
 4. 在 `expires_at` 之前**重发续期**；否则记录过期后节点 fail-closed，拒绝相关服务。
 
 > 本地后端协议见 README「后端协议（TCP，v2）」；规范见 `docs/sidecar.cddl`。

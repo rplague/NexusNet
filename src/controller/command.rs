@@ -60,6 +60,13 @@ fn response_payload(resp: service_protocol::Response) -> Result<Vec<u8>, String>
     }
 }
 
+fn is_writable_key(key: &str) -> bool {
+    if key == "/oahd/service/types" || key == "/oahd/bootstrap" {
+        return false;
+    }
+    key.starts_with("/oahd/auth/") || key.starts_with("/oahd/service/")
+}
+
 impl NodeController {
     /// Handle a message arriving from the ServiceDispatcher.
     pub(super) async fn handle_controller_message(&mut self, msg: ToController) {
@@ -254,6 +261,9 @@ impl NodeController {
         if key.is_empty() {
             return Err("missing 'key' field".to_string());
         }
+        if !is_writable_key(&key) {
+            return Err("key namespace not allowed".to_string());
+        }
         let ack = || to_cbor(&serde_json::json!({"success": true, "key": key.clone()}));
         match value {
             Some(bytes) => {
@@ -288,6 +298,9 @@ impl NodeController {
     ) -> Result<Vec<u8>, String> {
         if key.is_empty() {
             return Err("missing 'key' field".to_string());
+        }
+        if !is_writable_key(&key) {
+            return Err("key namespace not allowed".to_string());
         }
         if !providing && !record {
             return Err("at least one of 'providing' or 'record' is required".to_string());
@@ -451,5 +464,19 @@ mod tests {
             response_payload(resp),
             Err("remote service failed".to_string())
         );
+    }
+
+    #[test]
+    fn writable_key_allows_service_and_auth_namespaces() {
+        assert!(is_writable_key("/oahd/service/cmd"));
+        assert!(is_writable_key("/oahd/auth/abc/service"));
+    }
+
+    #[test]
+    fn writable_key_rejects_reserved_and_foreign_keys() {
+        assert!(!is_writable_key("/oahd/service/types"));
+        assert!(!is_writable_key("/oahd/bootstrap"));
+        assert!(!is_writable_key("/oahd/other"));
+        assert!(!is_writable_key("/custom/key"));
     }
 }
