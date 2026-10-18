@@ -55,6 +55,16 @@ fn resolve_state(config: &ConfigHandle) -> AuthState {
     }
 }
 
+fn same_trust_domain(a: &AuthState, b: &AuthState) -> bool {
+    match (a, b) {
+        (AuthState::Active(a), AuthState::Active(b)) => {
+            a.net_hash == b.net_hash && a.authority.to_bytes() == b.authority.to_bytes()
+        }
+        (AuthState::Disabled, AuthState::Disabled) => true,
+        _ => false,
+    }
+}
+
 /// Verifies inbound service requests against the DHT-published trust records.
 pub struct AuthGate {
     config: ConfigHandle,
@@ -77,13 +87,17 @@ impl AuthGate {
         }
     }
 
-    /// Recompute the state from config and drop version history (on reload).
+    /// Recompute the state from config. Version history survives a reload
+    /// unless the trust domain (network name or authority key) changed.
     pub fn reload(&mut self) {
-        self.state = resolve_state(&self.config);
+        let next = resolve_state(&self.config);
+        if !same_trust_domain(&self.state, &next) {
+            self.versions.clear();
+        }
+        self.state = next;
         if let AuthState::Misconfigured(reason) = &self.state {
             LogStruct::new(LogLevel::Warning, "鉴权网络配置错误", reason.clone()).emit();
         }
-        self.versions.clear();
     }
 
     /// Authorization: fetch records from the DHT on demand and verify signatures
@@ -166,5 +180,54 @@ impl AuthGate {
 
     pub fn whitelist_version(&self, service: &str) -> Option<u64> {
         self.versions.whitelist_version(service)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD;
+    use libp2p::identity;
+
+    fn net(name: &str, keypair: &identity::Keypair) -> AuthNetwork {
+        let public = keypair.public().try_into_ed25519().unwrap().to_bytes();
+        AuthNetwork::new(name, &STANDARD.encode(public)).unwrap()
+    }
+
+    #[test]
+    fn same_network_and_authority_keeps_versions() {
+        let keypair = identity::Keypair::generate_ed25519();
+        let network = net("myorg", &keypair);
+        assert!(same_trust_domain(
+            &AuthState::Active(network.clone()),
+            &AuthState::Active(network)
+        ));
+    }
+
+    #[test]
+    fn changed_network_or_authority_resets_versions() {
+        let keypair = identity::Keypair::generate_ed25519();
+        let other_keypair = identity::Keypair::generate_ed25519();
+        assert!(!same_trust_domain(
+            &AuthState::Active(net("myorg", &keypair)),
+            &AuthState::Active(net("other", &keypair))
+        ));
+        assert!(!same_trust_domain(
+            &AuthState::Active(net("myorg", &keypair)),
+            &AuthState::Active(net("myorg", &other_keypair))
+        ));
+    }
+
+    #[test]
+    fn disabled_state_is_stable() {
+        assert!(same_trust_domain(
+            &AuthState::Disabled,
+            &AuthState::Disabled
+        ));
+        assert!(!same_trust_domain(
+            &AuthState::Disabled,
+            &AuthState::Misconfigured("missing".to_string())
+        ));
     }
 }
