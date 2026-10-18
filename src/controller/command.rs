@@ -50,6 +50,16 @@ fn to_cbor<T: serde::Serialize>(value: &T) -> Vec<u8> {
     buf
 }
 
+fn response_payload(resp: service_protocol::Response) -> Result<Vec<u8>, String> {
+    if resp.success {
+        Ok(resp.data)
+    } else if resp.data.is_empty() {
+        Err("remote service failed".to_string())
+    } else {
+        Err(String::from_utf8_lossy(&resp.data).into_owned())
+    }
+}
+
 impl NodeController {
     /// Handle a message arriving from the ServiceDispatcher.
     pub(super) async fn handle_controller_message(&mut self, msg: ToController) {
@@ -358,11 +368,12 @@ impl NodeController {
             .or_else(|| providers.first().copied())
             .expect("providers is non-empty");
         let request = service_protocol::Request { service, payload };
-        self.swarm
+        let response = self
+            .swarm
             .send_request(&best, request)
             .await
-            .map(|resp| resp.data)
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        response_payload(response)
     }
 
     async fn cmd_service_request_to(
@@ -375,11 +386,12 @@ impl NodeController {
             .parse::<PeerId>()
             .map_err(|e| format!("invalid peer id: {e}"))?;
         let request = service_protocol::Request { service, payload };
-        self.swarm
+        let response = self
+            .swarm
             .send_request(&peer_id, request)
             .await
-            .map(|resp| resp.data)
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        response_payload(response)
     }
 
     /// Announce providing a key; returns an error string.
@@ -406,5 +418,38 @@ mod tests {
         let bytes = to_cbor(&result);
         let decoded: WhoamiResult = ciborium::de::from_reader(bytes.as_slice()).unwrap();
         assert_eq!(decoded, result);
+    }
+
+    #[test]
+    fn response_payload_accepts_success() {
+        let resp = service_protocol::Response {
+            success: true,
+            data: b"ok".to_vec(),
+        };
+        assert_eq!(response_payload(resp), Ok(b"ok".to_vec()));
+    }
+
+    #[test]
+    fn response_payload_maps_remote_failure_to_err() {
+        let resp = service_protocol::Response {
+            success: false,
+            data: b"unauthorized: nope".to_vec(),
+        };
+        assert_eq!(
+            response_payload(resp),
+            Err("unauthorized: nope".to_string())
+        );
+    }
+
+    #[test]
+    fn response_payload_handles_empty_remote_failure() {
+        let resp = service_protocol::Response {
+            success: false,
+            data: Vec::new(),
+        };
+        assert_eq!(
+            response_payload(resp),
+            Err("remote service failed".to_string())
+        );
     }
 }
