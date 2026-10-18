@@ -32,8 +32,22 @@ const WITHDRAW_GRACE: Duration = Duration::from_secs(3);
 /// Key of the global, append-only service-type index.
 const TYPES_KEY: &[u8] = b"/oahd/service/types";
 
+/// Upper bound on the locally tracked service-type union.
+const MAX_TYPES: usize = 4096;
+
 fn types_key() -> kad::RecordKey {
     kad::RecordKey::new(&TYPES_KEY)
+}
+
+fn merge_type_set(known: &mut BTreeSet<String>, incoming: impl IntoIterator<Item = String>) {
+    for name in incoming {
+        if known.len() >= MAX_TYPES {
+            break;
+        }
+        if auth::is_valid_service_name(&name) {
+            known.insert(name);
+        }
+    }
 }
 
 /// Manages the DHT lifecycle of the node's local service announcements and the
@@ -146,8 +160,9 @@ impl ServiceRegistry {
     /// from the DHT peers. Used to serve `list_services`.
     pub async fn list_types(&mut self) -> Vec<String> {
         let network_types = self.read_types_from_network().await;
-        self.known_types.extend(network_types);
-        self.known_types.extend(self.announced.iter().cloned());
+        merge_type_set(&mut self.known_types, network_types);
+        let announced: Vec<String> = self.announced.iter().cloned().collect();
+        merge_type_set(&mut self.known_types, announced);
         self.known_types.iter().cloned().collect()
     }
 
@@ -217,10 +232,11 @@ impl ServiceRegistry {
         let interval = Duration::from_secs(self.config.dispatcher_types_sync_interval() as u64);
         self.next_types_sync = Some(Instant::now() + interval);
 
-        let network_set: BTreeSet<String> =
-            self.read_types_from_network().await.into_iter().collect();
-        self.known_types.extend(network_set.iter().cloned());
-        self.known_types.extend(self.announced.iter().cloned());
+        let network_types = self.read_types_from_network().await;
+        let network_set: BTreeSet<String> = network_types.iter().cloned().collect();
+        merge_type_set(&mut self.known_types, network_types);
+        let announced: Vec<String> = self.announced.iter().cloned().collect();
+        merge_type_set(&mut self.known_types, announced);
 
         if self.known_types.is_empty() {
             // Never write an empty index: it would clobber types published by
@@ -248,7 +264,18 @@ impl ServiceRegistry {
     async fn read_types_from_network(&self) -> Vec<String> {
         match self.swarm.get_record_network(types_key()).await {
             Ok(kad::GetRecordOk::FoundRecord(peer_record)) => {
-                serde_json::from_slice::<Vec<String>>(&peer_record.record.value).unwrap_or_default()
+                match serde_json::from_slice::<Vec<String>>(&peer_record.record.value) {
+                    Ok(types) => types
+                        .into_iter()
+                        .filter(|name| auth::is_valid_service_name(name))
+                        .take(MAX_TYPES)
+                        .collect(),
+                    Err(e) => {
+                        LogStruct::new(LogLevel::Warning, "服务类型索引解析失败", e.to_string())
+                            .emit();
+                        Vec::new()
+                    }
+                }
             }
             _ => Vec::new(),
         }
@@ -270,5 +297,27 @@ mod tests {
             known.iter().cloned().collect::<Vec<_>>(),
             vec!["a".to_string(), "b".to_string(), "c".to_string()]
         );
+    }
+
+    #[test]
+    fn merge_type_set_filters_invalid_names() {
+        let mut known = BTreeSet::new();
+        merge_type_set(
+            &mut known,
+            vec![
+                "cmd".to_string(),
+                "bad/name".to_string(),
+                "service".to_string(),
+            ],
+        );
+        assert_eq!(known, BTreeSet::from(["cmd".to_string()]));
+    }
+
+    #[test]
+    fn merge_type_set_caps_the_union() {
+        let mut known = BTreeSet::new();
+        let incoming = (0..MAX_TYPES + 10).map(|i| format!("svc{i}"));
+        merge_type_set(&mut known, incoming);
+        assert_eq!(known.len(), MAX_TYPES);
     }
 }
