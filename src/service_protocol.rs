@@ -23,6 +23,9 @@ use std::time::Duration;
 /// Protocol ID.
 pub const SERVICE_REQ_PROTOCOL: &str = "/oahd/service_req/1.0.0";
 
+/// Maximum number of providers tried for one service request.
+pub const MAX_PROVIDER_ATTEMPTS: usize = 3;
+
 /// Request structure.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Request {
