@@ -15,7 +15,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::time::Duration;
 
 use libp2p::{PeerId, ping};
@@ -70,20 +70,13 @@ impl PeerTracker {
         }
     }
 
-    /// Rank providers by known RTT, then keep unknown peers in input order.
-    pub fn ranked_peers(&self, providers: &[PeerId]) -> Vec<PeerId> {
-        let mut ranked: Vec<PeerId> = Vec::new();
-        let mut seen: HashSet<PeerId> = HashSet::new();
-        for peer in providers {
-            if seen.insert(*peer) {
-                ranked.push(*peer);
-            }
-        }
-        ranked.sort_by_key(|peer| match self.rtts.get(peer) {
-            Some(rtt) => (0u8, *rtt),
-            None => (1u8, Duration::ZERO),
-        });
-        ranked
+    /// Pick the provider with the lowest known RTT.
+    pub fn best_peer(&self, providers: &[PeerId]) -> Option<PeerId> {
+        providers
+            .iter()
+            .filter_map(|p| self.rtts.get(p).map(|rtt| (p, rtt)))
+            .min_by_key(|(_, rtt)| *rtt)
+            .map(|(p, _)| *p)
     }
 }
 
@@ -96,45 +89,20 @@ mod tests {
     }
 
     #[test]
-    fn ranked_peers_picks_lowest_rtt_first() {
+    fn best_peer_picks_lowest_rtt() {
         let mut tracker = PeerTracker::default();
         let a = PeerId::random();
         let b = PeerId::random();
         let c = PeerId::random();
         tracker.rtts.insert(a, rtt(50));
         tracker.rtts.insert(b, rtt(10));
-        assert_eq!(tracker.ranked_peers(&[a, b, c]), vec![b, a, c]);
+        // c is unknown and must be ignored.
+        assert_eq!(tracker.best_peer(&[a, b, c]), Some(b));
     }
 
     #[test]
-    fn ranked_peers_keeps_unknown_order() {
+    fn best_peer_none_when_all_unknown() {
         let tracker = PeerTracker::default();
-        let a = PeerId::random();
-        let b = PeerId::random();
-        assert_eq!(tracker.ranked_peers(&[a, b]), vec![a, b]);
-    }
-
-    #[test]
-    fn ranked_peers_orders_known_rtt_then_unknown() {
-        let mut tracker = PeerTracker::default();
-        let fast = PeerId::random();
-        let slow = PeerId::random();
-        let unknown_a = PeerId::random();
-        let unknown_b = PeerId::random();
-        tracker.rtts.insert(fast, rtt(10));
-        tracker.rtts.insert(slow, rtt(100));
-
-        assert_eq!(
-            tracker.ranked_peers(&[unknown_a, slow, unknown_b, fast]),
-            vec![fast, slow, unknown_a, unknown_b]
-        );
-    }
-
-    #[test]
-    fn ranked_peers_deduplicates() {
-        let mut tracker = PeerTracker::default();
-        let peer = PeerId::random();
-        tracker.rtts.insert(peer, rtt(10));
-        assert_eq!(tracker.ranked_peers(&[peer, peer]), vec![peer]);
+        assert_eq!(tracker.best_peer(&[PeerId::random()]), None);
     }
 }

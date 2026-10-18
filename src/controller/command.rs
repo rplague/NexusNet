@@ -372,31 +372,21 @@ impl NodeController {
             .get_providers(key)
             .await
             .map_err(|e| format!("{e:?}"))?;
-        let candidates: Vec<PeerId> = self
-            .peers
-            .ranked_peers(&providers)
-            .into_iter()
-            .filter(|peer| *peer != self.my_peer_id)
-            .collect();
-        if candidates.is_empty() {
+        if providers.is_empty() {
             return Err("No provider found".to_string());
         }
-
-        let mut last_error = None;
-        for peer in candidates
-            .into_iter()
-            .take(service_protocol::MAX_PROVIDER_ATTEMPTS)
-        {
-            let request = service_protocol::Request {
-                service: service.clone(),
-                payload: payload.clone(),
-            };
-            match self.swarm.send_request(&peer, request).await {
-                Ok(response) => return response_payload(response),
-                Err(e) => last_error = Some(format!("{peer}: {e}")),
-            }
-        }
-        Err(last_error.unwrap_or_else(|| "No provider found".to_string()))
+        let best = self
+            .peers
+            .best_peer(&providers)
+            .or_else(|| providers.first().copied())
+            .expect("providers is non-empty");
+        let request = service_protocol::Request { service, payload };
+        let response = self
+            .swarm
+            .send_request(&best, request)
+            .await
+            .map_err(|e| e.to_string())?;
+        response_payload(response)
     }
 
     async fn cmd_service_request_to(
