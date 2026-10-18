@@ -382,6 +382,19 @@ struct CachedRecord {
 /// Returns `None` once the query finalized and the result was sent via `resp`;
 /// `Some` means more events are needed (the pending entry is returned as-is).
 /// Non-`GetProviders` entries are returned as-is.
+fn cacheable_record(
+    result: &Result<kad::GetRecordOk, kad::GetRecordError>,
+    network_only: bool,
+) -> Option<Option<Vec<u8>>> {
+    match result {
+        Ok(kad::GetRecordOk::FoundRecord(peer_record)) => {
+            Some(Some(peer_record.record.value.clone()))
+        }
+        Ok(kad::GetRecordOk::FinishedWithNoAdditionalRecord { .. }) if !network_only => Some(None),
+        _ => None,
+    }
+}
+
 fn apply_get_providers(
     pending: KadPending,
     result: Result<kad::GetProvidersOk, kad::GetProvidersError>,
@@ -717,15 +730,7 @@ impl SwarmActor {
                     network_only,
                 }) = self.pending_kad.remove(&id)
                 {
-                    let value = match &result {
-                        Ok(kad::GetRecordOk::FoundRecord(peer_record)) => {
-                            Some(peer_record.record.value.clone())
-                        }
-                        _ => None,
-                    };
-                    // Never negative-cache a network-only miss: the local store
-                    // may still hold a valid copy for regular reads.
-                    if value.is_some() || !network_only {
+                    if let Some(value) = cacheable_record(&result, network_only) {
                         self.insert_cached(key, value);
                     }
                     let _ = resp.send(result.map_err(|e| NetworkError::Kad(format!("{e:?}"))));
@@ -1375,5 +1380,36 @@ mod tests {
         };
         assert!(apply_get_providers(pending, Err(err)).is_none());
         assert!(rx.try_recv().unwrap().is_err());
+    }
+
+    #[test]
+    fn cacheable_record_ignores_transport_errors() {
+        let key = kad::RecordKey::new(b"k");
+        let err = kad::GetRecordError::Timeout { key };
+        assert_eq!(cacheable_record(&Err(err), false), None);
+    }
+
+    #[test]
+    fn cacheable_record_positive_on_found() {
+        let key = kad::RecordKey::new(b"k");
+        let value = b"v".to_vec();
+        let ok = kad::GetRecordOk::FoundRecord(kad::PeerRecord {
+            peer: None,
+            record: kad::Record::new(key, value.clone()),
+        });
+        assert_eq!(cacheable_record(&Ok(ok), false), Some(Some(value)));
+    }
+
+    #[test]
+    fn cacheable_record_negative_only_on_regular_miss() {
+        let ok = kad::GetRecordOk::FinishedWithNoAdditionalRecord {
+            cache_candidates: Default::default(),
+        };
+        assert_eq!(cacheable_record(&Ok(ok), false), Some(None));
+
+        let ok = kad::GetRecordOk::FinishedWithNoAdditionalRecord {
+            cache_candidates: Default::default(),
+        };
+        assert_eq!(cacheable_record(&Ok(ok), true), None);
     }
 }
