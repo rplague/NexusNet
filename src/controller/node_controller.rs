@@ -140,15 +140,15 @@ impl NodeController {
                     self.forward_inbound(request_id, service, payload, response_tx);
                 }
                 Decision::AllowUnprotected => {
-                    if self.config.set_service_require_auth(&service, false) {
-                        self.config.save_to_default();
-                        LogStruct::new(
-                            LogLevel::Warning,
-                            "鉴权网络同步",
-                            format!("{}在网络中已经无需鉴权，已经进行网络同步", service),
-                        )
-                        .emit();
-                    }
+                    LogStruct::new(
+                        LogLevel::Warning,
+                        "鉴权网络同步",
+                        format!(
+                            "{} 不在鉴权索引中，本次放行；本地 require_auth 保持不变",
+                            service
+                        ),
+                    )
+                    .emit();
                     self.forward_inbound(request_id, service, payload, response_tx);
                 }
                 Decision::Deny(reason) => {

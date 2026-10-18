@@ -90,7 +90,7 @@ add_key { t:"add_key", id:<uuid>, key:"/oahd/auth/<net_hash>/service", value:<bs
 2. 若该服务本地 `require_auth == false` → 放行。
 3. 通过本地记录缓存读取索引（未命中时按需查询 DHT，结果缓存 60 秒）：
    - 缺失/过期 → **拒绝**。
-   - 服务不在索引 → **放行**，并自动将本地该服务 `require_auth` 置为 `false`（「DHT 为准」的网络同步），记 Warning。
+   - 服务不在索引 → 本次**放行**并记 Warning；不修改本地 `require_auth`，索引恢复后自动重新生效。
 4. 通过本地记录缓存读取该服务白名单：
    - 缺失/不新鲜 → **拒绝**。
    - `peer ∈ members` → 放行，否则 **拒绝**。

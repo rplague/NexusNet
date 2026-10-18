@@ -270,7 +270,7 @@ u32_be(len) || cbor(message)      # len <= 16 MiB
   值为 COSE_Sign1；`net_hash = base64url_nopad(SHA-256(network))`。
 - **服务开关**：`services.dispatcher.local_services[].require_auth`。
 - **判定**：鉴权关闭或服务未要求鉴权 → 放行；索引/白名单缺失、过期、验签失败 → 拒绝；
-  服务不在索引 → 放行并自动把本地 `require_auth` 置为 `false`（网络同步）。
+  服务不在索引 → 本次放行并记录 Warning，不修改本地 `require_auth`；索引恢复后自动重新生效。
 - **边车发布**：签名记录经本地后端控制消息 `add_key { key, value }` 发布（`value` 为 `bstr`，二进制安全）；
   在 `expires_at` 前重发续期。
 - **状态查询**：`auth_status`。

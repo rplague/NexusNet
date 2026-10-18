@@ -718,26 +718,6 @@ impl ConfigHandle {
         cfg.network.ipv4_address = address;
     }
 
-    /// Set whether a local service requires authentication; returns true if it
-    /// was found and actually changed.
-    pub fn set_service_require_auth(&self, name: &str, require_auth: bool) -> bool {
-        let mut cfg = self.write();
-        match cfg
-            .services
-            .dispatcher
-            .local_services
-            .iter_mut()
-            .find(|s| s.name == name)
-        {
-            Some(svc) => {
-                let changed = svc.require_auth != require_auth;
-                svc.require_auth = require_auth;
-                changed
-            }
-            None => false,
-        }
-    }
-
     /// Replace the entire `NodeConfig`.
     pub fn replace_config(&self, new_config: NodeConfig) {
         *self.write() = new_config;

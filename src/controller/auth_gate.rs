@@ -35,7 +35,7 @@ enum AuthState {
 /// Authorization verdict for a single inbound request.
 pub enum Decision {
     Allow,
-    /// Service not in the auth index: allow, and sync the local auth requirement off.
+    /// Service not in the auth index: allow this request without changing local config.
     AllowUnprotected,
     Deny(String),
 }
