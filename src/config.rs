@@ -314,8 +314,6 @@ pub struct DispatcherConfig {
     pub enabled: bool,
     #[serde(default = "default_query_timeout_seconds")]
     pub query_timeout_secs: u32,
-    #[serde(default = "default_record_ttl_seconds")]
-    pub record_ttl_secs: u32,
     /// How often to reconcile the global service-type index with the DHT.
     #[serde(default = "default_types_sync_seconds")]
     pub types_sync_secs: u32,
@@ -328,7 +326,6 @@ impl Default for DispatcherConfig {
         DispatcherConfig {
             enabled: bool_true(),
             query_timeout_secs: default_query_timeout_seconds(),
-            record_ttl_secs: default_record_ttl_seconds(),
             types_sync_secs: default_types_sync_seconds(),
             local_services: vec![],
         }
