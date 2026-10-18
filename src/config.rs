@@ -77,6 +77,59 @@ pub struct NodeConfig {
 }
 
 impl NodeConfig {
+    fn validate(&self) -> Result<(), String> {
+        if self.network.port > u16::MAX as u32 {
+            return Err(format!(
+                "network.port 超出范围: {} (最大 {})",
+                self.network.port,
+                u16::MAX
+            ));
+        }
+        if self.services.ping.enabled {
+            if self.services.ping.interval_secs == 0 {
+                return Err("services.ping.interval_secs 必须大于 0".to_string());
+            }
+            if self.services.ping.with_timeout == 0 {
+                return Err("services.ping.with_timeout 必须大于 0".to_string());
+            }
+        }
+        if self.services.kademlia.enabled {
+            if self.services.kademlia.record_ttl_seconds == 0 {
+                return Err("services.kademlia.record_ttl_seconds 必须大于 0".to_string());
+            }
+            if self.services.kademlia.query_timeout_seconds == 0 {
+                return Err("services.kademlia.query_timeout_seconds 必须大于 0".to_string());
+            }
+        }
+        if self.services.dispatcher.enabled {
+            if self.services.dispatcher.query_timeout_secs == 0 {
+                return Err("services.dispatcher.query_timeout_secs 必须大于 0".to_string());
+            }
+            if self.services.dispatcher.types_sync_secs == 0 {
+                return Err("services.dispatcher.types_sync_secs 必须大于 0".to_string());
+            }
+        }
+        if self.services.relay.retry_interval_secs == 0 {
+            return Err("services.relay.retry_interval_secs 必须大于 0".to_string());
+        }
+        let mut names: Vec<&str> = Vec::new();
+        for service in &self.services.dispatcher.local_services {
+            if names.contains(&service.name.as_str()) {
+                return Err(format!("local_services 名称重复: {}", service.name));
+            }
+            if service.port == 0 {
+                return Err(format!("local_services.{} 端口不能为 0", service.name));
+            }
+            names.push(&service.name);
+        }
+        if self.crypto.pq_required && !self.crypto.pq_transport_enabled {
+            return Err(
+                "crypto.pq_required = true 需要 crypto.pq_transport_enabled = true".to_string(),
+            );
+        }
+        Ok(())
+    }
+
     /// Always returns a valid `NodeConfig`.
     fn from_toml_file(path: impl AsRef<Path>, create_if_missing: bool) -> NodeConfig {
         let path = path.as_ref();
@@ -94,8 +147,14 @@ impl NodeConfig {
 
         // Try to read and parse the file.
         match fs::read_to_string(path) {
-            Ok(content) => match toml::from_str(&content) {
-                Ok(config) => return config,
+            Ok(content) => match toml::from_str::<NodeConfig>(&content) {
+                Ok(config) => {
+                    if let Err(e) = config.validate() {
+                        LogStruct::new(LogLevel::Critical, "配置校验失败", e).emit();
+                        std::process::exit(1);
+                    }
+                    return config;
+                }
                 Err(e) => {
                     LogStruct::new(
                         LogLevel::Error,
@@ -767,5 +826,53 @@ mod tests {
         let handle = ConfigHandle::new(node);
         assert_eq!(handle.auth_network(), "none");
         assert!(handle.auth_required_services().is_empty());
+    }
+
+    #[test]
+    fn default_config_passes_validation() {
+        assert_eq!(NodeConfig::default().validate(), Ok(()));
+    }
+
+    #[test]
+    fn rejects_port_above_u16() {
+        let mut config = NodeConfig::default();
+        config.network.port = u16::MAX as u32 + 1;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_pq_required_without_transport() {
+        let mut config = NodeConfig::default();
+        config.crypto.pq_required = true;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_zero_kademlia_timeout() {
+        let mut config = NodeConfig::default();
+        config.services.kademlia.query_timeout_seconds = 0;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_duplicate_or_zero_port_local_services() {
+        let mut config = NodeConfig::default();
+        config.services.dispatcher.local_services = vec![
+            LocalServiceEntry {
+                name: "cmd".to_string(),
+                port: 5014,
+                require_auth: false,
+            },
+            LocalServiceEntry {
+                name: "cmd".to_string(),
+                port: 5015,
+                require_auth: false,
+            },
+        ];
+        assert!(config.validate().is_err());
+
+        config.services.dispatcher.local_services[1].name = "ocr".to_string();
+        config.services.dispatcher.local_services[1].port = 0;
+        assert!(config.validate().is_err());
     }
 }
