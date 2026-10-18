@@ -153,6 +153,7 @@ main()
   ├─ Network::start() → 构建 Swarm 并启动 SwarmActor
   ├─ 拨号所有 bootstrap 节点
   ├─ 启动 ServiceDispatcher（后台 tokio::spawn）
+  ├─ 启动鉴权 worker 池（4 个 worker，每个队列 32）
    └─ NodeController::run()（主协程）
         tokio::select! {
             event_rx          → 网络事件
@@ -266,6 +267,7 @@ u32_be(len) || cbor(message)      # len <= 16 MiB
 - **边车发布**：签名记录经本地后端控制消息 `add_key { key, value }` 发布（`value` 为 `bstr`，二进制安全）；
   在 `expires_at` 前重发续期。
 - **状态查询**：`auth_status`。
+- **并发**：鉴权查询在独立 worker 池中执行，不阻塞 NodeController；队列满时入站请求立即返回 `authentication overloaded`。
 
 完整记录格式、发布流程与验证算法见 [docs/auth.md](./docs/auth.md)。
 

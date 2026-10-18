@@ -32,18 +32,22 @@ use super::peer_tracker::PeerTracker;
 use super::relay_manager::RelayManager;
 use super::service_registry::ServiceRegistry;
 
+const AUTH_WORKERS: usize = 4;
+const AUTH_QUEUE_CAPACITY: usize = 32;
+
 /// Thin orchestration hub: routes between the Swarm actor, the
 /// `ServiceDispatcher`, the periodic ticks and the state-machine components.
 pub struct NodeController {
     pub(super) config: ConfigHandle,
     pub(super) my_peer_id: PeerId,
     pub(super) swarm: NetworkHandle,
-    to_dispatcher_tx: mpsc::UnboundedSender<InboundRequest>,
     to_controller_rx: mpsc::UnboundedReceiver<ToController>,
     event_rx: mpsc::UnboundedReceiver<NetworkEvent>,
     shutdown_rx: watch::Receiver<bool>,
     pub(super) peers: PeerTracker,
     pub(super) auth: AuthGate,
+    auth_txs: Vec<mpsc::Sender<AuthJob>>,
+    auth_next: usize,
     pub(super) services: ServiceRegistry,
     pub(super) relay: RelayManager,
     pub(super) bootstrap: BootstrapDiscovery,
@@ -66,6 +70,17 @@ impl NodeController {
 
         let peers = PeerTracker::new(my_peer_id);
         let auth = AuthGate::new(config.clone(), swarm.clone());
+        let mut auth_txs = Vec::with_capacity(AUTH_WORKERS);
+        for _ in 0..AUTH_WORKERS {
+            let (tx, rx) = mpsc::channel(AUTH_QUEUE_CAPACITY);
+            auth_txs.push(tx);
+            tokio::spawn(auth_worker(
+                auth.clone(),
+                rx,
+                to_dispatcher_tx.clone(),
+                swarm.clone(),
+            ));
+        }
         let services = ServiceRegistry::new(config.clone(), swarm.clone());
         let relay = RelayManager::new(config.clone(), swarm.clone(), my_peer_id);
         let bootstrap = BootstrapDiscovery::new(config.clone(), swarm.clone());
@@ -74,12 +89,13 @@ impl NodeController {
             config,
             my_peer_id,
             swarm,
-            to_dispatcher_tx,
             to_controller_rx,
             event_rx,
             shutdown_rx,
             peers,
             auth,
+            auth_txs,
+            auth_next: 0,
             services,
             relay,
             bootstrap,
@@ -135,35 +151,7 @@ impl NodeController {
                 service,
                 payload,
                 response_tx,
-            } => match self.auth.authorize(&peer, &service).await {
-                Decision::Allow => {
-                    self.forward_inbound(request_id, service, payload, response_tx);
-                }
-                Decision::AllowUnprotected => {
-                    LogStruct::new(
-                        LogLevel::Warning,
-                        "鉴权网络同步",
-                        format!(
-                            "{} 不在鉴权索引中，本次放行；本地 require_auth 保持不变",
-                            service
-                        ),
-                    )
-                    .emit();
-                    self.forward_inbound(request_id, service, payload, response_tx);
-                }
-                Decision::Deny(reason) => {
-                    LogStruct::new(
-                        LogLevel::Warning,
-                        "鉴权拒绝",
-                        format!("{} -> {}: {}", peer, service, reason),
-                    )
-                    .emit();
-                    let _ = response_tx.send(Ok(service_protocol::Response {
-                        success: false,
-                        data: format!("unauthorized: {}", reason).into_bytes(),
-                    }));
-                }
-            },
+            } => self.enqueue_auth(peer, request_id, service, payload, response_tx),
             NetworkEvent::Relay(event) => self.relay.on_relay_event(event),
             NetworkEvent::RelayClient(event) => self.relay.on_relay_client_event(event),
             NetworkEvent::ListenerClosed { addresses } => {
@@ -208,25 +196,119 @@ impl NodeController {
         }
     }
 
-    /// Forward an inbound request to the ServiceDispatcher.
-    fn forward_inbound(
-        &self,
+    fn enqueue_auth(
+        &mut self,
+        peer: PeerId,
         request_id: String,
         service: String,
         payload: Vec<u8>,
         response_tx: oneshot::Sender<Result<service_protocol::Response, String>>,
     ) {
-        let inbound = InboundRequest {
+        let job = AuthJob {
+            peer,
+            request_id,
             service,
             payload,
             response_tx,
         };
-        if let Err(e) = self.to_dispatcher_tx.send(inbound) {
-            let err_resp = service_protocol::Response {
-                success: false,
-                data: format!("service unavailable: {}", e).into_bytes(),
-            };
-            self.swarm.send_response(request_id, err_resp);
+        let index = self.auth_next % self.auth_txs.len();
+        self.auth_next = self.auth_next.wrapping_add(1);
+        match self.auth_txs[index].try_send(job) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(job)) => {
+                LogStruct::new(LogLevel::Warning, "鉴权队列已满", job.service.clone()).emit();
+                let _ = self.swarm.send_response(
+                    job.request_id,
+                    service_protocol::Response {
+                        success: false,
+                        data: b"authentication overloaded".to_vec(),
+                    },
+                );
+            }
+            Err(mpsc::error::TrySendError::Closed(job)) => {
+                LogStruct::new(LogLevel::Error, "鉴权队列不可用", job.service.clone()).emit();
+                let _ = self.swarm.send_response(
+                    job.request_id,
+                    service_protocol::Response {
+                        success: false,
+                        data: b"authentication unavailable".to_vec(),
+                    },
+                );
+            }
         }
+    }
+}
+
+struct AuthJob {
+    peer: PeerId,
+    request_id: String,
+    service: String,
+    payload: Vec<u8>,
+    response_tx: oneshot::Sender<Result<service_protocol::Response, String>>,
+}
+
+async fn auth_worker(
+    gate: AuthGate,
+    mut rx: mpsc::Receiver<AuthJob>,
+    to_dispatcher_tx: mpsc::UnboundedSender<InboundRequest>,
+    swarm: NetworkHandle,
+) {
+    while let Some(job) = rx.recv().await {
+        match gate.authorize(&job.peer, &job.service).await {
+            Decision::Allow => forward_auth_job(&to_dispatcher_tx, &swarm, job),
+            Decision::AllowUnprotected => {
+                LogStruct::new(
+                    LogLevel::Warning,
+                    "鉴权网络同步",
+                    format!(
+                        "{} 不在鉴权索引中，本次放行；本地 require_auth 保持不变",
+                        job.service
+                    ),
+                )
+                .emit();
+                forward_auth_job(&to_dispatcher_tx, &swarm, job);
+            }
+            Decision::Deny(reason) => {
+                LogStruct::new(
+                    LogLevel::Warning,
+                    "鉴权拒绝",
+                    format!("{} -> {}: {}", job.peer, job.service, reason),
+                )
+                .emit();
+                let _ = swarm.send_response(
+                    job.request_id,
+                    service_protocol::Response {
+                        success: false,
+                        data: format!("unauthorized: {}", reason).into_bytes(),
+                    },
+                );
+            }
+        }
+    }
+}
+
+fn forward_auth_job(
+    to_dispatcher_tx: &mpsc::UnboundedSender<InboundRequest>,
+    swarm: &NetworkHandle,
+    job: AuthJob,
+) {
+    let AuthJob {
+        request_id,
+        service,
+        payload,
+        response_tx,
+        ..
+    } = job;
+    let inbound = InboundRequest {
+        service,
+        payload,
+        response_tx,
+    };
+    if let Err(e) = to_dispatcher_tx.send(inbound) {
+        let err_resp = service_protocol::Response {
+            success: false,
+            data: format!("service unavailable: {}", e).into_bytes(),
+        };
+        let _ = swarm.send_response(request_id, err_resp);
     }
 }

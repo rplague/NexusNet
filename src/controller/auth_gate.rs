@@ -15,6 +15,8 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+use std::sync::{Arc, Mutex, RwLock};
+
 use libp2p::{PeerId, kad};
 
 use crate::auth::{self, AuthNetwork, AuthVersions};
@@ -23,6 +25,7 @@ use crate::log::{LogLevel, LogStruct};
 use crate::network::NetworkHandle;
 
 /// Node authentication runtime state.
+#[derive(Clone)]
 enum AuthState {
     /// `auth.network == "none"`: authentication disabled.
     Disabled,
@@ -66,11 +69,12 @@ fn same_trust_domain(a: &AuthState, b: &AuthState) -> bool {
 }
 
 /// Verifies inbound service requests against the DHT-published trust records.
+#[derive(Clone)]
 pub struct AuthGate {
     config: ConfigHandle,
     swarm: NetworkHandle,
-    state: AuthState,
-    versions: AuthVersions,
+    state: Arc<RwLock<AuthState>>,
+    versions: Arc<Mutex<AuthVersions>>,
 }
 
 impl AuthGate {
@@ -82,30 +86,39 @@ impl AuthGate {
         Self {
             config,
             swarm,
-            state,
-            versions: AuthVersions::default(),
+            state: Arc::new(RwLock::new(state)),
+            versions: Arc::new(Mutex::new(AuthVersions::default())),
         }
     }
 
     /// Recompute the state from config. Version history survives a reload
     /// unless the trust domain (network name or authority key) changed.
-    pub fn reload(&mut self) {
+    pub fn reload(&self) {
         let next = resolve_state(&self.config);
-        if !same_trust_domain(&self.state, &next) {
-            self.versions.clear();
+        let misconfigured = match &next {
+            AuthState::Misconfigured(reason) => Some(reason.clone()),
+            _ => None,
+        };
+        let mut state = self.state.write().expect("auth state poisoned");
+        if !same_trust_domain(&state, &next) {
+            self.versions
+                .lock()
+                .expect("auth versions poisoned")
+                .clear();
         }
-        self.state = next;
-        if let AuthState::Misconfigured(reason) = &self.state {
-            LogStruct::new(LogLevel::Warning, "鉴权网络配置错误", reason.clone()).emit();
+        *state = next;
+        drop(state);
+        if let Some(reason) = misconfigured {
+            LogStruct::new(LogLevel::Warning, "鉴权网络配置错误", reason).emit();
         }
     }
 
     /// Authorization: fetch records from the DHT on demand and verify signatures
-    /// (raw bytes are cached by the record cache).
-    ///
-    /// Blocking and inline: first/expired fetches wait on a DHT query.
-    pub async fn authorize(&mut self, peer: &PeerId, service: &str) -> Decision {
-        let net = match &self.state {
+    /// (raw bytes are cached by the record cache). Runs in the auth worker
+    /// pool; a cache miss waits on a DHT query without blocking the controller.
+    pub async fn authorize(&self, peer: &PeerId, service: &str) -> Decision {
+        let state = self.state.read().expect("auth state poisoned").clone();
+        let net = match &state {
             AuthState::Disabled => return Decision::Allow,
             AuthState::Misconfigured(reason) => return Decision::Deny(reason.clone()),
             AuthState::Active(net) => net.clone(),
@@ -127,7 +140,13 @@ impl AuthGate {
             Ok(_) => return Decision::Deny("auth index unavailable".to_string()),
             Err(e) => return Decision::Deny(format!("auth index query failed: {e}")),
         };
-        if self.versions.check_index(index.version).is_err() {
+        if self
+            .versions
+            .lock()
+            .expect("auth versions poisoned")
+            .check_index(index.version)
+            .is_err()
+        {
             return Decision::Deny("auth index rollback".to_string());
         }
         let Some(entry) = index.services.iter().find(|e| e.name == service).cloned() else {
@@ -152,6 +171,8 @@ impl AuthGate {
         };
         if self
             .versions
+            .lock()
+            .expect("auth versions poisoned")
             .check_whitelist(service, whitelist.version)
             .is_err()
         {
@@ -167,7 +188,8 @@ impl AuthGate {
 
     /// `(state, detail)` for the `auth_status` report.
     pub fn state_label(&self) -> (&'static str, Option<String>) {
-        match &self.state {
+        let state = self.state.read().expect("auth state poisoned");
+        match &*state {
             AuthState::Disabled => ("disabled", None),
             AuthState::Active(_) => ("active", None),
             AuthState::Misconfigured(r) => ("misconfigured", Some(r.clone())),
@@ -175,11 +197,17 @@ impl AuthGate {
     }
 
     pub fn index_version(&self) -> Option<u64> {
-        self.versions.index_version()
+        self.versions
+            .lock()
+            .expect("auth versions poisoned")
+            .index_version()
     }
 
     pub fn whitelist_version(&self, service: &str) -> Option<u64> {
-        self.versions.whitelist_version(service)
+        self.versions
+            .lock()
+            .expect("auth versions poisoned")
+            .whitelist_version(service)
     }
 }
 
@@ -229,5 +257,11 @@ mod tests {
             &AuthState::Disabled,
             &AuthState::Misconfigured("missing".to_string())
         ));
+    }
+
+    #[test]
+    fn auth_gate_is_clone_send_sync() {
+        fn assert_traits<T: Clone + Send + Sync>() {}
+        assert_traits::<AuthGate>();
     }
 }
