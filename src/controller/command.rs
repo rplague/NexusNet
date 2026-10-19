@@ -18,6 +18,7 @@
 use libp2p::{PeerId, kad};
 
 use crate::auth;
+use crate::controller::service_registry::ServiceCommand;
 use crate::service_dispatcher::{ControlCommand, ToController};
 use crate::service_protocol;
 use crate::sidecar_protocol::Message;
@@ -72,7 +73,14 @@ impl NodeController {
     pub(super) async fn handle_controller_message(&mut self, msg: ToController) {
         match msg {
             ToController::Control(cmd) => self.dispatch_command(cmd).await,
-            ToController::BackendStatus(status) => self.services.on_backend_status(status).await,
+            ToController::BackendStatus(status) => {
+                let command = if status.ready {
+                    ServiceCommand::BackendReady(status.service)
+                } else {
+                    ServiceCommand::BackendDown(status.service)
+                };
+                self.send_service(command).await;
+            }
         }
     }
 
@@ -126,9 +134,8 @@ impl NodeController {
     }
 
     async fn cmd_list_services(&mut self) -> Result<Vec<u8>, String> {
-        // Read through the registry so the result is the union of the DHT peers'
-        // view and every type this node has already observed (never stale-local).
-        let types = self.services.list_types().await;
+        let types = self.services_snapshot.borrow().types.clone();
+        let _ = self.services_tx.try_send(ServiceCommand::RefreshTypes);
         Ok(to_cbor(&types))
     }
 
@@ -172,7 +179,9 @@ impl NodeController {
     }
 
     async fn cmd_reannounce_services(&mut self) -> Result<Vec<u8>, String> {
-        self.services.reannounce().await;
+        self.services_tx
+            .try_send(ServiceCommand::Reannounce)
+            .map_err(|_| "registry busy".to_string())?;
         Ok(to_cbor(&serde_json::json!({"success": true})))
     }
 
@@ -183,7 +192,7 @@ impl NodeController {
             Ok(_) => {
                 self.relay.reset();
                 self.bootstrap.reset();
-                self.services.reset();
+                self.send_service(ServiceCommand::Reset).await;
                 self.auth.reload();
                 serde_json::json!({"success": true})
             }

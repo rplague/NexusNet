@@ -120,6 +120,9 @@ name = "cmd"
 port = 5014
 require_auth = false
 
+[services.registry]
+max_inflight_dht = 4             # 1..=16，registry DHT job 并发上限
+
 [services.relay]
 retry_interval_secs = 60
 max_failures = 3
@@ -230,12 +233,14 @@ u32_be(len) || cbor(message)      # len <= 16 MiB
 ## 服务注册与发现
 
 - 本地服务列表由 `config.services.dispatcher.local_services` 定义
+- 服务注册、撤销和类型索引 reconcile 在独立的异步 registry actor 中执行；NodeController 不再等待 DHT。并发由 `services.registry.max_inflight_dht` 控制（默认 4，范围 1–16）
 - 仅当 DHT bootstrap 完成**且**对应后端 TCP 握手（`hello`）成功后，才自动调用 `start_providing`，key 为 `/oahd/service/<name>`——避免提前宣告尚不可用的服务
 - 后端连接断开后进入 3 秒宽限期（由 1 秒 tick 检查，实际撤销窗口约 3–4 秒）：期间重连则不撤销；超时仍未恢复则 `stop_providing` 撤销宣告
 - 撤销为本地行为，远端 provider 记录需待 provider TTL 过期才会消失
 - 双栈节点在 `allow_bootstrap = true` 时声明为 `/oahd/bootstrap` provider；其他节点仅在 `accept_bootstrap_providers = true` 时才会把 Identify 发现的 provider 自动写入 bootstrap 列表
-- 同步 `/oahd/service/types` 全局服务类型记录（仅新增、不清理）：本地维护一个**单调并集**，并周期（`services.dispatcher.types_sync_secs`，默认 300s）从 DHT 对端读取（绕过本地 store 副本与 60s 缓存，避免自我遮蔽）后重新发布，使各节点即使遭遇并发覆盖也能收敛到完整列表
-- `list_services` → 读取并合并 DHT 对端与本地已知的全部服务类型
+- 同步 `/oahd/service/types` 全局服务类型记录（仅新增、不清理）：本地维护一个**单调并集**，并周期（`services.dispatcher.types_sync_secs`，默认 300s）从 DHT 对端读取（绕过本地 store 副本与 60s 缓存，避免自我遮蔽）后重新发布，使各节点即使遭遇并发覆盖也能收敛到完整列表；读取/写入由 registry actor 异步完成，单飞并带 dirty 重跑
+- `list_services` → 立即返回本地快照，并在后台触发一次类型索引刷新（最终一致）
+- `reannounce_services` → 投递后台重新宣告任务后立即返回 accepted
 - `discover_providers` → DHT get_providers 获取提供者列表
 - `service_request` → 查询提供者，RTT 排序选优，P2P 调用
 
