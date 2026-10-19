@@ -113,6 +113,9 @@ impl NodeConfig {
         if !(1..=16).contains(&self.services.registry.max_inflight_dht) {
             return Err("services.registry.max_inflight_dht 必须在 1..=16".to_string());
         }
+        if !(1..=16).contains(&self.services.dispatcher.max_inflight_dht) {
+            return Err("services.dispatcher.max_inflight_dht 必须在 1..=16".to_string());
+        }
         if self.services.relay.retry_interval_secs == 0 {
             return Err("services.relay.retry_interval_secs 必须大于 0".to_string());
         }
@@ -406,6 +409,9 @@ pub struct DispatcherConfig {
     /// How often to reconcile the global service-type index with the DHT.
     #[serde(default = "default_types_sync_seconds")]
     pub types_sync_secs: u32,
+    /// Maximum number of DHT control commands executing concurrently.
+    #[serde(default = "default_max_inflight_dht")]
+    pub max_inflight_dht: u32,
     #[serde(default = "Vec::new")]
     pub local_services: Vec<LocalServiceEntry>,
 }
@@ -416,6 +422,7 @@ impl Default for DispatcherConfig {
             enabled: bool_true(),
             query_timeout_secs: default_query_timeout_seconds(),
             types_sync_secs: default_types_sync_seconds(),
+            max_inflight_dht: default_max_inflight_dht(),
             local_services: vec![],
         }
     }
@@ -588,6 +595,10 @@ impl ConfigHandle {
 
     pub fn dispatcher_query_timeout(&self) -> u32 {
         self.read().services.dispatcher.query_timeout_secs
+    }
+
+    pub fn dispatcher_max_inflight_dht(&self) -> usize {
+        self.read().services.dispatcher.max_inflight_dht as usize
     }
 
     /// Interval, in seconds, between global service-type index reconciliations.
@@ -910,6 +921,10 @@ mod tests {
             ConfigHandle::new(config.clone()).registry_max_inflight_dht(),
             4
         );
+        assert_eq!(
+            ConfigHandle::new(config.clone()).dispatcher_max_inflight_dht(),
+            4
+        );
 
         let mut config = NodeConfig::default();
         config.services.registry.max_inflight_dht = 0;
@@ -919,6 +934,14 @@ mod tests {
         assert!(config.validate().is_err());
 
         config.services.registry.max_inflight_dht = 16;
+        assert!(config.validate().is_ok());
+
+        let mut config = NodeConfig::default();
+        config.services.dispatcher.max_inflight_dht = 0;
+        assert!(config.validate().is_err());
+        config.services.dispatcher.max_inflight_dht = 17;
+        assert!(config.validate().is_err());
+        config.services.dispatcher.max_inflight_dht = 16;
         assert!(config.validate().is_ok());
     }
 

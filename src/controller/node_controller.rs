@@ -49,6 +49,7 @@ pub struct NodeController {
     pub(super) auth: AuthGate,
     auth_txs: Vec<mpsc::Sender<AuthJob>>,
     auth_next: usize,
+    pub(super) dht_permits: Arc<tokio::sync::Semaphore>,
     pub(super) services_tx: mpsc::Sender<ServiceCommand>,
     pub(super) services_snapshot: watch::Receiver<Arc<ServiceSnapshot>>,
     pub(super) relay: RelayManager,
@@ -83,6 +84,9 @@ impl NodeController {
                 swarm.clone(),
             ));
         }
+        let dht_permits = Arc::new(tokio::sync::Semaphore::new(
+            config.dispatcher_max_inflight_dht().clamp(1, 16),
+        ));
         let services = service_registry::spawn(config.clone(), swarm.clone(), shutdown_rx.clone());
         let relay = RelayManager::new(config.clone(), swarm.clone(), my_peer_id);
         let bootstrap = BootstrapDiscovery::new(config.clone(), swarm.clone());
@@ -98,6 +102,7 @@ impl NodeController {
             auth,
             auth_txs,
             auth_next: 0,
+            dht_permits,
             services_tx: services.tx,
             services_snapshot: services.snapshot,
             relay,
