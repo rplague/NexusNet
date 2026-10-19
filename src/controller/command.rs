@@ -241,14 +241,6 @@ impl NodeController {
     pub(super) async fn handle_controller_message(&mut self, msg: ToController) {
         match msg {
             ToController::Control(cmd) => self.dispatch_command(cmd).await,
-            ToController::BackendStatus(status) => {
-                let command = if status.ready {
-                    ServiceCommand::BackendReady(status.service)
-                } else {
-                    ServiceCommand::BackendDown(status.service)
-                };
-                self.send_service(command).await;
-            }
         }
     }
 

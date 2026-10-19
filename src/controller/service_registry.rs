@@ -29,6 +29,7 @@ use crate::auth;
 use crate::config::ConfigHandle;
 use crate::log::{LogLevel, LogStruct};
 use crate::network::NetworkHandle;
+use crate::service_dispatcher::BackendReadiness;
 
 const WITHDRAW_GRACE: Duration = Duration::from_secs(3);
 const TYPES_KEY: &[u8] = b"/oahd/service/types";
@@ -68,8 +69,6 @@ pub struct ServiceSnapshot {
 
 #[derive(Debug, Clone)]
 pub enum ServiceCommand {
-    BackendReady(String),
-    BackendDown(String),
     BootstrapCompleted,
     Tick,
     Reannounce,
@@ -182,23 +181,36 @@ impl RegistryState {
         }
     }
 
+    fn replace_backend_ready(&mut self, ready: &HashSet<String>, now: Instant) {
+        let previous = std::mem::replace(&mut self.backend_ready, ready.clone());
+        for service in ready.difference(&previous) {
+            self.withdraw_deadline.remove(service);
+            self.announce_failures.remove(service);
+            self.announce_retry_at.remove(service);
+        }
+        for service in previous.difference(ready) {
+            self.announce_retry_at.remove(service);
+            if self.announced.contains(service) {
+                self.withdraw_deadline
+                    .entry(service.clone())
+                    .or_insert_with(|| now + WITHDRAW_GRACE);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn set_backend_ready(&mut self, service: &str, ready: bool, now: Instant) {
+        let mut set = self.backend_ready.clone();
+        if ready {
+            set.insert(service.to_string());
+        } else {
+            set.remove(service);
+        }
+        self.replace_backend_ready(&set, now);
+    }
+
     fn handle(&mut self, command: ServiceCommand, now: Instant) {
         match command {
-            ServiceCommand::BackendReady(service) => {
-                self.backend_ready.insert(service.clone());
-                self.withdraw_deadline.remove(&service);
-                self.announce_failures.remove(&service);
-                self.announce_retry_at.remove(&service);
-            }
-            ServiceCommand::BackendDown(service) => {
-                self.backend_ready.remove(&service);
-                self.announce_retry_at.remove(&service);
-                if self.announced.contains(&service) {
-                    self.withdraw_deadline
-                        .entry(service)
-                        .or_insert_with(|| now + WITHDRAW_GRACE);
-                }
-            }
             ServiceCommand::BootstrapCompleted => {
                 self.bootstrapped = true;
                 self.mark_types_dirty(now);
@@ -616,6 +628,7 @@ struct ServiceRegistryActor {
     dht: DhtClient,
     state: RegistryState,
     cmd_rx: mpsc::Receiver<ServiceCommand>,
+    readiness_rx: watch::Receiver<Arc<BackendReadiness>>,
     shutdown_rx: watch::Receiver<bool>,
     snapshot_tx: watch::Sender<Arc<ServiceSnapshot>>,
     jobs: JoinSet<JobResult>,
@@ -690,6 +703,9 @@ impl ServiceRegistryActor {
     }
 
     async fn run(mut self) {
+        let initial = self.readiness_rx.borrow().clone();
+        self.state
+            .replace_backend_ready(&initial.ready, Instant::now());
         self.snapshot();
         self.pump();
 
@@ -726,6 +742,16 @@ impl ServiceRegistryActor {
                     }
                     self.pump();
                 }
+                changed = self.readiness_rx.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    let ready = self.readiness_rx.borrow_and_update().clone();
+                    self.state
+                        .replace_backend_ready(&ready.ready, Instant::now());
+                    self.snapshot();
+                    self.pump();
+                }
                 _ = self.shutdown_rx.changed() => {
                     break;
                 }
@@ -748,14 +774,16 @@ fn parse_types(value: &[u8]) -> Result<Vec<String>, serde_json::Error> {
 pub fn spawn(
     config: ConfigHandle,
     swarm: NetworkHandle,
+    readiness_rx: watch::Receiver<Arc<BackendReadiness>>,
     shutdown_rx: watch::Receiver<bool>,
 ) -> ServiceRegistryHandle {
-    spawn_with_dht(config, DhtClient::Real(swarm), shutdown_rx)
+    spawn_with_dht(config, DhtClient::Real(swarm), readiness_rx, shutdown_rx)
 }
 
 fn spawn_with_dht(
     config: ConfigHandle,
     dht: DhtClient,
+    readiness_rx: watch::Receiver<Arc<BackendReadiness>>,
     shutdown_rx: watch::Receiver<bool>,
 ) -> ServiceRegistryHandle {
     let (tx, cmd_rx) = mpsc::channel(COMMAND_QUEUE_CAPACITY);
@@ -768,6 +796,7 @@ fn spawn_with_dht(
         dht,
         state,
         cmd_rx,
+        readiness_rx,
         shutdown_rx,
         snapshot_tx,
         jobs: JoinSet::new(),
@@ -853,7 +882,7 @@ mod tests {
 
     fn announce_services(state: &mut RegistryState, names: &[&str], now: Instant) -> Vec<JobSpec> {
         for name in names {
-            state.handle(ServiceCommand::BackendReady((*name).to_string()), now);
+            state.set_backend_ready(name, true, now);
         }
         state.handle(ServiceCommand::BootstrapCompleted, now);
         state.plan(now, 8)
@@ -863,7 +892,7 @@ mod tests {
     fn waits_for_bootstrap_before_announcing() {
         let mut state = RegistryState::new(config_with_services(&["cmd"]));
         let now = Instant::now();
-        state.handle(ServiceCommand::BackendReady("cmd".to_string()), now);
+        state.set_backend_ready("cmd", true, now);
         assert!(state.plan(now, 4).is_empty());
 
         state.handle(ServiceCommand::BootstrapCompleted, now);
@@ -892,7 +921,7 @@ mod tests {
         let mut state = RegistryState::new(config_with_services(&["a", "b", "c"]));
         let now = Instant::now();
         for name in ["a", "b", "c"] {
-            state.handle(ServiceCommand::BackendReady(name.to_string()), now);
+            state.set_backend_ready(name, true, now);
         }
         state.handle(ServiceCommand::BootstrapCompleted, now);
         assert_eq!(
@@ -936,18 +965,12 @@ mod tests {
         );
         assert!(state.snapshot().announced.contains(&"cmd".to_string()));
 
-        state.handle(ServiceCommand::BackendDown("cmd".to_string()), now);
+        state.set_backend_ready("cmd", false, now);
         assert!(state.plan(now + Duration::from_secs(1), 4).is_empty());
-        state.handle(
-            ServiceCommand::BackendReady("cmd".to_string()),
-            now + Duration::from_secs(2),
-        );
+        state.set_backend_ready("cmd", true, now + Duration::from_secs(2));
         assert!(state.plan(now + Duration::from_secs(4), 4).is_empty());
 
-        state.handle(
-            ServiceCommand::BackendDown("cmd".to_string()),
-            now + Duration::from_secs(5),
-        );
+        state.set_backend_ready("cmd", false, now + Duration::from_secs(5));
         let jobs = state.plan(now + Duration::from_secs(10), 4);
         assert!(matches!(jobs.as_slice(), [JobSpec::Withdraw { service, .. }] if service == "cmd"));
     }
@@ -965,7 +988,7 @@ mod tests {
         else {
             panic!("expected announce");
         };
-        state.handle(ServiceCommand::BackendDown("cmd".to_string()), now);
+        state.set_backend_ready("cmd", false, now);
         state.apply(
             JobResult::Announced {
                 generation,
@@ -999,7 +1022,7 @@ mod tests {
         );
         assert_eq!(state.reconcile, ReconcileState::Idle);
 
-        state.handle(ServiceCommand::BackendReady("cmd".to_string()), now);
+        state.set_backend_ready("cmd", true, now);
         let jobs = state.plan(now, 4);
         let JobSpec::Announce {
             generation,
@@ -1045,7 +1068,7 @@ mod tests {
             },
             now,
         );
-        state.handle(ServiceCommand::BackendDown("cmd".to_string()), now);
+        state.set_backend_ready("cmd", false, now);
         let jobs = state.plan(now + Duration::from_secs(4), 4);
         let JobSpec::Withdraw {
             generation,
@@ -1231,8 +1254,9 @@ mod tests {
     async fn idle_actor_does_not_spin() {
         let config = config_with_services(&[]);
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (_readiness_tx, readiness_rx) = watch::channel(Arc::new(BackendReadiness::default()));
         let mock = Arc::new(MockDht::new(Duration::ZERO));
-        let handle = spawn_with_dht(config, DhtClient::Mock(mock), shutdown_rx);
+        let handle = spawn_with_dht(config, DhtClient::Mock(mock), readiness_rx, shutdown_rx);
 
         tokio::time::sleep(Duration::from_millis(50)).await;
         let loops = handle.loops.load(Ordering::Relaxed);
@@ -1243,23 +1267,22 @@ mod tests {
     async fn actor_processes_commands_while_announce_is_slow() {
         let config = config_with_services(&["cmd"]);
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (readiness_tx, readiness_rx) = watch::channel(Arc::new(BackendReadiness::default()));
         let mock = Arc::new(MockDht::new(Duration::from_millis(500)));
-        let handle = spawn_with_dht(config, DhtClient::Mock(mock), shutdown_rx);
+        let handle = spawn_with_dht(config, DhtClient::Mock(mock), readiness_rx, shutdown_rx);
 
-        handle
-            .tx
-            .send(ServiceCommand::BackendReady("cmd".to_string()))
-            .await
+        readiness_tx
+            .send(Arc::new(BackendReadiness {
+                ready: HashSet::from(["cmd".to_string()]),
+            }))
             .unwrap();
         handle
             .tx
             .send(ServiceCommand::BootstrapCompleted)
             .await
             .unwrap();
-        handle
-            .tx
-            .send(ServiceCommand::BackendDown("cmd".to_string()))
-            .await
+        readiness_tx
+            .send(Arc::new(BackendReadiness::default()))
             .unwrap();
 
         let snapshot = tokio::time::timeout(Duration::from_millis(100), async {

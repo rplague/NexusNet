@@ -98,10 +98,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let _ = shutdown_tx.send(true);
     });
 
-    let dispatcher = ServiceDispatcher::new(
+    let (dispatcher, readiness_rx) = ServiceDispatcher::new(
         to_dispatcher_rx,
         to_controller_tx.clone(),
         config_handle.clone(),
+        peer_id,
         shutdown_rx.clone(),
     );
     tokio::spawn(async move {
@@ -117,6 +118,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         peer_id,
         to_controller_rx,
         to_dispatcher_tx,
+        readiness_rx,
         network,
         shutdown_rx,
     );
