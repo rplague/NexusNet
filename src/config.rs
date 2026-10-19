@@ -57,6 +57,7 @@ default_u32_fn!(default_query_timeout_seconds, 60);
 default_u32_fn!(default_relay_retry_interval, 60);
 default_u32_fn!(default_relay_max_failures, 3);
 default_u32_fn!(default_types_sync_seconds, 300);
+default_u32_fn!(default_max_inflight_dht, 4);
 
 fn default_auth_network() -> String {
     "none".to_string()
@@ -108,6 +109,9 @@ impl NodeConfig {
             if self.services.dispatcher.types_sync_secs == 0 {
                 return Err("services.dispatcher.types_sync_secs 必须大于 0".to_string());
             }
+        }
+        if !(1..=16).contains(&self.services.registry.max_inflight_dht) {
+            return Err("services.registry.max_inflight_dht 必须在 1..=16".to_string());
         }
         if self.services.relay.retry_interval_secs == 0 {
             return Err("services.relay.retry_interval_secs 必须大于 0".to_string());
@@ -288,7 +292,23 @@ pub struct ServicesConfig {
     #[serde(default)]
     pub dispatcher: DispatcherConfig,
     #[serde(default)]
+    pub registry: RegistryService,
+    #[serde(default)]
     pub relay: RelayService,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct RegistryService {
+    #[serde(default = "default_max_inflight_dht")]
+    pub max_inflight_dht: u32,
+}
+
+impl Default for RegistryService {
+    fn default() -> Self {
+        RegistryService {
+            max_inflight_dht: default_max_inflight_dht(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
@@ -573,6 +593,10 @@ impl ConfigHandle {
     /// Interval, in seconds, between global service-type index reconciliations.
     pub fn dispatcher_types_sync_interval(&self) -> u32 {
         self.read().services.dispatcher.types_sync_secs.max(1)
+    }
+
+    pub fn registry_max_inflight_dht(&self) -> usize {
+        self.read().services.registry.max_inflight_dht as usize
     }
 
     pub fn relay_retry_interval(&self) -> u32 {
@@ -875,6 +899,27 @@ mod tests {
         config.services.dispatcher.local_services[1].name = "ocr".to_string();
         config.services.dispatcher.local_services[1].port = 0;
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn registry_max_inflight_dht_defaults_and_validates() {
+        let config = NodeConfig::default();
+        assert_eq!(config.services.registry.max_inflight_dht, 4);
+        assert!(config.validate().is_ok());
+        assert_eq!(
+            ConfigHandle::new(config.clone()).registry_max_inflight_dht(),
+            4
+        );
+
+        let mut config = NodeConfig::default();
+        config.services.registry.max_inflight_dht = 0;
+        assert!(config.validate().is_err());
+
+        config.services.registry.max_inflight_dht = 17;
+        assert!(config.validate().is_err());
+
+        config.services.registry.max_inflight_dht = 16;
+        assert!(config.validate().is_ok());
     }
 
     #[test]
