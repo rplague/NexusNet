@@ -17,6 +17,8 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use libp2p::kad;
@@ -605,6 +607,8 @@ impl DhtClient {
 pub struct ServiceRegistryHandle {
     pub tx: mpsc::Sender<ServiceCommand>,
     pub snapshot: watch::Receiver<Arc<ServiceSnapshot>>,
+    #[cfg(test)]
+    pub loops: Arc<AtomicUsize>,
 }
 
 struct ServiceRegistryActor {
@@ -615,6 +619,8 @@ struct ServiceRegistryActor {
     shutdown_rx: watch::Receiver<bool>,
     snapshot_tx: watch::Sender<Arc<ServiceSnapshot>>,
     jobs: JoinSet<JobResult>,
+    #[cfg(test)]
+    loops: Arc<AtomicUsize>,
 }
 
 impl ServiceRegistryActor {
@@ -688,6 +694,8 @@ impl ServiceRegistryActor {
         self.pump();
 
         loop {
+            #[cfg(test)]
+            self.loops.fetch_add(1, Ordering::Relaxed);
             tokio::select! {
                 command = self.cmd_rx.recv() => {
                     let Some(command) = command else {
@@ -700,14 +708,14 @@ impl ServiceRegistryActor {
                     self.snapshot();
                     self.pump();
                 }
-                result = self.jobs.join_next() => {
+                Some(result) = self.jobs.join_next() => {
                     match result {
-                        Some(Ok(result)) => {
+                        Ok(result) => {
                             self.state.apply(result, Instant::now());
                             self.snapshot();
                         }
-                        Some(Err(error)) if error.is_cancelled() => {}
-                        Some(Err(error)) => {
+                        Err(error) if error.is_cancelled() => {}
+                        Err(error) => {
                             LogStruct::new(
                                 LogLevel::Error,
                                 "服务注册任务异常退出",
@@ -715,7 +723,6 @@ impl ServiceRegistryActor {
                             )
                             .emit();
                         }
-                        None => {}
                     }
                     self.pump();
                 }
@@ -753,6 +760,8 @@ fn spawn_with_dht(
 ) -> ServiceRegistryHandle {
     let (tx, cmd_rx) = mpsc::channel(COMMAND_QUEUE_CAPACITY);
     let (snapshot_tx, snapshot) = watch::channel(Arc::new(ServiceSnapshot::default()));
+    #[cfg(test)]
+    let loops = Arc::new(AtomicUsize::new(0));
     let state = RegistryState::new(config.clone());
     let actor = ServiceRegistryActor {
         config,
@@ -762,11 +771,18 @@ fn spawn_with_dht(
         shutdown_rx,
         snapshot_tx,
         jobs: JoinSet::new(),
+        #[cfg(test)]
+        loops: loops.clone(),
     };
     tokio::spawn(async move {
         actor.run().await;
     });
-    ServiceRegistryHandle { tx, snapshot }
+    ServiceRegistryHandle {
+        tx,
+        snapshot,
+        #[cfg(test)]
+        loops,
+    }
 }
 
 #[cfg(test)]
@@ -1209,6 +1225,18 @@ mod tests {
             now,
         );
         assert_eq!(state.reconcile, ReconcileState::Idle);
+    }
+
+    #[tokio::test]
+    async fn idle_actor_does_not_spin() {
+        let config = config_with_services(&[]);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let mock = Arc::new(MockDht::new(Duration::ZERO));
+        let handle = spawn_with_dht(config, DhtClient::Mock(mock), shutdown_rx);
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let loops = handle.loops.load(Ordering::Relaxed);
+        assert!(loops < 100, "registry actor spun {loops} times while idle");
     }
 
     #[tokio::test]
