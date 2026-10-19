@@ -16,8 +16,10 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 use std::cmp::min;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
+use libp2p::PeerId;
 use libp2p::futures::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -46,19 +48,21 @@ pub struct ControlCommand {
     pub resp_tx: oneshot::Sender<Result<Vec<u8>, String>>,
 }
 
-/// Backend connection readiness change, reported by `ServiceDispatcher` to
-/// `NodeController`.
+/// Backend connection readiness change.
 pub struct BackendStatus {
     pub service: String,
     pub ready: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct BackendReadiness {
+    pub ready: HashSet<String>,
 }
 
 /// All upstream messages from the dispatcher to the controller.
 pub enum ToController {
     /// A backend-issued control command (with a reply channel).
     Control(ControlCommand),
-    /// A backend connection readiness change.
-    BackendStatus(BackendStatus),
 }
 
 /// An inbound P2P service request to forward to a local backend.
@@ -99,12 +103,40 @@ fn command_timeout(msg: &Message, base: Duration, kad: Duration) -> Duration {
 }
 
 /// Routes between `NodeController` and one persistent task per local backend.
+#[derive(Debug, PartialEq, Eq)]
+enum LocalRoute {
+    Local(String),
+    Reject(String),
+    Remote,
+}
+
+fn route_local(ready: &HashSet<String>, my_peer_id: PeerId, msg: &Message) -> LocalRoute {
+    match msg {
+        Message::ServiceRequest { service, .. } if ready.contains(service) => {
+            LocalRoute::Local(service.clone())
+        }
+        Message::ServiceRequestTo { service, peer, .. }
+            if peer.parse::<PeerId>().ok() == Some(my_peer_id) =>
+        {
+            if ready.contains(service) {
+                LocalRoute::Local(service.clone())
+            } else {
+                LocalRoute::Reject(format!("local service {service} is not ready"))
+            }
+        }
+        _ => LocalRoute::Remote,
+    }
+}
+
 pub struct ServiceDispatcher {
     inbound_rx: mpsc::Receiver<InboundRequest>,
     event_rx: mpsc::Receiver<BackendEvent>,
     to_controller_tx: mpsc::Sender<ToController>,
     /// Service name -> command sender for its backend task.
     backends: HashMap<String, mpsc::Sender<BackendCmd>>,
+    my_peer_id: PeerId,
+    backend_ready: HashSet<String>,
+    readiness_tx: watch::Sender<Arc<BackendReadiness>>,
     shutdown_rx: watch::Receiver<bool>,
     query_timeout: Duration,
     kad_timeout: Duration,
@@ -115,8 +147,9 @@ impl ServiceDispatcher {
         inbound_rx: mpsc::Receiver<InboundRequest>,
         to_controller_tx: mpsc::Sender<ToController>,
         config: ConfigHandle,
+        my_peer_id: PeerId,
         shutdown_rx: watch::Receiver<bool>,
-    ) -> Self {
+    ) -> (Self, watch::Receiver<Arc<BackendReadiness>>) {
         let configured = config.read().services.dispatcher.local_services.clone();
         // Services with invalid names (reserved "service" or illegal characters)
         // get no backend connection.
@@ -143,6 +176,7 @@ impl ServiceDispatcher {
 
         let query_timeout = Duration::from_secs(config.dispatcher_query_timeout().into());
         let kad_timeout = Duration::from_secs(config.kademlia_query_timeout().into());
+        let (readiness_tx, readiness_rx) = watch::channel(Arc::new(BackendReadiness::default()));
         let (event_tx, event_rx) = mpsc::channel(EVENT_QUEUE_CAPACITY);
         let mut backends = HashMap::new();
         if config.dispatcher_enabled() {
@@ -166,15 +200,21 @@ impl ServiceDispatcher {
             .emit();
         }
 
-        Self {
-            inbound_rx,
-            event_rx,
-            to_controller_tx,
-            backends,
-            shutdown_rx,
-            query_timeout,
-            kad_timeout,
-        }
+        (
+            Self {
+                inbound_rx,
+                event_rx,
+                to_controller_tx,
+                backends,
+                my_peer_id,
+                backend_ready: HashSet::new(),
+                readiness_tx,
+                shutdown_rx,
+                query_timeout,
+                kad_timeout,
+            },
+            readiness_rx,
+        )
     }
 
     pub async fn run(mut self) {
@@ -210,10 +250,14 @@ impl ServiceDispatcher {
                     };
                     match event {
                         BackendEvent::Status(status) => {
-                            let _ = self
-                                .to_controller_tx
-                                .send(ToController::BackendStatus(status))
-                                .await;
+                            if status.ready {
+                                self.backend_ready.insert(status.service.clone());
+                            } else {
+                                self.backend_ready.remove(&status.service);
+                            }
+                            let _ = self.readiness_tx.send(Arc::new(BackendReadiness {
+                                ready: self.backend_ready.clone(),
+                            }));
                         }
                         BackendEvent::Control { service, msg } => {
                             self.forward_control(service, msg).await
@@ -242,6 +286,28 @@ impl ServiceDispatcher {
         let Some(backend_tx) = self.backends.get(&service).cloned() else {
             return;
         };
+
+        match self.local_route(&msg) {
+            LocalRoute::Local(target) => {
+                let payload = match &msg {
+                    Message::ServiceRequest { payload, .. }
+                    | Message::ServiceRequestTo { payload, .. } => payload.clone(),
+                    _ => Vec::new(),
+                };
+                self.forward_local(service, target, id, payload);
+                return;
+            }
+            LocalRoute::Reject(reason) => {
+                let _ = backend_tx.try_send(BackendCmd::WriteReply(Message::Reply {
+                    id,
+                    ok: false,
+                    result: None,
+                    error: Some(SidecarError::new("backend_not_ready", reason)),
+                }));
+                return;
+            }
+            LocalRoute::Remote => {}
+        }
 
         let budget = command_timeout(&msg, self.query_timeout, self.kad_timeout);
         let (resp_tx, resp_rx) = oneshot::channel();
@@ -288,6 +354,105 @@ impl ServiceDispatcher {
                 },
             };
             let _ = backend_tx.send(BackendCmd::WriteReply(reply)).await;
+        });
+    }
+
+    fn local_route(&self, msg: &Message) -> LocalRoute {
+        route_local(&self.backend_ready, self.my_peer_id, msg)
+    }
+
+    fn forward_local(&self, origin: String, target: String, id: Uuid, payload: Vec<u8>) {
+        let Some(origin_tx) = self.backends.get(&origin).cloned() else {
+            return;
+        };
+        let Some(target_tx) = self.backends.get(&target).cloned() else {
+            let _ = origin_tx.try_send(BackendCmd::WriteReply(Message::Reply {
+                id,
+                ok: false,
+                result: None,
+                error: Some(SidecarError::new(
+                    "no_backend",
+                    format!("no backend for service {target}"),
+                )),
+            }));
+            return;
+        };
+
+        tokio::spawn(async move {
+            let (response_tx, response_rx) = oneshot::channel();
+            let request = InboundRequest {
+                service: target,
+                payload,
+                response_tx,
+            };
+            if let Err(error) = target_tx.try_send(BackendCmd::Request(request)) {
+                let message = match error {
+                    mpsc::error::TrySendError::Full(_) => "backend queue full".to_string(),
+                    mpsc::error::TrySendError::Closed(_) => "backend unavailable".to_string(),
+                };
+                let _ = origin_tx
+                    .send(BackendCmd::WriteReply(Message::Reply {
+                        id,
+                        ok: false,
+                        result: None,
+                        error: Some(SidecarError::new("backend_busy", message)),
+                    }))
+                    .await;
+                return;
+            }
+
+            let reply = match timeout(service_protocol::REQUEST_TIMEOUT, response_rx).await {
+                Ok(Ok(Ok(response))) => {
+                    if response.success {
+                        Message::Reply {
+                            id,
+                            ok: true,
+                            result: Some(response.data),
+                            error: None,
+                        }
+                    } else {
+                        let message = String::from_utf8_lossy(&response.data).into_owned();
+                        Message::Reply {
+                            id,
+                            ok: false,
+                            result: None,
+                            error: Some(SidecarError::new(
+                                "service_failed",
+                                if message.is_empty() {
+                                    "local service failed".to_string()
+                                } else {
+                                    message
+                                },
+                            )),
+                        }
+                    }
+                }
+                Ok(Ok(Err(error))) => Message::Reply {
+                    id,
+                    ok: false,
+                    result: None,
+                    error: Some(SidecarError::new("backend_error", error)),
+                },
+                Ok(Err(_)) => Message::Reply {
+                    id,
+                    ok: false,
+                    result: None,
+                    error: Some(SidecarError::new(
+                        "backend_error",
+                        "backend response channel closed",
+                    )),
+                },
+                Err(_) => Message::Reply {
+                    id,
+                    ok: false,
+                    result: None,
+                    error: Some(SidecarError::new(
+                        "timeout",
+                        "local service request timeout",
+                    )),
+                },
+            };
+            let _ = origin_tx.send(BackendCmd::WriteReply(reply)).await;
         });
     }
 }
@@ -559,6 +724,76 @@ mod tests {
         assert_eq!(
             command_timeout(&msg, BASE, KAD),
             BASE.saturating_add(MARGIN)
+        );
+    }
+
+    #[test]
+    fn routes_local_ready_requests() {
+        let my_peer_id = PeerId::random();
+        let ready = HashSet::from(["cmd".to_string()]);
+        let id = Uuid::new_v4();
+        assert_eq!(
+            route_local(
+                &ready,
+                my_peer_id,
+                &Message::ServiceRequest {
+                    id,
+                    service: "cmd".into(),
+                    payload: vec![],
+                }
+            ),
+            LocalRoute::Local("cmd".to_string())
+        );
+        assert_eq!(
+            route_local(
+                &ready,
+                my_peer_id,
+                &Message::ServiceRequest {
+                    id,
+                    service: "remote".into(),
+                    payload: vec![],
+                }
+            ),
+            LocalRoute::Remote
+        );
+        assert_eq!(
+            route_local(
+                &ready,
+                my_peer_id,
+                &Message::ServiceRequestTo {
+                    id,
+                    service: "cmd".into(),
+                    peer: my_peer_id.to_string(),
+                    payload: vec![],
+                }
+            ),
+            LocalRoute::Local("cmd".to_string())
+        );
+        assert!(matches!(
+            route_local(
+                &HashSet::new(),
+                my_peer_id,
+                &Message::ServiceRequestTo {
+                    id,
+                    service: "cmd".into(),
+                    peer: my_peer_id.to_string(),
+                    payload: vec![],
+                }
+            ),
+            LocalRoute::Reject(_)
+        ));
+        assert_eq!(
+            route_local(
+                &ready,
+                my_peer_id,
+                &Message::ServiceRequestTo {
+                    id,
+                    service: "cmd".into(),
+                    peer: PeerId::random().to_string(),
+                    payload: vec![],
+                }
+            ),
+            LocalRoute::Remote
         );
     }
 }

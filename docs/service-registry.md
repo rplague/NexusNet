@@ -29,12 +29,14 @@ ServiceRegistryActor
 `SwarmActor` 仍是唯一拥有 `Swarm` 的任务。registry actor 通过
 `NetworkHandle` 发命令；Kademlia 的多个 `QueryId` 提供 DHT 并发。
 
+`ServiceDispatcher` 持有唯一的 `backend_ready` 集合并通过 watch 发布；
+registry actor 订阅该 watch，用完整集合差分处理就绪/断开，不再接收
+`BackendReady` / `BackendDown` 命令。
+
 ## 命令
 
 | 命令 | 来源 | 说明 |
 |---|---|---|
-| `BackendReady` | dispatcher | 后端 TCP 握手成功 |
-| `BackendDown` | dispatcher | 后端断开，进入 3s 宽限 |
 | `BootstrapCompleted` | controller | 启动 announce 与 reconcile |
 | `Tick` | controller（1s） | 处理到期撤销/重试 |
 | `Reannounce` | 控制命令 | 后台重新调度 |

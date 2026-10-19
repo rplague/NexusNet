@@ -24,7 +24,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use crate::config::ConfigHandle;
 use crate::log::{LogLevel, LogStruct};
 use crate::network::{AGENT_NAME, NetworkEvent, NetworkHandle, NetworkStart};
-use crate::service_dispatcher::{InboundRequest, ToController};
+use crate::service_dispatcher::{BackendReadiness, InboundRequest, ToController};
 use crate::service_protocol;
 
 use super::auth_gate::{AuthGate, Decision};
@@ -62,6 +62,7 @@ impl NodeController {
         my_peer_id: PeerId,
         to_controller_rx: mpsc::Receiver<ToController>,
         to_dispatcher_tx: mpsc::Sender<InboundRequest>,
+        readiness_rx: watch::Receiver<Arc<BackendReadiness>>,
         network: NetworkStart,
         shutdown_rx: watch::Receiver<bool>,
     ) -> Self {
@@ -87,7 +88,12 @@ impl NodeController {
         let dht_permits = Arc::new(tokio::sync::Semaphore::new(
             config.dispatcher_max_inflight_dht().clamp(1, 16),
         ));
-        let services = service_registry::spawn(config.clone(), swarm.clone(), shutdown_rx.clone());
+        let services = service_registry::spawn(
+            config.clone(),
+            swarm.clone(),
+            readiness_rx,
+            shutdown_rx.clone(),
+        );
         let relay = RelayManager::new(config.clone(), swarm.clone(), my_peer_id);
         let bootstrap = BootstrapDiscovery::new(config.clone(), swarm.clone());
 

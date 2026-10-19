@@ -234,6 +234,7 @@ u32_be(len) || cbor(message)      # len <= 16 MiB
 ## 服务注册与发现
 
 - 本地服务列表由 `config.services.dispatcher.local_services` 定义
+- `ServiceDispatcher` 持有唯一一份 `backend_ready`（后端 `hello` 握手成功），并通过 watch 发布；ServiceRegistry 订阅该状态，不再由 NodeController 转发
 - 服务注册、撤销和类型索引 reconcile 在独立的异步 registry actor 中执行；NodeController 不再等待 DHT。并发由 `services.registry.max_inflight_dht` 控制（默认 4，范围 1–16）
 - 仅当 DHT bootstrap 完成**且**对应后端 TCP 握手（`hello`）成功后，才自动调用 `start_providing`，key 为 `/oahd/service/<name>`——避免提前宣告尚不可用的服务
 - 后端连接断开后进入 3 秒宽限期（由 1 秒 tick 检查，实际撤销窗口约 3–4 秒）：期间重连则不撤销；超时仍未恢复则 `stop_providing` 撤销宣告
@@ -244,8 +245,9 @@ u32_be(len) || cbor(message)      # len <= 16 MiB
 - `reannounce_services` → 投递后台重新宣告任务后立即返回 accepted
 - DHT 控制命令（`query_key`、`discover_providers`、`service_request`、`service_request_to`，以及 `providing=false` 的 `add_key`）在独立有界 worker 中执行；并发由 `services.dispatcher.max_inflight_dht` 控制（默认 4，范围 1–16）。`whoami`/`relay_status`/`pq_status`/`auth_status`/`list_services` 不等待 DHT
 - `add_key` 的 `providing=true` 仍由 NodeController 处理，用于保持与 ServiceRegistry 宣告状态一致
+- 本地调用优先：`service_request` 命中已就绪的本地服务时直接走 `ServiceDispatcher`，不查 DHT、不使用 PQ、不经过 AuthGate；`service_request_to(self, service)` 同样走本地。本地未就绪时，`service_request` 回退远端，`service_request_to(self)` 返回 `backend_not_ready`
 - `discover_providers` → DHT get_providers 获取提供者列表
-- `service_request` → 查询提供者，RTT 排序选优，P2P 调用
+- `service_request` → 本地就绪优先；否则查询 provider，RTT 排序选优，P2P 调用
 
 ## 抗量子加密
 
@@ -307,7 +309,7 @@ u32_be(len) || cbor(message)      # len <= 16 MiB
 
 ## 开发状态
 
-当前版本：**0.5.1-1644** — 完成度 **5.5/10**
+当前版本：**0.5.1-1832** — 完成度 **5.5/10**
 
 ## 许可
 
