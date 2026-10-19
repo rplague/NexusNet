@@ -21,7 +21,7 @@ use std::time::Duration;
 use libp2p::{PeerId, ping};
 
 /// Tracks per-peer round-trip times and consecutive ping failures.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct PeerTracker {
     rtts: HashMap<PeerId, Duration>,
     failures: HashMap<PeerId, u32>,

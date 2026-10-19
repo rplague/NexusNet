@@ -15,15 +15,20 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+use std::time::{Duration, Instant};
+
 use libp2p::{PeerId, kad};
 
 use crate::auth;
 use crate::controller::service_registry::ServiceCommand;
+use crate::log::{LogLevel, LogStruct};
+use crate::network::NetworkHandle;
 use crate::service_dispatcher::{ControlCommand, ToController};
 use crate::service_protocol;
 use crate::sidecar_protocol::Message;
 
 use super::NodeController;
+use super::peer_tracker::PeerTracker;
 use super::relay_manager::RELAY_TARGET;
 
 /// `whoami` result payload.
@@ -68,6 +73,169 @@ fn is_writable_key(key: &str) -> bool {
     key.starts_with("/oahd/auth/") || key.starts_with("/oahd/service/")
 }
 
+fn command_name(msg: &Message) -> &'static str {
+    match msg {
+        Message::Hello { .. } => "hello",
+        Message::Request { .. } => "request",
+        Message::Reply { .. } => "reply",
+        Message::ListServices { .. } => "list_services",
+        Message::DiscoverProviders { .. } => "discover_providers",
+        Message::QueryPublicIp { .. } => "query_public_ip",
+        Message::Whoami { .. } => "whoami",
+        Message::ReconnectBootstrap { .. } => "reconnect_bootstrap",
+        Message::ReannounceServices { .. } => "reannounce_services",
+        Message::ReloadConfig { .. } => "reload_config",
+        Message::RefreshCache { .. } => "refresh_cache",
+        Message::RelayStatus { .. } => "relay_status",
+        Message::PqStatus { .. } => "pq_status",
+        Message::AuthStatus { .. } => "auth_status",
+        Message::QueryKey { .. } => "query_key",
+        Message::AddKey { .. } => "add_key",
+        Message::RemoveKey { .. } => "remove_key",
+        Message::ServiceRequest { .. } => "service_request",
+        Message::ServiceRequestTo { .. } => "service_request_to",
+    }
+}
+
+fn can_run_in_dht_worker(msg: &Message) -> bool {
+    match msg {
+        Message::QueryKey { .. }
+        | Message::DiscoverProviders { .. }
+        | Message::ServiceRequest { .. }
+        | Message::ServiceRequestTo { .. } => true,
+        Message::AddKey { providing, .. } => !*providing,
+        _ => false,
+    }
+}
+
+fn log_command(kind: &str, elapsed: Duration) {
+    let level = if elapsed >= Duration::from_secs(1) {
+        LogLevel::Warning
+    } else {
+        LogLevel::Debug
+    };
+    LogStruct::new(
+        level,
+        "控制命令",
+        format!("{kind} {}ms", elapsed.as_millis()),
+    )
+    .emit();
+}
+
+fn provider_strings(providers: Vec<PeerId>) -> Vec<String> {
+    providers.into_iter().map(|peer| peer.to_string()).collect()
+}
+
+async fn run_dht_command(
+    swarm: &NetworkHandle,
+    peers: &PeerTracker,
+    msg: Message,
+) -> Result<Vec<u8>, String> {
+    match msg {
+        Message::DiscoverProviders { service, .. } => {
+            let key = kad::RecordKey::new(&format!("/oahd/service/{service}"));
+            match swarm.get_providers(key).await {
+                Ok(providers) => Ok(to_cbor(&provider_strings(providers))),
+                Err(e) => Err(format!("{e:?}")),
+            }
+        }
+        Message::QueryKey { key, .. } => {
+            if key.is_empty() {
+                return Err("missing key".to_string());
+            }
+            if let Ok(kad::GetRecordOk::FoundRecord(peer_record)) =
+                swarm.get_record(kad::RecordKey::new(&key)).await
+            {
+                let value = peer_record.record.value.clone();
+                let providers = swarm
+                    .get_providers(kad::RecordKey::new(&key))
+                    .await
+                    .unwrap_or_default();
+                return Ok(to_cbor(&QueryKeyResult {
+                    key,
+                    value: Some(value),
+                    providers: provider_strings(providers),
+                }));
+            }
+
+            let providers = swarm
+                .get_providers(kad::RecordKey::new(&key))
+                .await
+                .unwrap_or_default();
+            if providers.is_empty() {
+                Err("key not found".to_string())
+            } else {
+                Ok(to_cbor(&QueryKeyResult {
+                    key,
+                    value: None,
+                    providers: provider_strings(providers),
+                }))
+            }
+        }
+        Message::ServiceRequest {
+            service, payload, ..
+        } => {
+            let key = kad::RecordKey::new(&format!("/oahd/service/{service}"));
+            let providers = swarm
+                .get_providers(key)
+                .await
+                .map_err(|e| format!("{e:?}"))?;
+            if providers.is_empty() {
+                return Err("No provider found".to_string());
+            }
+            let best = peers
+                .best_peer(&providers)
+                .or_else(|| providers.first().copied())
+                .expect("providers is non-empty");
+            let response = swarm
+                .send_request(&best, service_protocol::Request { service, payload })
+                .await
+                .map_err(|e| e.to_string())?;
+            response_payload(response)
+        }
+        Message::ServiceRequestTo {
+            service,
+            peer,
+            payload,
+            ..
+        } => {
+            let peer_id = peer
+                .parse::<PeerId>()
+                .map_err(|e| format!("invalid peer id: {e}"))?;
+            let response = swarm
+                .send_request(&peer_id, service_protocol::Request { service, payload })
+                .await
+                .map_err(|e| e.to_string())?;
+            response_payload(response)
+        }
+        Message::AddKey {
+            key,
+            value,
+            providing,
+            ..
+        } => {
+            if providing {
+                return Err("async add_key does not support providing".to_string());
+            }
+            if key.is_empty() {
+                return Err("missing 'key' field".to_string());
+            }
+            if !is_writable_key(&key) {
+                return Err("key namespace not allowed".to_string());
+            }
+            let Some(bytes) = value else {
+                return Err("at least one of 'value' or 'providing' is required".to_string());
+            };
+            swarm
+                .put_record(kad::RecordKey::new(&key), bytes)
+                .await
+                .map_err(|e| format!("put_record failed: {e}"))?;
+            Ok(to_cbor(&serde_json::json!({"success": true, "key": key})))
+        }
+        _ => Err("command not supported by DHT worker".to_string()),
+    }
+}
+
 impl NodeController {
     /// Handle a message arriving from the ServiceDispatcher.
     pub(super) async fn handle_controller_message(&mut self, msg: ToController) {
@@ -86,9 +254,32 @@ impl NodeController {
 
     async fn dispatch_command(&mut self, req: ControlCommand) {
         let ControlCommand { msg, resp_tx } = req;
-        let result = self.run_command(msg).await;
-        let _ =
-            resp_tx.send(result.unwrap_or_else(|| Err("command produced no result".to_string())));
+        let kind = command_name(&msg);
+        let started = Instant::now();
+
+        if can_run_in_dht_worker(&msg) {
+            let permit = match self.dht_permits.clone().try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    LogStruct::new(LogLevel::Warning, "控制命令繁忙", kind.to_string()).emit();
+                    let _ = resp_tx.send(Err("node busy: too many DHT commands".to_string()));
+                    return;
+                }
+            };
+            let swarm = self.swarm.clone();
+            let peers = self.peers.clone();
+            tokio::spawn(async move {
+                let result = run_dht_command(&swarm, &peers, msg).await;
+                log_command(kind, started.elapsed());
+                let _ = resp_tx.send(result);
+                drop(permit);
+            });
+        } else {
+            let result = self.run_command(msg).await;
+            log_command(kind, started.elapsed());
+            let _ = resp_tx
+                .send(result.unwrap_or_else(|| Err("command produced no result".to_string())));
+        }
     }
 
     /// Route one backend control command to its handler.
@@ -473,6 +664,44 @@ mod tests {
             response_payload(resp),
             Err("remote service failed".to_string())
         );
+    }
+
+    #[test]
+    fn dht_worker_classification() {
+        let id = uuid::Uuid::new_v4();
+        assert!(can_run_in_dht_worker(&Message::QueryKey {
+            id,
+            key: "/k".into()
+        }));
+        assert!(can_run_in_dht_worker(&Message::DiscoverProviders {
+            id,
+            service: "cmd".into()
+        }));
+        assert!(can_run_in_dht_worker(&Message::ServiceRequest {
+            id,
+            service: "cmd".into(),
+            payload: vec![],
+        }));
+        assert!(can_run_in_dht_worker(&Message::ServiceRequestTo {
+            id,
+            service: "cmd".into(),
+            peer: "12D3KooW".into(),
+            payload: vec![],
+        }));
+        assert!(can_run_in_dht_worker(&Message::AddKey {
+            id,
+            key: "/oahd/auth/x".into(),
+            value: Some(vec![]),
+            providing: false,
+        }));
+        assert!(!can_run_in_dht_worker(&Message::AddKey {
+            id,
+            key: "/oahd/auth/x".into(),
+            value: Some(vec![]),
+            providing: true,
+        }));
+        assert!(!can_run_in_dht_worker(&Message::Whoami { id }));
+        assert!(!can_run_in_dht_worker(&Message::ListServices { id }));
     }
 
     #[test]
