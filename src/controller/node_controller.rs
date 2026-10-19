@@ -15,6 +15,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use libp2p::{PeerId, identify, ping};
@@ -30,7 +31,7 @@ use super::auth_gate::{AuthGate, Decision};
 use super::bootstrap::BootstrapDiscovery;
 use super::peer_tracker::PeerTracker;
 use super::relay_manager::RelayManager;
-use super::service_registry::ServiceRegistry;
+use super::service_registry::{self, ServiceCommand, ServiceSnapshot};
 
 const AUTH_WORKERS: usize = 4;
 const AUTH_QUEUE_CAPACITY: usize = 32;
@@ -48,7 +49,8 @@ pub struct NodeController {
     pub(super) auth: AuthGate,
     auth_txs: Vec<mpsc::Sender<AuthJob>>,
     auth_next: usize,
-    pub(super) services: ServiceRegistry,
+    pub(super) services_tx: mpsc::Sender<ServiceCommand>,
+    pub(super) services_snapshot: watch::Receiver<Arc<ServiceSnapshot>>,
     pub(super) relay: RelayManager,
     pub(super) bootstrap: BootstrapDiscovery,
 }
@@ -81,7 +83,7 @@ impl NodeController {
                 swarm.clone(),
             ));
         }
-        let services = ServiceRegistry::new(config.clone(), swarm.clone());
+        let services = service_registry::spawn(config.clone(), swarm.clone(), shutdown_rx.clone());
         let relay = RelayManager::new(config.clone(), swarm.clone(), my_peer_id);
         let bootstrap = BootstrapDiscovery::new(config.clone(), swarm.clone());
 
@@ -96,7 +98,8 @@ impl NodeController {
             auth,
             auth_txs,
             auth_next: 0,
-            services,
+            services_tx: services.tx,
+            services_snapshot: services.snapshot,
             relay,
             bootstrap,
         }
@@ -122,7 +125,7 @@ impl NodeController {
                     self.handle_controller_message(msg).await;
                 }
                 _ = service_tick.tick() => {
-                    self.services.tick().await;
+                    let _ = self.services_tx.try_send(ServiceCommand::Tick);
                 }
                 _ = relay_tick.tick() => {
                     self.bootstrap.announce_self().await;
@@ -141,7 +144,7 @@ impl NodeController {
             NetworkEvent::Ping(event) => self.handle_ping(event),
             NetworkEvent::Identify(event) => self.handle_identify(event).await,
             NetworkEvent::BootstrapCompleted => {
-                self.services.on_bootstrap_completed().await;
+                self.send_service(ServiceCommand::BootstrapCompleted).await;
                 self.bootstrap.announce_self().await;
                 self.relay.tick().await;
             }
@@ -160,6 +163,12 @@ impl NodeController {
                     self.relay.tick().await;
                 }
             }
+        }
+    }
+
+    pub(super) async fn send_service(&self, command: ServiceCommand) {
+        if self.services_tx.send(command).await.is_err() {
+            LogStruct::new(LogLevel::Critical, "服务注册任务不可用", "").emit();
         }
     }
 
