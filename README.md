@@ -114,6 +114,7 @@ bootstrap_nodes = []
 enabled = true
 query_timeout_secs = 60
 types_sync_secs = 300
+max_inflight_dht = 4             # 1..=16，DHT 控制命令并发上限
 
 [[services.dispatcher.local_services]]
 name = "cmd"
@@ -241,6 +242,8 @@ u32_be(len) || cbor(message)      # len <= 16 MiB
 - 同步 `/oahd/service/types` 全局服务类型记录（仅新增、不清理）：本地维护一个**单调并集**，并周期（`services.dispatcher.types_sync_secs`，默认 300s）从 DHT 对端读取（绕过本地 store 副本与 60s 缓存，避免自我遮蔽）后重新发布，使各节点即使遭遇并发覆盖也能收敛到完整列表；读取/写入由 registry actor 异步完成，单飞并带 dirty 重跑
 - `list_services` → 立即返回本地快照，并在后台触发一次类型索引刷新（最终一致）
 - `reannounce_services` → 投递后台重新宣告任务后立即返回 accepted
+- DHT 控制命令（`query_key`、`discover_providers`、`service_request`、`service_request_to`，以及 `providing=false` 的 `add_key`）在独立有界 worker 中执行；并发由 `services.dispatcher.max_inflight_dht` 控制（默认 4，范围 1–16）。`whoami`/`relay_status`/`pq_status`/`auth_status`/`list_services` 不等待 DHT
+- `add_key` 的 `providing=true` 仍由 NodeController 处理，用于保持与 ServiceRegistry 宣告状态一致
 - `discover_providers` → DHT get_providers 获取提供者列表
 - `service_request` → 查询提供者，RTT 排序选优，P2P 调用
 
@@ -304,7 +307,7 @@ u32_be(len) || cbor(message)      # len <= 16 MiB
 
 ## 开发状态
 
-当前版本：**0.5.1-1526** — 完成度 **5.5/10**
+当前版本：**0.5.1-1644** — 完成度 **5.5/10**
 
 ## 许可
 
