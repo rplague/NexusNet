@@ -1009,6 +1009,103 @@ mod tests {
     }
 
     #[test]
+    fn failed_withdraw_is_retried() {
+        let mut state = RegistryState::new(config_with_services(&["cmd"]));
+        let now = Instant::now();
+        let jobs = announce_services(&mut state, &["cmd"], now);
+        let JobSpec::Announce {
+            generation,
+            service,
+            ..
+        } = jobs.into_iter().next().unwrap()
+        else {
+            panic!("expected announce");
+        };
+        state.apply(
+            JobResult::Announced {
+                generation,
+                service,
+                result: Ok(()),
+            },
+            now,
+        );
+        state.handle(ServiceCommand::BackendDown("cmd".to_string()), now);
+        let jobs = state.plan(now + Duration::from_secs(4), 4);
+        let JobSpec::Withdraw {
+            generation,
+            service,
+            ..
+        } = jobs.into_iter().next().unwrap()
+        else {
+            panic!("expected withdraw");
+        };
+        state.apply(
+            JobResult::Withdrawn {
+                generation,
+                service,
+                result: Err("nope".to_string()),
+            },
+            now + Duration::from_secs(4),
+        );
+        assert!(
+            state
+                .plan(now + Duration::from_secs(5), 4)
+                .iter()
+                .all(|job| !matches!(job, JobSpec::Withdraw { .. }))
+        );
+        assert!(matches!(
+            state.plan(now + Duration::from_secs(10), 4).as_slice(),
+            [JobSpec::Withdraw { .. }]
+        ));
+    }
+
+    #[test]
+    fn reconcile_dirty_reruns_after_write() {
+        let mut state = RegistryState::new(config_with_services(&["cmd"]));
+        let now = Instant::now();
+        state.known_types.insert("ocr".to_string());
+        state.handle(ServiceCommand::BootstrapCompleted, now);
+        let jobs = state.plan(now, 4);
+        let JobSpec::ReadTypes { generation } = jobs
+            .into_iter()
+            .find(|job| matches!(job, JobSpec::ReadTypes { .. }))
+            .unwrap()
+        else {
+            panic!("expected read");
+        };
+        state.apply(
+            JobResult::TypesRead {
+                generation,
+                result: Ok(vec!["cmd".to_string()]),
+            },
+            now,
+        );
+        let jobs = state.plan(now, 4);
+        let JobSpec::WriteTypes { generation, .. } = jobs
+            .into_iter()
+            .find(|job| matches!(job, JobSpec::WriteTypes { .. }))
+            .unwrap()
+        else {
+            panic!("expected write");
+        };
+        state.handle(ServiceCommand::RefreshTypes, now);
+        state.apply(
+            JobResult::TypesWritten {
+                generation,
+                result: Ok(()),
+            },
+            now,
+        );
+        assert!(state.next_types_sync.is_some_and(|at| at <= now));
+        assert!(
+            state
+                .plan(now, 4)
+                .iter()
+                .any(|job| matches!(job, JobSpec::ReadTypes { .. }))
+        );
+    }
+
+    #[test]
     fn failed_announce_retries_with_backoff() {
         let mut state = RegistryState::new(config_with_services(&["cmd"]));
         let now = Instant::now();
