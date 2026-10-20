@@ -40,14 +40,22 @@ pub struct Response {
     pub data: Vec<u8>,
 }
 
-/// Create a request-response behaviour with the default config.
-pub fn new_service_req_behaviour() -> cbor::Behaviour<Request, Response> {
+/// Create a request-response behaviour with explicit message size limits.
+pub fn new_service_req_behaviour(
+    max_request_bytes: u64,
+    max_response_bytes: u64,
+) -> cbor::Behaviour<Request, Response> {
     let cfg = Config::default().with_request_timeout(REQUEST_TIMEOUT);
 
     // Convert &str to StreamProtocol.
     let protocol = StreamProtocol::new(SERVICE_REQ_PROTOCOL);
 
-    cbor::Behaviour::new(
+    let codec = cbor::codec::Codec::<Request, Response>::default()
+        .set_request_size_maximum(max_request_bytes)
+        .set_response_size_maximum(max_response_bytes);
+
+    cbor::Behaviour::with_codec(
+        codec,
         vec![(protocol, request_response::ProtocolSupport::Full)],
         cfg,
     )

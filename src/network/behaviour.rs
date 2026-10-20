@@ -173,12 +173,19 @@ impl NetBehaviour {
             Toggle::from(None)
         };
 
-        let service_req = service_protocol::new_service_req_behaviour();
+        let max_request_bytes = config.dispatcher_max_request_bytes();
+        let max_response_bytes = config.dispatcher_max_response_bytes();
+        let service_req =
+            service_protocol::new_service_req_behaviour(max_request_bytes, max_response_bytes);
 
         // PQ behaviours: registered only when enabled.
         let pq_active = config.pq_enabled();
         let service_req_pq: Toggle<cbor::Behaviour<PqRequest, PqResponse>> = if pq_active {
-            Toggle::from(Some(cbor::Behaviour::new(
+            let codec = cbor::codec::Codec::<PqRequest, PqResponse>::default()
+                .set_request_size_maximum(max_request_bytes)
+                .set_response_size_maximum(max_response_bytes);
+            Toggle::from(Some(cbor::Behaviour::with_codec(
+                codec,
                 vec![(
                     StreamProtocol::new(pq::SERVICE_REQ_PQ_PROTOCOL),
                     ProtocolSupport::Full,
