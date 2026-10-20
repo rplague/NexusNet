@@ -172,7 +172,9 @@ impl NetworkHandle {
     }
 
     /// Fetch a record from the DHT peers, ignoring the local store copy and the
-    /// 60s result cache. See `SwarmCommand::KadGetRecordNetwork`.
+    /// 60s result cache. A network-only `NotFound` is reported as
+    /// `FinishedWithNoAdditionalRecord`, so callers can treat an absent record
+    /// as an empty result. See `SwarmCommand::KadGetRecordNetwork`.
     pub async fn get_record_network(
         &self,
         key: kad::RecordKey,
@@ -392,6 +394,26 @@ fn cacheable_record(
         }
         Ok(kad::GetRecordOk::FinishedWithNoAdditionalRecord { .. }) if !network_only => Some(None),
         _ => None,
+    }
+}
+
+/// Normalize a finished `GetRecord` query.
+///
+/// For network-only reads, `NotFound` is the definitive "the DHT has no such
+/// record" answer, not a failure. Reporting it as an empty completed query lets
+/// callers (e.g. the service-type index) publish their local monotonic union
+/// instead of retrying forever.
+fn finalize_get_record(
+    result: Result<kad::GetRecordOk, kad::GetRecordError>,
+    network_only: bool,
+) -> Result<kad::GetRecordOk, NetworkError> {
+    match result {
+        Err(kad::GetRecordError::NotFound { .. }) if network_only => {
+            Ok(kad::GetRecordOk::FinishedWithNoAdditionalRecord {
+                cache_candidates: Default::default(),
+            })
+        }
+        other => other.map_err(|e| NetworkError::Kad(format!("{e:?}"))),
     }
 }
 
@@ -797,7 +819,7 @@ impl SwarmActor {
                     if let Some(value) = cacheable_record(&result, network_only) {
                         self.insert_cached(key, value);
                     }
-                    let _ = resp.send(result.map_err(|e| NetworkError::Kad(format!("{e:?}"))));
+                    let _ = resp.send(finalize_get_record(result, network_only));
                 }
             }
             kad::QueryResult::GetProviders(result) => {
@@ -1872,6 +1894,26 @@ mod tests {
             cache_candidates: Default::default(),
         };
         assert_eq!(cacheable_record(&Ok(ok), true), None);
+    }
+
+    #[test]
+    fn network_only_not_found_is_an_empty_result() {
+        let key = kad::RecordKey::new(b"/oahd/service/types");
+        let not_found = || kad::GetRecordError::NotFound {
+            key: key.clone(),
+            closest_peers: Vec::new(),
+        };
+
+        let normalized = finalize_get_record(Err(not_found()), true).unwrap();
+        assert!(matches!(
+            normalized,
+            kad::GetRecordOk::FinishedWithNoAdditionalRecord { .. }
+        ));
+
+        assert!(matches!(
+            finalize_get_record(Err(not_found()), false),
+            Err(NetworkError::Kad(_))
+        ));
     }
 
     #[test]

@@ -1048,6 +1048,40 @@ mod tests {
     }
 
     #[test]
+    fn empty_network_index_bootstraps_announced_types() {
+        let mut state = RegistryState::new(config_with_services(&["cmd"]));
+        let now = Instant::now();
+        state.announced.insert("cmd".to_string());
+        state.handle(ServiceCommand::BootstrapCompleted, now);
+
+        let jobs = state.plan(now, 4);
+        let JobSpec::ReadTypes { generation } = jobs
+            .into_iter()
+            .find(|job| matches!(job, JobSpec::ReadTypes { .. }))
+            .unwrap()
+        else {
+            panic!("expected read");
+        };
+        state.apply(
+            JobResult::TypesRead {
+                generation,
+                result: Ok(Vec::new()),
+            },
+            now,
+        );
+
+        let jobs = state.plan(now, 4);
+        let JobSpec::WriteTypes { value, .. } = jobs
+            .into_iter()
+            .find(|job| matches!(job, JobSpec::WriteTypes { .. }))
+            .unwrap()
+        else {
+            panic!("expected write");
+        };
+        assert_eq!(parse_types(&value).unwrap(), vec!["cmd".to_string()]);
+    }
+
+    #[test]
     fn failed_withdraw_is_retried() {
         let mut state = RegistryState::new(config_with_services(&["cmd"]));
         let now = Instant::now();

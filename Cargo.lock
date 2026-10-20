@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "NexusNet"
-version = "0.5.1-1404"
+version = "0.5.1-1432"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -30,6 +30,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "toml",
+ "toml_edit",
  "uuid",
  "x25519-dalek",
 ]
