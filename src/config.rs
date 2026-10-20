@@ -188,6 +188,15 @@ impl NodeConfig {
                         LogStruct::new(LogLevel::Critical, "配置校验失败", e).emit();
                         std::process::exit(1);
                     }
+                    if let Some(completed) = complete_missing_fields(&content, &config) {
+                        write_atomic_or_exit(path, &completed);
+                        LogStruct::new(
+                            LogLevel::Preset,
+                            "配置已自动补全",
+                            path.display().to_string(),
+                        )
+                        .emit();
+                    }
                     return config;
                 }
                 Err(e) => {
@@ -242,6 +251,64 @@ fn rename_bad_config(path: &Path) -> io::Result<()> {
     }
     fs::rename(path, &backup_path)?;
     Ok(())
+}
+
+/// Fill in keys that exist in `config` but are missing from the TOML document.
+///
+/// Existing values, unknown keys, comments and array-of-table entries are left
+/// untouched. Returns `None` when the document is already complete.
+fn complete_missing_fields(original: &str, config: &NodeConfig) -> Option<String> {
+    let mut doc = original.parse::<toml_edit::DocumentMut>().ok()?;
+    let complete = toml::to_string_pretty(config).ok()?;
+    let defaults = complete.parse::<toml_edit::DocumentMut>().ok()?;
+    merge_missing(doc.as_table_mut(), defaults.as_table());
+    let updated = doc.to_string();
+    (updated != original).then_some(updated)
+}
+
+fn merge_missing(dst: &mut toml_edit::Table, src: &toml_edit::Table) {
+    for (key, src_item) in src.iter() {
+        match dst.get_mut(key) {
+            None => {
+                dst.insert(key, src_item.clone());
+            }
+            Some(dst_item) => {
+                if let (Some(dst_table), Some(src_table)) =
+                    (dst_item.as_table_mut(), src_item.as_table())
+                {
+                    merge_missing(dst_table, src_table);
+                }
+            }
+        }
+    }
+}
+
+fn write_atomic_or_exit(path: &Path, content: &str) {
+    let temp_path = path.with_extension("tmp");
+    if let Err(e) = fs::write(&temp_path, content) {
+        LogStruct::new(
+            LogLevel::Critical,
+            "写入临时配置文件失败",
+            format!("路径: {}, 错误: {}", temp_path.display(), e),
+        )
+        .emit();
+        std::process::exit(1);
+    }
+    if let Err(e) = fs::rename(&temp_path, path) {
+        let _ = fs::remove_file(&temp_path);
+        LogStruct::new(
+            LogLevel::Critical,
+            "重命名配置文件失败",
+            format!(
+                "从 {} 到 {}, 错误: {}",
+                temp_path.display(),
+                path.display(),
+                e
+            ),
+        )
+        .emit();
+        std::process::exit(1);
+    }
 }
 
 fn default_name() -> String {
@@ -550,33 +617,7 @@ impl ConfigHandle {
             }
         };
 
-        let temp_path = path.with_extension("tmp");
-
-        if let Err(e) = fs::write(&temp_path, toml_string) {
-            LogStruct::new(
-                LogLevel::Critical,
-                "写入临时配置文件失败",
-                format!("路径: {}, 错误: {}", temp_path.display(), e),
-            )
-            .emit();
-            std::process::exit(1);
-        }
-
-        if let Err(e) = fs::rename(&temp_path, path) {
-            let _ = fs::remove_file(&temp_path);
-            LogStruct::new(
-                LogLevel::Critical,
-                "重命名配置文件失败",
-                format!(
-                    "从 {} 到 {}, 错误: {}",
-                    temp_path.display(),
-                    path.display(),
-                    e
-                ),
-            )
-            .emit();
-            std::process::exit(1);
-        }
+        write_atomic_or_exit(path, &toml_string);
     }
 
     /// Save to the default config path (`NEXUSNET_CONFIG_PATH`).
@@ -1017,6 +1058,55 @@ mod tests {
 
         invalid.services.dispatcher.max_response_bytes = 0;
         assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn config_completion_adds_missing_fields_and_keeps_comments() {
+        let original = r#"# 保留注释
+[node]
+name = "自定义"
+custom_key = "keep"
+
+[[services.dispatcher.local_services]]
+name = "cmd"
+port = 5014
+"#;
+        let config: NodeConfig = toml::from_str(original).unwrap();
+        let completed = complete_missing_fields(original, &config).expect("should complete");
+
+        assert!(completed.contains("# 保留注释"));
+        assert!(completed.contains("custom_key = \"keep\""));
+        assert!(completed.contains("query_timeout_secs"));
+        assert!(completed.contains("max_request_bytes"));
+        assert!(completed.contains("bootstrap_nodes"));
+        assert!(completed.contains("name = \"cmd\""));
+
+        let reparsed: NodeConfig = toml::from_str(&completed).unwrap();
+        assert_eq!(reparsed.node.name, "自定义");
+        assert_eq!(reparsed.services.dispatcher.local_services.len(), 1);
+    }
+
+    #[test]
+    fn config_completion_is_noop_when_complete() {
+        let config = NodeConfig::default();
+        let original = toml::to_string_pretty(&config).unwrap();
+        assert!(complete_missing_fields(&original, &config).is_none());
+    }
+
+    #[test]
+    fn from_toml_file_persists_completed_config() {
+        let path =
+            std::env::temp_dir().join(format!("nexusnet-config-{}.toml", uuid::Uuid::new_v4()));
+        fs::write(&path, "[node]\nname = \"x\"\n").unwrap();
+
+        let config = NodeConfig::from_toml_file(&path, true);
+        assert_eq!(config.node.name, "x");
+
+        let saved = fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("name = \"x\""));
+        assert!(saved.contains("max_request_bytes"));
+
+        let _ = fs::remove_file(&path);
     }
 
     #[test]

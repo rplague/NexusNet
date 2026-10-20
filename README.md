@@ -153,6 +153,10 @@ authority = "<base64 ed25519 公钥>"
 约增加 8 KiB 开销；接近上限时需适当调大。发送端会在本地先检查大小并直接返回明确错误；
 两端都需升级并配置足够的上限，旧版本对端仍按 1 MiB 拒绝大请求。
 
+启动读取配置时，文件中缺失的字段会自动补全并原子写回；已有值、未知字段、注释和数组表
+条目保持不变。补全写回失败会记录 Critical 并退出。注意 `network` 公网 IP 自动更新仍会
+按规范格式整体重写配置文件。
+
 配置路径由环境变量决定（见 `src/paths.rs`）：`NEXUSNET_CONFIG_PATH`、
 `NEXUSNET_KEYPAIR_PATH`、`NEXUSNET_LOG_PATH`（均为目录；`NEXUSNET_LOG_PATH` 仅文件输出
 模式使用，systemd 下日志走 journald）、`NEXUSNET_LOG_MODE`；未设置时回退当前目录。
@@ -316,7 +320,7 @@ u32_be(len) || cbor(message)      # len <= 16 MiB
 
 ## 开发状态
 
-当前版本：**0.5.1-1404** — 完成度 **5.5/10**
+当前版本：**0.5.1-1432** — 完成度 **5.5/10**
 
 ## 许可
 
