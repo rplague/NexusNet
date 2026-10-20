@@ -443,10 +443,34 @@ enum PendingInbound {
     },
 }
 
+/// An inbound request awaiting an application response.
+struct PendingInboundEntry {
+    connection_id: ConnectionId,
+    peer: PeerId,
+    pending: PendingInbound,
+}
+
+/// Waiter and wire size for an outbound plaintext request.
+struct PendingOutbound {
+    resp: oneshot::Sender<Result<service_protocol::Response, NetworkError>>,
+    wire_len: u64,
+}
+
 /// Waiter and response key for an outbound PQ request.
 struct PqOutboundPending {
     resp: oneshot::Sender<Result<service_protocol::Response, NetworkError>>,
     out: pq::PqOutbound,
+    wire_len: u64,
+}
+
+/// Rejection returned to requests that arrive during a hot reload.
+const RELOAD_REJECTION: &[u8] = b"node is reloading; retry shortly";
+
+fn reload_rejection_response() -> service_protocol::Response {
+    service_protocol::Response {
+        success: false,
+        data: RELOAD_REJECTION.to_vec(),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -505,13 +529,10 @@ pub(crate) struct SwarmActor {
     /// Verified and cached peer PQ identities.
     pq_identities: HashMap<PeerId, PqIdentity>,
     pending_kad: HashMap<kad::QueryId, KadPending>,
-    pending_outbound: HashMap<
-        request_response::OutboundRequestId,
-        oneshot::Sender<Result<service_protocol::Response, NetworkError>>,
-    >,
+    pending_outbound: HashMap<request_response::OutboundRequestId, PendingOutbound>,
     pending_outbound_pq: HashMap<request_response::OutboundRequestId, PqOutboundPending>,
     pending_pq_identity: HashMap<request_response::OutboundRequestId, PeerId>,
-    pending_inbound: HashMap<String, (ConnectionId, PendingInbound)>,
+    pending_inbound: HashMap<String, PendingInboundEntry>,
     /// `get_record` result cache (including negative entries).
     record_cache: HashMap<kad::RecordKey, CachedRecord>,
 }
@@ -675,7 +696,7 @@ impl SwarmActor {
                 // After a connection closes its pending inbound requests can no
                 // longer be replied to; clean them up to avoid a leak.
                 self.pending_inbound
-                    .retain(|_, (cid, _)| *cid != connection_id);
+                    .retain(|_, entry| entry.connection_id != connection_id);
                 if num_established == 0 {
                     self.peer_protocols.remove(&peer_id);
                     self.pq_identities.remove(&peer_id);
@@ -844,7 +865,11 @@ impl SwarmActor {
 
                     self.pending_inbound.insert(
                         request_id.clone(),
-                        (connection_id, PendingInbound::Plain(channel)),
+                        PendingInboundEntry {
+                            connection_id,
+                            peer,
+                            pending: PendingInbound::Plain(channel),
+                        },
                     );
 
                     let _ = self.event_tx.send(NetworkEvent::InboundServiceRequest {
@@ -881,17 +906,35 @@ impl SwarmActor {
                     response,
                     ..
                 } => {
-                    if let Some(sender) = self.pending_outbound.remove(&request_id) {
-                        let _ = sender.send(Ok(response));
+                    if let Some(pending) = self.pending_outbound.remove(&request_id) {
+                        let _ = pending.resp.send(Ok(response));
                     }
                 }
             },
             request_response::Event::OutboundFailure {
-                request_id, error, ..
+                peer,
+                request_id,
+                error,
+                ..
             } => {
-                if let Some(sender) = self.pending_outbound.remove(&request_id) {
-                    let _ = sender.send(Err(NetworkError::Request(error.to_string())));
+                if let Some(pending) = self.pending_outbound.remove(&request_id) {
+                    let message = describe_outbound_failure(
+                        false,
+                        peer,
+                        service_protocol::SERVICE_REQ_PROTOCOL,
+                        Some(pending.wire_len),
+                        &error,
+                    );
+                    let _ = pending.resp.send(Err(NetworkError::Request(message)));
                 }
+            }
+            request_response::Event::InboundFailure { peer, error, .. } => {
+                let detail = describe_inbound_failure(
+                    peer,
+                    self.config.dispatcher_max_request_bytes(),
+                    &error,
+                );
+                LogStruct::new(LogLevel::Warning, "入站服务请求失败", detail).emit();
             }
             _ => {}
         }
@@ -913,15 +956,27 @@ impl SwarmActor {
                     request, channel, ..
                 } => {
                     let Some(keys) = self.pq_keys.as_ref() else {
-                        LogStruct::new(LogLevel::Warning, "PQ 请求无法处理", "本地未加载 PQ 密钥")
-                            .emit();
+                        LogStruct::new(
+                            LogLevel::Warning,
+                            "PQ 请求中止",
+                            format!(
+                                "{peer}: 本地未加载 PQ 密钥；请检查 keypair.pq.bin 与 crypto.pq_* 配置"
+                            ),
+                        )
+                        .emit();
                         return;
                     };
                     let inbound = match pq::open_request(keys, &peer, &request) {
                         Ok(v) => v,
                         Err(e) => {
-                            LogStruct::new(LogLevel::Warning, "PQ 请求解密失败", e.to_string())
-                                .emit();
+                            LogStruct::new(
+                                LogLevel::Warning,
+                                "PQ 请求解密失败",
+                                format!(
+                                    "{peer}: {e}；可能对端缓存的 identity 已过期或两端 PQ 密钥不一致"
+                                ),
+                            )
+                            .emit();
                             return;
                         }
                     };
@@ -941,7 +996,12 @@ impl SwarmActor {
                         return;
                     }
                     let Some(req) = decode_request(&inbound.plaintext) else {
-                        LogStruct::new(LogLevel::Warning, "PQ 请求格式错误", "").emit();
+                        LogStruct::new(
+                            LogLevel::Warning,
+                            "PQ 请求格式错误",
+                            format!("{peer}: 解密后的请求 payload 无法解析"),
+                        )
+                        .emit();
                         if let Ok(response) =
                             inbound.seal_response(&encode_response(&service_protocol::Response {
                                 success: false,
@@ -958,7 +1018,11 @@ impl SwarmActor {
                     let (resp_tx, resp_rx) = oneshot::channel();
                     self.pending_inbound.insert(
                         request_id.clone(),
-                        (connection_id, PendingInbound::Pq { channel, inbound }),
+                        PendingInboundEntry {
+                            connection_id,
+                            peer,
+                            pending: PendingInbound::Pq { channel, inbound },
+                        },
                     );
                     let _ = self.event_tx.send(NetworkEvent::InboundServiceRequest {
                         peer,
@@ -995,24 +1059,41 @@ impl SwarmActor {
                         let result = match pending.out.open_response(&response) {
                             Ok(bytes) => match decode_response(&bytes) {
                                 Some(resp) => Ok(resp),
-                                None => {
-                                    Err(NetworkError::Request("pq response decode failed".into()))
-                                }
+                                None => Err(NetworkError::Request(
+                                    "PQ 响应解码失败（响应可能被截断或超过 max_response_bytes）"
+                                        .into(),
+                                )),
                             },
-                            Err(e) => Err(NetworkError::Request(e.to_string())),
+                            Err(e) => Err(NetworkError::Request(format!("PQ 响应解密失败: {e}"))),
                         };
                         let _ = pending.resp.send(result);
                     }
                 }
             },
             request_response::Event::OutboundFailure {
-                request_id, error, ..
+                peer,
+                request_id,
+                error,
+                ..
             } => {
                 if let Some(pending) = self.pending_outbound_pq.remove(&request_id) {
-                    let _ = pending
-                        .resp
-                        .send(Err(NetworkError::Request(error.to_string())));
+                    let message = describe_outbound_failure(
+                        true,
+                        peer,
+                        pq::SERVICE_REQ_PQ_PROTOCOL,
+                        Some(pending.wire_len),
+                        &error,
+                    );
+                    let _ = pending.resp.send(Err(NetworkError::Request(message)));
                 }
+            }
+            request_response::Event::InboundFailure { peer, error, .. } => {
+                let detail = describe_inbound_failure(
+                    peer,
+                    self.config.dispatcher_max_request_bytes(),
+                    &error,
+                );
+                LogStruct::new(LogLevel::Warning, "入站 PQ 请求失败", detail).emit();
             }
             _ => {}
         }
@@ -1053,8 +1134,27 @@ impl SwarmActor {
                     }
                 }
             },
-            request_response::Event::OutboundFailure { request_id, .. } => {
+            request_response::Event::OutboundFailure {
+                peer,
+                request_id,
+                error,
+                ..
+            } => {
                 self.pending_pq_identity.remove(&request_id);
+                LogStruct::new(
+                    LogLevel::Debug,
+                    "PQ 身份请求失败",
+                    format!("{peer}: {error}"),
+                )
+                .emit();
+            }
+            request_response::Event::InboundFailure { peer, error, .. } => {
+                let detail = describe_inbound_failure(
+                    peer,
+                    self.config.dispatcher_max_request_bytes(),
+                    &error,
+                );
+                LogStruct::new(LogLevel::Debug, "入站 PQ 身份请求失败", detail).emit();
             }
             _ => {}
         }
@@ -1232,6 +1332,23 @@ impl SwarmActor {
                     }
                 };
 
+                let max_request_bytes = self.config.dispatcher_max_request_bytes();
+                let plain_wire_len = match encoded_len(&request) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        let _ = resp.send(Err(e));
+                        return true;
+                    }
+                };
+                if plain_wire_len > max_request_bytes {
+                    let _ = resp.send(Err(request_too_large_error(
+                        plain_wire_len,
+                        max_request_bytes,
+                        false,
+                    )));
+                    return true;
+                }
+
                 if use_pq {
                     let recipient = self.pq_identities.get(&peer).cloned().unwrap();
                     let sign = self.config.pq_identity_enabled();
@@ -1247,10 +1364,31 @@ impl SwarmActor {
                     };
                     match sealed {
                         Ok(out) => {
+                            let wire_len = match encoded_len(&out.request) {
+                                Ok(n) => n,
+                                Err(e) => {
+                                    let _ = resp.send(Err(e));
+                                    return true;
+                                }
+                            };
+                            if wire_len > max_request_bytes {
+                                let _ = resp.send(Err(request_too_large_error(
+                                    wire_len,
+                                    max_request_bytes,
+                                    true,
+                                )));
+                                return true;
+                            }
                             if let Some(b) = self.swarm.behaviour_mut().service_req_pq.as_mut() {
                                 let id = b.send_request(&peer, out.request.clone());
-                                self.pending_outbound_pq
-                                    .insert(id, PqOutboundPending { resp, out });
+                                self.pending_outbound_pq.insert(
+                                    id,
+                                    PqOutboundPending {
+                                        resp,
+                                        out,
+                                        wire_len,
+                                    },
+                                );
                             } else {
                                 let _ = resp.send(Err(NetworkError::Request(
                                     "pq behaviour disabled".into(),
@@ -1267,15 +1405,22 @@ impl SwarmActor {
                         .behaviour_mut()
                         .service_req
                         .send_request(&peer, request);
-                    self.pending_outbound.insert(request_id, resp);
+                    self.pending_outbound.insert(
+                        request_id,
+                        PendingOutbound {
+                            resp,
+                            wire_len: plain_wire_len,
+                        },
+                    );
                 }
             }
             SwarmCommand::ServiceSendResponse {
                 request_id,
                 response,
             } => {
-                if let Some((_, pending)) = self.pending_inbound.remove(&request_id) {
-                    match pending {
+                if let Some(entry) = self.pending_inbound.remove(&request_id) {
+                    let peer = entry.peer;
+                    match entry.pending {
                         PendingInbound::Plain(channel) => {
                             let _ = self
                                 .swarm
@@ -1290,13 +1435,24 @@ impl SwarmActor {
                                         self.swarm.behaviour_mut().service_req_pq.as_mut()
                                     {
                                         let _ = b.send_response(channel, resp);
+                                    } else {
+                                        LogStruct::new(
+                                            LogLevel::Warning,
+                                            "PQ 响应无法发送",
+                                            format!(
+                                                "request={request_id} peer={peer}: PQ behaviour 已禁用；该请求将无法回复，对端会收到空响应"
+                                            ),
+                                        )
+                                        .emit();
                                     }
                                 }
                                 Err(e) => {
                                     LogStruct::new(
                                         LogLevel::Warning,
                                         "PQ 响应加密失败",
-                                        e.to_string(),
+                                        format!(
+                                            "request={request_id} peer={peer}: {e}；该请求将无法回复，对端会收到空响应"
+                                        ),
                                     )
                                     .emit();
                                 }
@@ -1335,10 +1491,7 @@ impl SwarmActor {
     }
 
     fn reject_inbound(&mut self, pending: PendingInbound) {
-        let message = service_protocol::Response {
-            success: false,
-            data: b"node reloading".to_vec(),
-        };
+        let message = reload_rejection_response();
         match pending {
             PendingInbound::Plain(channel) => {
                 let _ = self
@@ -1357,6 +1510,85 @@ impl SwarmActor {
         }
     }
 
+    /// Reply to inbound requests that are still queued on the old Swarm during
+    /// a reload, instead of silently dropping their response channels.
+    fn reject_old_swarm_event(&mut self, event: SwarmEvent<NetBehaviourEvent>) {
+        match event {
+            SwarmEvent::Behaviour(NetBehaviourEvent::ServiceReq(
+                request_response::Event::Message {
+                    message: request_response::Message::Request { channel, .. },
+                    ..
+                },
+            )) => {
+                let _ = self
+                    .swarm
+                    .behaviour_mut()
+                    .service_req
+                    .send_response(channel, reload_rejection_response());
+            }
+            SwarmEvent::Behaviour(NetBehaviourEvent::ServiceReqPq(
+                request_response::Event::Message {
+                    peer,
+                    message:
+                        request_response::Message::Request {
+                            request, channel, ..
+                        },
+                    ..
+                },
+            )) => {
+                let Some(keys) = self.pq_keys.as_ref() else {
+                    LogStruct::new(
+                        LogLevel::Warning,
+                        "PQ 请求中止",
+                        format!(
+                            "{peer}: 本地未加载 PQ 密钥；请检查 keypair.pq.bin 与 crypto.pq_* 配置"
+                        ),
+                    )
+                    .emit();
+                    return;
+                };
+                match pq::open_request(keys, &peer, &request) {
+                    Ok(inbound) => {
+                        if let Ok(sealed) =
+                            inbound.seal_response(&encode_response(&reload_rejection_response()))
+                            && let Some(behaviour) =
+                                self.swarm.behaviour_mut().service_req_pq.as_mut()
+                        {
+                            let _ = behaviour.send_response(channel, sealed);
+                        }
+                    }
+                    Err(e) => {
+                        LogStruct::new(
+                            LogLevel::Warning,
+                            "PQ 请求解密失败",
+                            format!(
+                                "{peer}: {e}；可能对端缓存的 identity 已过期或两端 PQ 密钥不一致"
+                            ),
+                        )
+                        .emit();
+                    }
+                }
+            }
+            SwarmEvent::Behaviour(NetBehaviourEvent::PqIdentity(
+                request_response::Event::Message {
+                    message: request_response::Message::Request { channel, .. },
+                    ..
+                },
+            )) => {
+                let identity = self
+                    .pq_keys
+                    .as_ref()
+                    .and_then(|k| k.identity(&self.keypair).ok());
+                if let Some(identity) = identity
+                    && let Some(behaviour) = self.swarm.behaviour_mut().pq_identity.as_mut()
+                {
+                    let _ = behaviour.send_response(channel, identity);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Rebuild the Swarm from the current config. The new Swarm is built first,
     /// so a build failure leaves the old one untouched.
     async fn reload(&mut self) -> Result<(), NetworkError> {
@@ -1365,23 +1597,27 @@ impl SwarmActor {
         let inbound: Vec<PendingInbound> = self
             .pending_inbound
             .drain()
-            .map(|(_, (_, pending))| pending)
+            .map(|(_, entry)| entry.pending)
             .collect();
         for pending in inbound {
             self.reject_inbound(pending);
         }
-        let _ = tokio::time::timeout(Duration::from_millis(250), async {
-            loop {
-                let _ = self.swarm.select_next_some().await;
-            }
-        })
-        .await;
+
+        let deadline = tokio::time::sleep(Duration::from_millis(250));
+        tokio::pin!(deadline);
+        loop {
+            let event = tokio::select! {
+                _ = &mut deadline => break,
+                event = self.swarm.select_next_some() => event,
+            };
+            self.reject_old_swarm_event(event);
+        }
 
         for (_, pending) in self.pending_kad.drain() {
             pending.fail(NetworkError::Reloaded);
         }
-        for (_, tx) in self.pending_outbound.drain() {
-            let _ = tx.send(Err(NetworkError::Reloaded));
+        for (_, pending) in self.pending_outbound.drain() {
+            let _ = pending.resp.send(Err(NetworkError::Reloaded));
         }
         for (_, pending) in self.pending_outbound_pq.drain() {
             let _ = pending.resp.send(Err(NetworkError::Reloaded));
@@ -1440,6 +1676,88 @@ fn decode_response(bytes: &[u8]) -> Option<service_protocol::Response> {
         success: *success != 0,
         data: data.to_vec(),
     })
+}
+
+/// Encode a value with the same codec used on the wire to measure its size.
+fn encoded_len<T: serde::Serialize>(value: &T) -> Result<u64, NetworkError> {
+    cbor4ii::serde::to_vec(Vec::new(), value)
+        .map(|encoded| encoded.len() as u64)
+        .map_err(|e| NetworkError::Request(format!("encode request failed: {e}")))
+}
+
+fn request_too_large_error(wire_len: u64, limit: u64, pq: bool) -> NetworkError {
+    let suffix = if pq {
+        "; PQ encrypted envelope overhead is included"
+    } else {
+        ""
+    };
+    NetworkError::Request(format!(
+        "request too large: {wire_len} bytes > services.dispatcher.max_request_bytes ({limit} bytes){suffix}"
+    ))
+}
+
+/// Turn a libp2p outbound failure into an actionable error message.
+fn describe_outbound_failure(
+    pq: bool,
+    peer: PeerId,
+    protocol: &str,
+    wire_len: Option<u64>,
+    error: &request_response::OutboundFailure,
+) -> String {
+    use request_response::OutboundFailure;
+    use std::io::ErrorKind;
+
+    let size_hint = wire_len
+        .map(|n| format!("；本端请求 {n} 字节"))
+        .unwrap_or_default();
+    match error {
+        OutboundFailure::Io(e) => match e.kind() {
+            ErrorKind::UnexpectedEof if pq => format!(
+                "对端 {peer} 未返回响应就关闭了 PQ 请求流（可能原因：对端缺少 PQ 密钥、PQ 密钥/身份不匹配、请求超过对端 max_request_bytes 或对端内部错误{size_hint}）"
+            ),
+            ErrorKind::UnexpectedEof => format!(
+                "对端 {peer} 未返回响应就关闭了请求流（可能原因：请求超过对端 max_request_bytes、被对端拒绝或对端内部错误{size_hint}）"
+            ),
+            ErrorKind::InvalidData | ErrorKind::Unsupported => format!(
+                "对端 {peer} 响应解析失败（响应可能被截断、超过 max_response_bytes 或协议版本不兼容）: {e}"
+            ),
+            _ => format!("对端 {peer} 请求流 I/O 错误: {e}"),
+        },
+        OutboundFailure::Timeout => format!(
+            "对端 {peer} 响应超时（{}s）",
+            service_protocol::REQUEST_TIMEOUT.as_secs()
+        ),
+        OutboundFailure::ConnectionClosed => format!("对端 {peer} 在返回响应前关闭了连接"),
+        OutboundFailure::UnsupportedProtocols => format!("对端 {peer} 不支持协议 {protocol}"),
+        OutboundFailure::DialFailure => format!("无法与对端 {peer} 建立连接"),
+    }
+}
+
+/// Turn a libp2p inbound failure into an actionable log message.
+fn describe_inbound_failure(
+    peer: PeerId,
+    max_request_bytes: u64,
+    error: &request_response::InboundFailure,
+) -> String {
+    use request_response::InboundFailure;
+    use std::io::ErrorKind;
+
+    match error {
+        InboundFailure::Io(e)
+            if matches!(
+                e.kind(),
+                ErrorKind::UnexpectedEof | ErrorKind::InvalidData | ErrorKind::InvalidInput
+            ) =>
+        {
+            format!(
+                "{peer}: {error}；请求可能超过 services.dispatcher.max_request_bytes（当前 {max_request_bytes} 字节）"
+            )
+        }
+        InboundFailure::ResponseOmission => {
+            format!("{peer}: {error}；响应通道被丢弃，对端会收到空响应")
+        }
+        _ => format!("{peer}: {error}"),
+    }
 }
 
 #[cfg(test)]
@@ -1591,5 +1909,76 @@ mod tests {
             MissingTransport
         );
         assert_eq!(send_security(true, true, true, true, Some(true)), Pq);
+    }
+
+    #[test]
+    fn encoded_len_matches_cbor_wire_size() {
+        let request = service_protocol::Request {
+            service: "cmd".to_string(),
+            payload: vec![7; 32],
+        };
+        let encoded = cbor4ii::serde::to_vec(Vec::new(), &request).unwrap();
+        assert_eq!(encoded_len(&request).unwrap() as usize, encoded.len());
+    }
+
+    #[test]
+    fn request_too_large_error_mentions_config_field() {
+        let plain = request_too_large_error(2048, 1024, false).to_string();
+        assert!(plain.contains("2048"));
+        assert!(plain.contains("services.dispatcher.max_request_bytes"));
+        assert!(!plain.contains("PQ"));
+
+        let pq = request_too_large_error(2048, 1024, true).to_string();
+        assert!(pq.contains("PQ encrypted envelope overhead"));
+    }
+
+    #[test]
+    fn outbound_failure_messages_are_actionable() {
+        let peer = PeerId::random();
+        let eof = request_response::OutboundFailure::Io(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "eof",
+        ));
+
+        let plain = describe_outbound_failure(
+            false,
+            peer,
+            service_protocol::SERVICE_REQ_PROTOCOL,
+            Some(123),
+            &eof,
+        );
+        assert!(plain.contains("max_request_bytes"));
+        assert!(plain.contains("123"));
+        assert!(!plain.contains("PQ"));
+
+        let pq =
+            describe_outbound_failure(true, peer, pq::SERVICE_REQ_PQ_PROTOCOL, Some(456), &eof);
+        assert!(pq.contains("PQ 密钥"));
+        assert!(pq.contains("456"));
+
+        let timeout = request_response::OutboundFailure::Timeout;
+        assert!(
+            describe_outbound_failure(
+                false,
+                peer,
+                service_protocol::SERVICE_REQ_PROTOCOL,
+                None,
+                &timeout,
+            )
+            .contains("超时")
+        );
+    }
+
+    #[test]
+    fn inbound_failure_messages_have_hints() {
+        let peer = PeerId::random();
+        let io = request_response::InboundFailure::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "bad",
+        ));
+        assert!(describe_inbound_failure(peer, 4096, &io).contains("max_request_bytes"));
+
+        let omission = request_response::InboundFailure::ResponseOmission;
+        assert!(describe_inbound_failure(peer, 4096, &omission).contains("空响应"));
     }
 }

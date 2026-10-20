@@ -59,6 +59,14 @@ default_u32_fn!(default_relay_max_failures, 3);
 default_u32_fn!(default_types_sync_seconds, 300);
 default_u32_fn!(default_max_inflight_dht, 4);
 
+/// Default P2P service request/response size limit (16 MiB), aligned with
+/// `sidecar_protocol::MAX_FRAME`.
+fn default_max_message_bytes() -> u64 {
+    16 << 20
+}
+
+const MAX_MESSAGE_BYTES_LIMIT: u64 = 64 << 20;
+
 fn default_auth_network() -> String {
     "none".to_string()
 }
@@ -115,6 +123,20 @@ impl NodeConfig {
         }
         if !(1..=16).contains(&self.services.dispatcher.max_inflight_dht) {
             return Err("services.dispatcher.max_inflight_dht 必须在 1..=16".to_string());
+        }
+        if self.services.dispatcher.max_request_bytes == 0
+            || self.services.dispatcher.max_request_bytes > MAX_MESSAGE_BYTES_LIMIT
+        {
+            return Err(format!(
+                "services.dispatcher.max_request_bytes 必须在 1..={MAX_MESSAGE_BYTES_LIMIT}"
+            ));
+        }
+        if self.services.dispatcher.max_response_bytes == 0
+            || self.services.dispatcher.max_response_bytes > MAX_MESSAGE_BYTES_LIMIT
+        {
+            return Err(format!(
+                "services.dispatcher.max_response_bytes 必须在 1..={MAX_MESSAGE_BYTES_LIMIT}"
+            ));
         }
         if self.services.relay.retry_interval_secs == 0 {
             return Err("services.relay.retry_interval_secs 必须大于 0".to_string());
@@ -412,6 +434,12 @@ pub struct DispatcherConfig {
     /// Maximum number of DHT control commands executing concurrently.
     #[serde(default = "default_max_inflight_dht")]
     pub max_inflight_dht: u32,
+    /// Maximum encoded size of one P2P service request.
+    #[serde(default = "default_max_message_bytes")]
+    pub max_request_bytes: u64,
+    /// Maximum encoded size of one P2P service response.
+    #[serde(default = "default_max_message_bytes")]
+    pub max_response_bytes: u64,
     #[serde(default = "Vec::new")]
     pub local_services: Vec<LocalServiceEntry>,
 }
@@ -423,6 +451,8 @@ impl Default for DispatcherConfig {
             query_timeout_secs: default_query_timeout_seconds(),
             types_sync_secs: default_types_sync_seconds(),
             max_inflight_dht: default_max_inflight_dht(),
+            max_request_bytes: default_max_message_bytes(),
+            max_response_bytes: default_max_message_bytes(),
             local_services: vec![],
         }
     }
@@ -599,6 +629,14 @@ impl ConfigHandle {
 
     pub fn dispatcher_max_inflight_dht(&self) -> usize {
         self.read().services.dispatcher.max_inflight_dht as usize
+    }
+
+    pub fn dispatcher_max_request_bytes(&self) -> u64 {
+        self.read().services.dispatcher.max_request_bytes
+    }
+
+    pub fn dispatcher_max_response_bytes(&self) -> u64 {
+        self.read().services.dispatcher.max_response_bytes
     }
 
     /// Interval, in seconds, between global service-type index reconciliations.
@@ -943,6 +981,42 @@ mod tests {
         assert!(config.validate().is_err());
         config.services.dispatcher.max_inflight_dht = 16;
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn dispatcher_message_limits_default_parse_and_validate() {
+        let config = NodeConfig::default();
+        assert_eq!(config.services.dispatcher.max_request_bytes, 16 << 20);
+        assert_eq!(config.services.dispatcher.max_response_bytes, 16 << 20);
+        assert!(config.validate().is_ok());
+
+        let handle = ConfigHandle::new(config);
+        assert_eq!(handle.dispatcher_max_request_bytes(), 16 << 20);
+        assert_eq!(handle.dispatcher_max_response_bytes(), 16 << 20);
+
+        let parsed: NodeConfig = toml::from_str(
+            r#"
+            [services.dispatcher]
+            max_request_bytes = 2097152
+            max_response_bytes = 1048576
+            "#,
+        )
+        .unwrap();
+        assert_eq!(parsed.services.dispatcher.max_request_bytes, 2 << 20);
+        assert_eq!(parsed.services.dispatcher.max_response_bytes, 1 << 20);
+
+        let mut invalid = NodeConfig::default();
+        invalid.services.dispatcher.max_request_bytes = 0;
+        assert!(invalid.validate().is_err());
+
+        invalid.services.dispatcher.max_request_bytes = (64 << 20) + 1;
+        assert!(invalid.validate().is_err());
+
+        invalid.services.dispatcher.max_request_bytes = 64 << 20;
+        assert!(invalid.validate().is_ok());
+
+        invalid.services.dispatcher.max_response_bytes = 0;
+        assert!(invalid.validate().is_err());
     }
 
     #[test]

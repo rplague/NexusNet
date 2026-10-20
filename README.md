@@ -115,6 +115,8 @@ enabled = true
 query_timeout_secs = 60
 types_sync_secs = 300
 max_inflight_dht = 4             # 1..=16，DHT 控制命令并发上限
+max_request_bytes = 16777216     # P2P 服务请求上限，默认 16 MiB，范围 1..=64 MiB
+max_response_bytes = 16777216    # P2P 服务响应上限，默认 16 MiB，范围 1..=64 MiB
 
 [[services.dispatcher.local_services]]
 name = "cmd"
@@ -145,6 +147,11 @@ authority = "<base64 ed25519 公钥>"
 
 `services.dispatcher.query_timeout_secs` 是控制指令的基础超时；涉及 DHT 查询的命令会按
 实际需要自动延长。
+
+`services.dispatcher.max_request_bytes` / `max_response_bytes` 限制单个 P2P 服务报文
+（CBOR 编码后）的大小，默认 16 MiB。启用 PQ 时，请求还会附带 KEM/nonce/可选身份签名，
+约增加 8 KiB 开销；接近上限时需适当调大。发送端会在本地先检查大小并直接返回明确错误；
+两端都需升级并配置足够的上限，旧版本对端仍按 1 MiB 拒绝大请求。
 
 配置路径由环境变量决定（见 `src/paths.rs`）：`NEXUSNET_CONFIG_PATH`、
 `NEXUSNET_KEYPAIR_PATH`、`NEXUSNET_LOG_PATH`（均为目录；`NEXUSNET_LOG_PATH` 仅文件输出
@@ -309,7 +316,7 @@ u32_be(len) || cbor(message)      # len <= 16 MiB
 
 ## 开发状态
 
-当前版本：**0.5.1-1832** — 完成度 **5.5/10**
+当前版本：**0.5.1-1404** — 完成度 **5.5/10**
 
 ## 许可
 
