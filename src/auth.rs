@@ -45,15 +45,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
-use coset::{
-    CborSerializable, CoseSign1, CoseSign1Builder, HeaderBuilder, RegisteredLabelWithPrivate, iana,
-};
 use libp2p::identity::{self, ed25519};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::cose::{self, CoseError};
+use crate::limits::DHT_MAX_RECORD_BYTES;
+
 /// Maximum size of a single record, in bytes.
-const MAX_DOC_BYTES: usize = 1 << 20;
+const MAX_DOC_BYTES: usize = DHT_MAX_RECORD_BYTES;
 /// Maximum number of whitelist members.
 const MAX_MEMBERS: usize = 100_000;
 /// Maximum number of services in the index.
@@ -166,6 +166,7 @@ pub struct WhitelistDoc {
     pub members: Vec<String>,
 }
 
+#[allow(dead_code)]
 fn cbor_encode<T: Serialize>(value: &T) -> Result<Vec<u8>, AuthError> {
     let mut buf = Vec::new();
     ciborium::ser::into_writer(value, &mut buf).map_err(|_| AuthError::Malformed)?;
@@ -176,24 +177,23 @@ fn cbor_decode<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, AuthErro
     ciborium::de::from_reader(bytes).map_err(|_| AuthError::Malformed)
 }
 
-fn eddsa_header() -> coset::Header {
-    HeaderBuilder::new()
-        .algorithm(iana::Algorithm::EdDSA)
-        .build()
+fn map_cose_error(error: CoseError) -> AuthError {
+    match error {
+        CoseError::Cose => AuthError::Cose,
+        CoseError::Malformed => AuthError::Malformed,
+        CoseError::InvalidSignature => AuthError::InvalidSignature,
+        CoseError::TooLarge => AuthError::TooLarge,
+    }
 }
 
 /// Sign `payload` with `keypair`; `aad` is the bound key path bytes.
+#[allow(dead_code)]
 fn sign_payload(
     keypair: &identity::Keypair,
     aad: &[u8],
     payload: Vec<u8>,
 ) -> Result<Vec<u8>, AuthError> {
-    let sign1 = CoseSign1Builder::new()
-        .protected(eddsa_header())
-        .payload(payload)
-        .try_create_signature(aad, |data| keypair.sign(data).map_err(|_| AuthError::Cose))?
-        .build();
-    sign1.to_vec().map_err(|_| AuthError::Cose)
+    cose::sign_ed25519(keypair, aad, payload).map_err(map_cose_error)
 }
 
 /// Verify and return the payload; the raw payload bytes are within the signature
@@ -203,31 +203,11 @@ fn verify_payload(
     aad: &[u8],
     value: &[u8],
 ) -> Result<Vec<u8>, AuthError> {
-    if value.len() > MAX_DOC_BYTES {
-        return Err(AuthError::TooLarge);
-    }
-    let sign1 = CoseSign1::from_slice(value).map_err(|_| AuthError::Cose)?;
-
-    // Enforce the EdDSA algorithm to avoid algorithm confusion.
-    let expected = RegisteredLabelWithPrivate::Assigned(iana::Algorithm::EdDSA);
-    if sign1.protected.header.alg != Some(expected) {
-        return Err(AuthError::InvalidSignature);
-    }
-
-    sign1
-        .verify_signature(aad, |sig, data| {
-            if authority.verify(data, sig) {
-                Ok(())
-            } else {
-                Err(AuthError::InvalidSignature)
-            }
-        })
-        .map_err(|_| AuthError::InvalidSignature)?;
-
-    sign1.payload.ok_or(AuthError::Malformed)
+    cose::verify_ed25519(authority, aad, value, MAX_DOC_BYTES).map_err(map_cose_error)
 }
 
 /// Build and sign the index record; returns the full bytes to write to the DHT.
+#[allow(dead_code)]
 pub fn sign_index(
     keypair: &identity::Keypair,
     net: &AuthNetwork,
@@ -239,6 +219,7 @@ pub fn sign_index(
 
 /// Build and sign a service whitelist record; returns the full bytes to write to
 /// the DHT.
+#[allow(dead_code)]
 pub fn sign_whitelist(
     keypair: &identity::Keypair,
     net: &AuthNetwork,

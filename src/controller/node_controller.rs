@@ -15,13 +15,15 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use libp2p::{PeerId, identify, ping};
+use libp2p::{PeerId, identify, kad, ping};
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::config::ConfigHandle;
+use crate::dht_cache::{CachePolicy, DhtCache};
 use crate::log::{LogLevel, LogStruct};
 use crate::network::{AGENT_NAME, NetworkEvent, NetworkHandle, NetworkStart};
 use crate::service_dispatcher::{BackendReadiness, InboundRequest, ToController};
@@ -29,6 +31,10 @@ use crate::service_protocol;
 
 use super::auth_gate::{AuthGate, Decision};
 use super::bootstrap::BootstrapDiscovery;
+use super::dht_fetchers::{
+    GenericRecordFetcher, LegacyTypesFetcher, ProviderFetcher, TypesFetcher,
+};
+use super::legacy_types::LegacyTypesPublisher;
 use super::peer_tracker::PeerTracker;
 use super::relay_manager::RelayManager;
 use super::service_registry::{self, ServiceCommand, ServiceSnapshot};
@@ -54,6 +60,11 @@ pub struct NodeController {
     pub(super) services_snapshot: watch::Receiver<Arc<ServiceSnapshot>>,
     pub(super) relay: RelayManager,
     pub(super) bootstrap: BootstrapDiscovery,
+    pub(super) record_cache: Arc<DhtCache<kad::RecordKey, Vec<u8>, GenericRecordFetcher>>,
+    pub(super) provider_cache: Arc<DhtCache<kad::RecordKey, Vec<PeerId>, ProviderFetcher>>,
+    pub(super) signed_types_cache: Option<Arc<DhtCache<(), BTreeSet<String>, TypesFetcher>>>,
+    pub(super) legacy_types_cache: Arc<DhtCache<(), BTreeSet<String>, LegacyTypesFetcher>>,
+    pub(super) legacy_types_publisher: Option<Arc<LegacyTypesPublisher>>,
 }
 
 impl NodeController {
@@ -88,6 +99,50 @@ impl NodeController {
         let dht_permits = Arc::new(tokio::sync::Semaphore::new(
             config.dispatcher_max_inflight_dht().clamp(1, 16),
         ));
+        let record_cache = DhtCache::new(
+            Arc::new(GenericRecordFetcher {
+                swarm: swarm.clone(),
+            }),
+            CachePolicy::generic(),
+            4,
+        );
+        let provider_cache = DhtCache::new(
+            Arc::new(ProviderFetcher {
+                swarm: swarm.clone(),
+            }),
+            CachePolicy::providers(),
+            4,
+        );
+        let types_interval = Duration::from_secs(config.dispatcher_types_sync_interval() as u64);
+        let legacy_types_cache = DhtCache::new(
+            Arc::new(LegacyTypesFetcher {
+                swarm: swarm.clone(),
+            }),
+            CachePolicy::types(types_interval),
+            2,
+        );
+        let signed_types_cache = config.types_authority_key().map(|authority| {
+            DhtCache::new(
+                Arc::new(TypesFetcher {
+                    swarm: swarm.clone(),
+                    authority,
+                    max_ttl_seconds: config.types_ttl_seconds(),
+                }),
+                CachePolicy::types(types_interval),
+                2,
+            )
+        });
+        let legacy_types_publisher = if signed_types_cache.is_none() && config.kademlia_enabled() {
+            LogStruct::new(
+                LogLevel::Warning,
+                "类型索引兼容模式",
+                "未配置 services.registry.types_authority，使用旧版未签名索引",
+            )
+            .emit();
+            Some(LegacyTypesPublisher::new(swarm.clone(), types_interval))
+        } else {
+            None
+        };
         let services = service_registry::spawn(
             config.clone(),
             swarm.clone(),
@@ -95,7 +150,8 @@ impl NodeController {
             shutdown_rx.clone(),
         );
         let relay = RelayManager::new(config.clone(), swarm.clone(), my_peer_id);
-        let bootstrap = BootstrapDiscovery::new(config.clone(), swarm.clone());
+        let bootstrap =
+            BootstrapDiscovery::new(config.clone(), swarm.clone(), provider_cache.clone());
 
         Self {
             config,
@@ -113,6 +169,11 @@ impl NodeController {
             services_snapshot: services.snapshot,
             relay,
             bootstrap,
+            record_cache,
+            provider_cache,
+            signed_types_cache,
+            legacy_types_cache,
+            legacy_types_publisher,
         }
     }
 
@@ -137,6 +198,26 @@ impl NodeController {
                 }
                 _ = service_tick.tick() => {
                     let _ = self.services_tx.try_send(ServiceCommand::Tick);
+                    let signed_present = self
+                        .signed_types_cache
+                        .as_ref()
+                        .and_then(|cache| cache.peek(&()).and_then(|read| read.value))
+                        .is_some();
+                    if let Some(cache) = &self.signed_types_cache {
+                        cache.refresh_if_due(());
+                    }
+                    if !signed_present {
+                        self.legacy_types_cache.refresh_if_due(());
+                    }
+                    if let Some(publisher) = &self.legacy_types_publisher {
+                        let mut types = self
+                            .legacy_types_cache
+                            .peek(&())
+                            .and_then(|read| read.value)
+                            .unwrap_or_default();
+                        types.extend(self.services_snapshot.borrow().announced.iter().cloned());
+                        publisher.maybe_publish(types);
+                    }
                 }
                 _ = relay_tick.tick() => {
                     self.bootstrap.announce_self().await;
@@ -155,6 +236,8 @@ impl NodeController {
             NetworkEvent::Ping(event) => self.handle_ping(event),
             NetworkEvent::Identify(event) => self.handle_identify(event).await,
             NetworkEvent::BootstrapCompleted => {
+                self.mark_caches_stale();
+                self.bootstrap.reset();
                 self.send_service(ServiceCommand::BootstrapCompleted).await;
                 self.bootstrap.announce_self().await;
                 self.relay.tick().await;
@@ -174,6 +257,44 @@ impl NodeController {
                     self.relay.tick().await;
                 }
             }
+        }
+    }
+
+    pub(super) fn mark_caches_stale(&self) {
+        self.record_cache.mark_all_stale();
+        self.provider_cache.mark_all_stale();
+        if let Some(cache) = &self.signed_types_cache {
+            cache.mark_all_stale();
+        }
+        self.legacy_types_cache.mark_all_stale();
+        self.auth.mark_all_stale();
+    }
+
+    pub(super) fn invalidate_caches(&self) {
+        self.record_cache.invalidate_all();
+        self.provider_cache.invalidate_all();
+        if let Some(cache) = &self.signed_types_cache {
+            cache.invalidate_all();
+        }
+        self.legacy_types_cache.invalidate_all();
+        self.auth.invalidate_all();
+    }
+    pub(super) fn invalidate_record_key(&self, key: &str) {
+        let record_key = kad::RecordKey::new(&key);
+        self.record_cache.invalidate(&record_key);
+        if key.starts_with("/oahd/auth/") {
+            self.auth.invalidate_all();
+        }
+        if key.starts_with("/oahd/service/") {
+            self.provider_cache.invalidate(&record_key);
+        }
+        if key == "/oahd/service/authtypes/"
+            && let Some(cache) = &self.signed_types_cache
+        {
+            cache.mark_stale(&());
+        }
+        if key == "/oahd/service/types" {
+            self.legacy_types_cache.mark_stale(&());
         }
     }
 

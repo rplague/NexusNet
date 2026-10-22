@@ -2,16 +2,17 @@
 
 ## 目标
 
-- NodeController 不等待任何 service-registry DHT 操作。
+- NodeController 不等待 service-registry DHT 操作。
 - registry actor 不被单个 DHT 查询阻塞；DHT 调用作为受控 job 执行。
-- `list_services` 通过 watch 快照立即返回，后台刷新类型索引。
+- 服务类型索引不再由 registry 维护，改为独立的签名文档 SWR 缓存。
 
 ## 结构
 
 ```text
 NodeController
   ├─ services_tx: mpsc::Sender<ServiceCommand>        (bounded 256)
-  └─ services_snapshot: watch::Receiver<Arc<ServiceSnapshot>>
+  ├─ services_snapshot: watch::Receiver<Arc<ServiceSnapshot>>
+  └─ types_cache: DhtCache<(), BTreeSet<String>, TypesFetcher>
 
                  ServiceCommand
                        │
@@ -20,9 +21,7 @@ ServiceRegistryActor
   ├─ RegistryState（纯状态机）
   ├─ JoinSet<JobResult>（最多 services.registry.max_inflight_dht 个）
   │    ├─ start_providing
-  │    ├─ stop_providing
-  │    ├─ get_record_network
-  │    └─ put_record
+  │    └─ stop_providing
   └─ snapshot_tx: watch::Sender<Arc<ServiceSnapshot>>
 ```
 
@@ -30,18 +29,16 @@ ServiceRegistryActor
 `NetworkHandle` 发命令；Kademlia 的多个 `QueryId` 提供 DHT 并发。
 
 `ServiceDispatcher` 持有唯一的 `backend_ready` 集合并通过 watch 发布；
-registry actor 订阅该 watch，用完整集合差分处理就绪/断开，不再接收
-`BackendReady` / `BackendDown` 命令。
+registry actor 订阅该 watch，用完整集合差分处理就绪/断开。
 
 ## 命令
 
 | 命令 | 来源 | 说明 |
 |---|---|---|
-| `BootstrapCompleted` | controller | 启动 announce 与 reconcile |
+| `BootstrapCompleted` | controller | 清空 `announced`，让规划器重新宣告 |
 | `Tick` | controller（1s） | 处理到期撤销/重试 |
-| `Reannounce` | 控制命令 | 后台重新调度 |
-| `RefreshTypes` | `list_services` | 后台刷新类型索引 |
-| `Reset` | reload | generation +1，清空临时状态，保留 known_types |
+| `Reannounce` | 控制命令 | 清空 `announced` 并重新调度 |
+| `Reset` | reload | generation +1，清空临时状态 |
 
 ## 状态机
 
@@ -54,7 +51,6 @@ registry actor 订阅该 watch，用完整集合差分处理就绪/断开，不�
 1. 到期撤销
 2. 到期 announce 重试
 3. 新 announce
-4. types reconcile
 
 ### announce
 
@@ -68,41 +64,91 @@ registry actor 订阅该 watch，用完整集合差分处理就绪/断开，不�
 - 成功：从 `announced` 移除；若后端已恢复，重新调度 announce。
 - 失败：重新设置重试 deadline。
 
-### reconcile types
+### bootstrap / reannounce
 
-```text
-Idle --(due / RefreshTypes)--> Reading
-Reading --(merge known_types)--> Idle | ReadyToWrite
-ReadyToWrite --(plan)--> Writing
-Writing --(result)--> Idle
-```
+`BootstrapCompleted` 与 `Reannounce` 都会清空 `announced` 和
+`announce_retry_at`，因此下一次 `plan` 会重新执行 `start_providing`。
+`BootstrapCompleted` 每次 DHT bootstrap 成功都会触发（actor 侧 30 秒去抖），
+避免网络分区或 DHT 重建后永久停留在“已宣告”状态。
 
-- single-flight；`reconcile_dirty` 在当前链结束后触发立即重跑。
-- 失败后 30s 重试。
-- `known_types` 保持单调并集，上限 `MAX_TYPES`。
+## 类型索引
+
+类型索引不属于 registry 状态机：
+
+- DHT key：`/oahd/service/authtypes/`。
+- 值：authority 签名的 `TypesDoc`（COSE_Sign1）。
+- 读取：`DhtCache<(), BTreeSet<String>, TypesFetcher>`。
+  - `fresh_for = services.dispatcher.types_sync_secs`
+  - stale 允许到文档 `expires_at`
+  - 只接受最高合法 `version`，整体替换
+- 发布：`publish_types` 控制指令，`Quorum::All`。
+- 未配置 `services.registry.types_authority` 时进入旧版兼容模式（见下）。
+
+`list_services` = 类型缓存 ∪ `announced` ∪ `backend_ready`，立即返回并触发后台刷新。
 
 ## 并发与背压
 
 - `services.registry.max_inflight_dht` 控制同时执行的 registry DHT job，
   默认 4，范围 1–16。
 - 命令队列 256；状态类命令等待入队（不等待 DHT），
-  `Tick`/`RefreshTypes`/`Reannounce` 在队列满时丢弃或返回 busy。
+  `Tick`/`Reannounce` 在队列满时丢弃或返回 busy。
 - reload 时 `generation` 使旧 job 结果失效；`JoinSet` 在 shutdown 时排空。
 
 ## 快照
 
 `ServiceSnapshot` 包含：
 
-- `types`：`known_types ∪ announced`
 - `announced`
 - `backend_ready`
 - `bootstrapped`
 
-`list_services` 读取 `types` 并触发后台 `RefreshTypes`。该命令是最终一致的：
-如果 DHT 中刚出现新类型，下一次调用或后台刷新后可见。
+`ServiceSnapshot.types` 已移除；全局类型由 NodeController 的 `types_cache` 提供。
 
 ## 测试
 
-- 纯状态机测试：announce/withdraw 生命周期、grace、重试、reset、reconcile。
+- 纯状态机测试：announce/withdraw 生命周期、grace、重试、reset。
+- bootstrap/reannounce 清空 `announced` 并重新宣告。
 - mock DHT 测试：慢 announce 不阻塞 actor 命令；快照及时更新。
-- 现有单元测试全部保留。
+- 类型签名/版本/过期/冲突测试位于 `types_doc` 与 `dht_cache`。
+
+## 旧版兼容
+
+- 旧 key：`/oahd/service/types`，值为未签名 JSON 数组 `["cmd","ocr"]`。
+- 配置了 `types_authority`：
+  - 新节点只信任 `/oahd/service/authtypes/` 的签名文档；
+  - `publish_types` 同时把签名文档中的服务列表镜像写入旧 key，供旧节点读取；
+  - 签名文档缺失时，新节点回退读取旧 key（迁移期兼容）。
+- 未配置 `types_authority`：
+  - 进入旧版模式，读取旧 key 并合并所有记录；
+  - 周期（`types_sync_secs`）把 `旧 key 类型 ∪ 本地 announced` 发布回旧 key；
+  - 启动日志记录 Warning，提示配置 `types_authority` 以启用签名索引。
+- 旧 key 与新 key 不冲突；`/oahd/service/authtypes/` 末尾的 `/` 也避免了与服务名 `authtypes` 的 provider key 冲突。
+
+## 签名类型文档
+
+`TypesDoc` 的 CBOR payload：
+
+```text
+{
+  "version":    uint,      # 单调递增；续期也需递增
+  "issued_at":  uint,      # Unix 秒
+  "expires_at": uint,      # Unix 秒，issued_at < expires_at
+  "services":   [tstr],    # 去重后的服务名
+}
+```
+
+签名规则与鉴权记录相同：
+
+- `COSE_Sign1`，保护头 `alg = EdDSA`；
+- `external_aad = "/oahd/service/authtypes/"` 的 UTF-8 字节；
+- 使用 `services.registry.types_authority` 对应的 Ed25519 私钥签名；
+- 文档生命周期不得超过 `services.registry.types_ttl_seconds`。
+
+发布：
+
+```text
+publish_types { t:"publish_types", id:<uuid>, value:<COSE_Sign1 bstr> }
+```
+
+节点验签、检查版本/过期/名称后，以 `Quorum::All` 写入
+`/oahd/service/authtypes/`。读取端只接受最高合法版本，整体替换旧列表。

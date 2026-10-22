@@ -259,8 +259,8 @@ impl RelayManager {
         }
     }
 
-    /// Record a relay failure and set exponential backoff; at the threshold,
-    /// evict the node from the bootstrap list.
+    /// Record a relay failure and set exponential backoff. Bootstrap
+    /// configuration is never modified; a failing relay is only retried later.
     fn record_failure(&mut self, peer_id: PeerId, now: Instant) {
         let count = {
             let c = self.failures.entry(peer_id).or_insert(0);
@@ -268,39 +268,13 @@ impl RelayManager {
             *c
         };
 
-        self.backoff.insert(
-            peer_id,
-            now + Duration::from_secs(relay_backoff_secs(count)),
-        );
-
         let max = self.config.relay_max_failures();
-        if max > 0 && count >= max {
-            self.evict_bootstrap(peer_id);
-        }
-    }
-
-    /// Remove a failed node from the bootstrap list and persist (no floor kept).
-    fn evict_bootstrap(&mut self, peer_id: PeerId) {
-        let filtered: Vec<Multiaddr> = self
-            .config
-            .bootstrap_nodes()
-            .into_iter()
-            .filter(|addr| extract_peer_id_from_multiaddr(addr) != Some(peer_id))
-            .collect();
-        self.config.set_bootstrap_nodes(filtered);
-        self.config.save_to_default();
-
-        self.active.remove(&peer_id);
-        self.pending.remove(&peer_id);
-        self.failures.remove(&peer_id);
-        self.backoff.remove(&peer_id);
-
-        LogStruct::new(
-            LogLevel::Warning,
-            "移除失效中继",
-            format!("已从 bootstrap 列表移除: {}", peer_id),
-        )
-        .emit();
+        let delay = if max > 0 && count >= max {
+            Duration::from_secs(3600)
+        } else {
+            Duration::from_secs(relay_backoff_secs(count))
+        };
+        self.backoff.insert(peer_id, now + delay);
     }
 }
 

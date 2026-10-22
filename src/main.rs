@@ -18,12 +18,16 @@
 mod auth;
 mod config;
 mod controller;
+mod cose;
+mod dht_cache;
+mod limits;
 mod log;
 mod network;
 mod paths;
 mod service_dispatcher;
 mod service_protocol;
 mod sidecar_protocol;
+mod types_doc;
 
 use crate::config::ConfigHandle;
 use controller::NodeController;

@@ -27,6 +27,7 @@
 //! Identify protocol table, avoiding a false claim of support.
 
 use crate::config::ConfigHandle;
+use crate::limits::{DHT_MAX_RECORD_BYTES, KAD_MAX_PACKET_BYTES};
 use crate::network::pq::{self, PqIdentity, PqRequest, PqResponse};
 use crate::service_protocol;
 use libp2p::request_response::{self, ProtocolSupport, cbor};
@@ -145,8 +146,15 @@ impl NetBehaviour {
         let identify = identify::Behaviour::new(identify_config);
 
         // Kademlia configuration.
-        let store = kad::store::MemoryStore::new(peer_id);
+        let store = kad::store::MemoryStore::with_config(
+            peer_id,
+            kad::store::MemoryStoreConfig {
+                max_value_bytes: DHT_MAX_RECORD_BYTES + 1,
+                ..Default::default()
+            },
+        );
         let mut kad_config = kad::Config::new(StreamProtocol::new("/ipfs/kad/1.0.0"));
+        kad_config.set_max_packet_size(KAD_MAX_PACKET_BYTES);
         let record_ttl = Duration::from_secs(config.kademlia_record_ttl().into());
         kad_config.set_record_ttl(Some(record_ttl));
         // Republish well before expiry so remote copies never lapse.

@@ -17,6 +17,7 @@
 
 use crate::paths;
 use crate::{LogLevel, LogStruct};
+use libp2p::identity::ed25519;
 use libp2p::multiaddr::Protocol;
 use libp2p::{Multiaddr, PeerId};
 use std::collections::HashMap;
@@ -58,6 +59,7 @@ default_u32_fn!(default_relay_retry_interval, 60);
 default_u32_fn!(default_relay_max_failures, 3);
 default_u32_fn!(default_types_sync_seconds, 300);
 default_u32_fn!(default_max_inflight_dht, 4);
+default_u32_fn!(default_types_ttl_seconds, 900);
 
 /// Default P2P service request/response size limit (16 MiB), aligned with
 /// `sidecar_protocol::MAX_FRAME`.
@@ -120,6 +122,19 @@ impl NodeConfig {
         }
         if !(1..=16).contains(&self.services.registry.max_inflight_dht) {
             return Err("services.registry.max_inflight_dht 必须在 1..=16".to_string());
+        }
+        if !(1..=86_400).contains(&self.services.registry.types_ttl_seconds) {
+            return Err("services.registry.types_ttl_seconds 必须在 1..=86400".to_string());
+        }
+        if let Some(authority) = self
+            .services
+            .registry
+            .types_authority
+            .as_deref()
+            .filter(|value| !value.is_empty())
+        {
+            crate::auth::parse_authority(authority)
+                .map_err(|e| format!("services.registry.types_authority 无效: {e}"))?;
         }
         if !(1..=16).contains(&self.services.dispatcher.max_inflight_dht) {
             return Err("services.dispatcher.max_inflight_dht 必须在 1..=16".to_string());
@@ -393,12 +408,21 @@ pub struct ServicesConfig {
 pub struct RegistryService {
     #[serde(default = "default_max_inflight_dht")]
     pub max_inflight_dht: u32,
+    /// Ed25519 public key allowed to sign the global service-type index.
+    /// Empty/absent enables the legacy unsigned compatibility mode.
+    #[serde(default)]
+    pub types_authority: Option<String>,
+    /// Maximum accepted lifetime of a signed types document.
+    #[serde(default = "default_types_ttl_seconds")]
+    pub types_ttl_seconds: u32,
 }
 
 impl Default for RegistryService {
     fn default() -> Self {
         RegistryService {
             max_inflight_dht: default_max_inflight_dht(),
+            types_authority: None,
+            types_ttl_seconds: default_types_ttl_seconds(),
         }
     }
 }
@@ -688,6 +712,25 @@ impl ConfigHandle {
     pub fn registry_max_inflight_dht(&self) -> usize {
         self.read().services.registry.max_inflight_dht as usize
     }
+    /// Configured authority public key, if any.
+    pub fn types_authority(&self) -> Option<String> {
+        self.read()
+            .services
+            .registry
+            .types_authority
+            .clone()
+            .filter(|value| !value.is_empty())
+    }
+
+    /// Parsed types authority key, if configured and valid.
+    pub fn types_authority_key(&self) -> Option<ed25519::PublicKey> {
+        self.types_authority()
+            .and_then(|authority| crate::auth::parse_authority(&authority).ok())
+    }
+
+    pub fn types_ttl_seconds(&self) -> u64 {
+        self.read().services.registry.types_ttl_seconds as u64
+    }
 
     pub fn relay_retry_interval(&self) -> u32 {
         self.read().services.relay.retry_interval_secs
@@ -854,6 +897,7 @@ impl ConfigHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
 
     fn peer() -> PeerId {
         libp2p::identity::Keypair::generate_ed25519()
@@ -1022,6 +1066,30 @@ mod tests {
         assert!(config.validate().is_err());
         config.services.dispatcher.max_inflight_dht = 16;
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn registry_types_authority_defaults_and_validates() {
+        let config = NodeConfig::default();
+        assert_eq!(config.services.registry.types_authority, None);
+        assert_eq!(config.services.registry.types_ttl_seconds, 900);
+        assert!(config.validate().is_ok());
+
+        let mut config = NodeConfig::default();
+        config.services.registry.types_ttl_seconds = 0;
+        assert!(config.validate().is_err());
+        config.services.registry.types_ttl_seconds = 86_401;
+        assert!(config.validate().is_err());
+        config.services.registry.types_ttl_seconds = 900;
+
+        let keypair = libp2p::identity::Keypair::generate_ed25519();
+        let public = keypair.public().try_into_ed25519().unwrap().to_bytes();
+        config.services.registry.types_authority =
+            Some(base64::engine::general_purpose::STANDARD.encode(public));
+        assert!(config.validate().is_ok());
+
+        config.services.registry.types_authority = Some("not base64".into());
+        assert!(config.validate().is_err());
     }
 
     #[test]
