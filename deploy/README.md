@@ -84,7 +84,7 @@ apt purge <pkg>              # 彻底清除包配置
 | `../deb/{postinst,prerm,postrm}` | Debian 维护脚本（打包素材） |
 | `build-win.sh` | 交叉编译产物 + NSIS 组装 Windows 安装器与便携 zip，自动派生命名 |
 | `win/service.nsi` | NSIS 安装脚本（含 `@PKG@`/`@BIN@`/`@VERSION@` 等占位符） |
-| `publish-release.sh` | 幂等发布：把指定目录内的文件上传到 Gitea Release（供 CI 复用） |
+| `publish-release.sh` | 幂等发布：把指定目录内的文件上传到 Gitea Release（手动发布或旧 Gitea CI 使用；WebGit CI 仅构建，不上传产物） |
 
 ## 手动构建 deb
 
@@ -211,3 +211,14 @@ $env:NEXUSNET_LOG_MODE="file"
   `TimeoutStopSec=15` 防止卡死被强杀。Windows 下由 NSSM 以 Ctrl+C 触发同一优雅退出路径。
 - 后端边车（CLI / OCR 等）仍由外部独立管理，本服务不管理其生命周期；
   如后续需要，可在 `nexusnet.service` 的 `[Unit]` 中追加 `After=`/`Wants=` 关联对应的边车服务。
+
+## CI（WebGit）
+
+CI 使用 WebGit 原生 runner 的 `.webgit/ci.yml`（version 1），不使用 GitHub/Gitea Actions：
+
+- `test`：`cargo test --verbose`
+- `fmt`：`cargo fmt -- --check`
+- `build-linux`：`cargo build --release` + `./deploy/build-deb.sh`
+- `build-windows`：存在 mingw-w64 与 NSIS 时交叉编译并调用 `./deploy/build-win.sh`，否则跳过
+
+WebGit runner 不提供 artifact 上传或 Release 资产发布；构建产物保留在本次 run 的工作区，run 结束后清理。
