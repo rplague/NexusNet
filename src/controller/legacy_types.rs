@@ -41,15 +41,17 @@ struct MirrorState {
 pub struct LegacyTypesPublisher {
     swarm: NetworkHandle,
     interval: Duration,
+    max_bytes: usize,
     state: Mutex<MirrorState>,
     inflight: AtomicBool,
 }
 
 impl LegacyTypesPublisher {
-    pub fn new(swarm: NetworkHandle, interval: Duration) -> Arc<Self> {
+    pub fn new(swarm: NetworkHandle, interval: Duration, max_bytes: usize) -> Arc<Self> {
         Arc::new(Self {
             swarm,
             interval,
+            max_bytes,
             state: Mutex::new(MirrorState {
                 last: None,
                 next_publish: Instant::now(),
@@ -62,26 +64,38 @@ impl LegacyTypesPublisher {
     /// elapsed. Returns immediately; the write runs in the background.
     pub fn maybe_publish(self: &Arc<Self>, services: BTreeSet<String>) {
         let list: Vec<String> = services.into_iter().collect();
+        let Some((value, included)) = types_doc::encode_legacy_types_capped(&list, self.max_bytes)
+        else {
+            return;
+        };
+        let published: Vec<String> = list[..included].to_vec();
         let now = Instant::now();
         {
             let state = self.state.lock().expect("legacy types state poisoned");
-            if state.last.as_deref() == Some(list.as_slice()) && now < state.next_publish {
+            if state.last.as_deref() == Some(published.as_slice()) && now < state.next_publish {
                 return;
             }
-            if list.is_empty() && state.last.is_none() {
+            if published.is_empty() && state.last.is_none() {
                 return;
             }
         }
         if self.inflight.swap(true, Ordering::SeqCst) {
             return;
         }
+        if included < list.len() {
+            LogStruct::new(
+                LogLevel::Warning,
+                "旧版类型镜像已裁剪",
+                format!(
+                    "{included}/{} 个服务，超出 compat.max_record_bytes",
+                    list.len()
+                ),
+            )
+            .emit();
+        }
 
         let this = Arc::clone(self);
         tokio::spawn(async move {
-            let Some(value) = types_doc::encode_legacy_types(&list) else {
-                this.inflight.store(false, Ordering::SeqCst);
-                return;
-            };
             let result = this
                 .swarm
                 .put_record(
@@ -93,7 +107,7 @@ impl LegacyTypesPublisher {
             match result {
                 Ok(()) => {
                     let mut state = this.state.lock().expect("legacy types state poisoned");
-                    state.last = Some(list);
+                    state.last = Some(published);
                     state.next_publish = Instant::now() + this.interval;
                 }
                 Err(error) => {

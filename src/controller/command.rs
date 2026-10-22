@@ -133,12 +133,19 @@ fn provider_strings(providers: Vec<PeerId>) -> Vec<String> {
     providers.into_iter().map(|peer| peer.to_string()).collect()
 }
 
-fn quorum_for_key(key: &str) -> kad::Quorum {
-    if key.starts_with("/oahd/auth/") {
-        kad::Quorum::All
-    } else {
-        kad::Quorum::One
+fn quorum_for_key(_key: &str) -> kad::Quorum {
+    // Old versions publish with Quorum::One. Keep this for mixed networks:
+    // Quorum::All fails if an older peer cannot store or answer.
+    kad::Quorum::One
+}
+
+fn check_compat_record_size(len: usize, max_bytes: u64) -> Result<(), String> {
+    if len as u64 > max_bytes {
+        return Err(format!(
+            "record exceeds compat.max_record_bytes ({max_bytes} bytes); raise it after all nodes support larger packets"
+        ));
     }
+    Ok(())
 }
 
 async fn fetch_providers(
@@ -221,6 +228,7 @@ async fn run_dht_command(
     provider_cache: &Arc<DhtCache<kad::RecordKey, Vec<PeerId>, ProviderFetcher>>,
     auth_gate: &AuthGate,
     my_peer_id: PeerId,
+    max_record_bytes: u64,
     msg: Message,
 ) -> Result<Vec<u8>, String> {
     match msg {
@@ -295,6 +303,7 @@ async fn run_dht_command(
             let Some(bytes) = value else {
                 return Err("at least one of 'value' or 'providing' is required".to_string());
             };
+            check_compat_record_size(bytes.len(), max_record_bytes)?;
             let record_key = kad::RecordKey::new(&key);
             swarm
                 .put_record(record_key.clone(), bytes, quorum_for_key(&key))
@@ -338,6 +347,7 @@ impl NodeController {
             let provider_cache = self.provider_cache.clone();
             let auth_gate = self.auth.clone();
             let my_peer_id = self.my_peer_id;
+            let max_record_bytes = self.config.compat_max_record_bytes();
             tokio::spawn(async move {
                 let result = run_dht_command(
                     &swarm,
@@ -346,6 +356,7 @@ impl NodeController {
                     &provider_cache,
                     &auth_gate,
                     my_peer_id,
+                    max_record_bytes,
                     msg,
                 )
                 .await;
@@ -409,18 +420,19 @@ impl NodeController {
             .signed_types_cache
             .as_ref()
             .and_then(|cache| cache.peek(&()).and_then(|read| read.value));
-        let mut types: BTreeSet<String> = match signed {
-            Some(types) => types,
-            None => {
-                // Compatibility fallback: only when the signed index is absent
-                // (or no authority is configured) use the legacy unsigned list.
-                self.legacy_types_cache.refresh_if_due(());
-                self.legacy_types_cache
-                    .peek(&())
-                    .and_then(|read| read.value)
-                    .unwrap_or_default()
-            }
-        };
+        let use_legacy = self.legacy_types_merge || signed.is_none();
+        if use_legacy {
+            self.legacy_types_cache.refresh_if_due(());
+        }
+        let mut types: BTreeSet<String> = signed.unwrap_or_default();
+        if use_legacy
+            && let Some(legacy) = self
+                .legacy_types_cache
+                .peek(&())
+                .and_then(|read| read.value)
+        {
+            types.extend(legacy);
+        }
         if let Some(cache) = &self.signed_types_cache {
             cache.refresh_if_due(());
         }
@@ -562,26 +574,62 @@ impl NodeController {
             self.config.types_ttl_seconds(),
         )
         .map_err(|e| format!("invalid types document: {e}"))?;
+        let max_record_bytes = self.config.compat_max_record_bytes();
+        check_compat_record_size(value.len(), max_record_bytes)?;
         self.swarm
             .put_record(
                 kad::RecordKey::new(&crate::types_doc::TYPES_KEY),
                 value,
-                kad::Quorum::All,
+                quorum_for_key("/oahd/service/authtypes/"),
             )
             .await
             .map_err(|e| format!("put_record failed: {e}"))?;
-        // Compatibility mirror for older nodes.
-        if let Some(legacy) = crate::types_doc::encode_legacy_types(&doc.services)
-            && let Err(error) = self
-                .swarm
-                .put_record(
-                    kad::RecordKey::new(&crate::types_doc::LEGACY_TYPES_KEY),
-                    legacy,
-                    kad::Quorum::One,
-                )
-                .await
+
+        // Compatibility mirror for older nodes. Preserve legacy-only services
+        // so publishing a signed document never shrinks the old key.
+        let mut services: BTreeSet<String> = doc.services.iter().cloned().collect();
+        // Force a fresh legacy read so the mirror preserves old-only services.
+        self.legacy_types_cache.invalidate(&());
+        if let Ok(read) = self.legacy_types_cache.get(()).await
+            && let Some(legacy) = read.value
         {
-            LogStruct::new(LogLevel::Warning, "旧版类型镜像发布失败", error.to_string()).emit();
+            services.extend(legacy);
+        }
+        let list: Vec<String> = services.into_iter().collect();
+        match crate::types_doc::encode_legacy_types_capped(&list, max_record_bytes as usize) {
+            Some((legacy, included)) => {
+                if included < list.len() {
+                    LogStruct::new(
+                        LogLevel::Warning,
+                        "旧版类型镜像已裁剪",
+                        format!(
+                            "{included}/{} 个服务，超出 compat.max_record_bytes",
+                            list.len()
+                        ),
+                    )
+                    .emit();
+                }
+                if let Err(error) = self
+                    .swarm
+                    .put_record(
+                        kad::RecordKey::new(&crate::types_doc::LEGACY_TYPES_KEY),
+                        legacy,
+                        quorum_for_key("/oahd/service/types"),
+                    )
+                    .await
+                {
+                    LogStruct::new(LogLevel::Warning, "旧版类型镜像发布失败", error.to_string())
+                        .emit();
+                }
+            }
+            None => {
+                LogStruct::new(
+                    LogLevel::Warning,
+                    "旧版类型镜像无法编码",
+                    format!("compat.max_record_bytes={max_record_bytes}"),
+                )
+                .emit();
+            }
         }
         if let Some(cache) = &self.signed_types_cache {
             cache.mark_stale(&());
@@ -607,6 +655,7 @@ impl NodeController {
         let ack = || to_cbor(&serde_json::json!({"success": true, "key": key.clone()}));
         match value {
             Some(bytes) => {
+                check_compat_record_size(bytes.len(), self.config.compat_max_record_bytes())?;
                 let record_key = kad::RecordKey::new(&key);
                 self.swarm
                     .put_record(record_key, bytes, quorum_for_key(&key))
@@ -818,6 +867,12 @@ mod tests {
         }));
         assert!(!can_run_in_dht_worker(&Message::Whoami { id }));
         assert!(!can_run_in_dht_worker(&Message::ListServices { id }));
+    }
+
+    #[test]
+    fn compat_record_size_guard_rejects_oversized_values() {
+        assert!(check_compat_record_size(14 * 1024, 14 * 1024).is_ok());
+        assert!(check_compat_record_size(14 * 1024 + 1, 14 * 1024).is_err());
     }
 
     #[test]

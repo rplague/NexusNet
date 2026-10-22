@@ -132,6 +132,10 @@ types_ttl_seconds = 900          # 签名类型文档最大有效期，1..=86400
 retry_interval_secs = 60
 max_failures = 3
 
+[compat]
+max_record_bytes = 14336     # 默认适配旧版 16 KiB Kademlia 包
+legacy_types_merge = true    # 合并旧 /oahd/service/types
+
 [crypto]
 pq_transport_enabled = false
 pq_identity_enabled = false
@@ -230,7 +234,7 @@ u32_be(len) || cbor(message)      # len <= 16 MiB
 - `add_key` 的 `value` 为 `bstr`，二进制安全（无需 base64）。
 - `remove_key`：撤销 provider 宣告 / 删除本地记录，`{ key, ? providing=true, ? record=false }`。两项均为**本地操作**——远端 provider 记录需待对端 provider TTL 过期才消失，远端 value 副本按 `services.kademlia.record_ttl_seconds` 过期；撤销只影响发现，不阻止直接 `service_request_to` 调用。
 - `add_key` / `remove_key` 仅允许 `/oahd/service/<name>` 与 `/oahd/auth/...`；`/oahd/service/authtypes/`、`/oahd/service/types` 和 `/oahd/bootstrap` 由节点自身维护，后端不可写。
-- `publish_types`：发布 authority 签名的全局服务类型文档（`value` 为 COSE_Sign1 字节）；需要配置 `services.registry.types_authority`，写入使用 `Quorum::All`。
+- `publish_types`：发布 authority 签名的全局服务类型文档（`value` 为 COSE_Sign1 字节）；需要配置 `services.registry.types_authority`，写入使用 `Quorum::One` 以兼容旧网络。
 - `refresh_cache`：清空应用层 SWR 缓存，并删除 Kademlia 本地 store 中非本节点发布的副本；本节点自己发布的记录保留。
 - 默认超时 30 秒，超时以 `error{code:"timeout"}` 应答。
 
@@ -260,7 +264,8 @@ u32_be(len) || cbor(message)      # len <= 16 MiB
 - 撤销为本地行为，远端 provider 记录需待 provider TTL 过期才会消失
 - 双栈节点在 `allow_bootstrap = true` 时声明为 `/oahd/bootstrap` provider；其他节点仅在 `accept_bootstrap_providers = true` 时才会把 Identify 发现的 provider 自动写入 bootstrap 列表
 - 全局服务类型索引的新格式为 `/oahd/service/authtypes/`：由 `services.registry.types_authority` 签名的 COSE_Sign1 `TypesDoc`（`version`/`issued_at`/`expires_at`/`services`）。节点只接受最高合法版本并整体替换，不再维护“只增不减”的并集；文档过期后自动从 `list_services` 消失。
-- 旧版兼容：配置 authority 时，`publish_types` 会把同一服务列表镜像写入旧 key `/oahd/service/types`（未签名 JSON），旧节点仍可发现类型；新节点只在签名索引缺失时回退读取旧 key。未配置 authority 时进入旧版兼容模式，读取并周期发布旧 key，启动时记录 Warning。
+- 旧版兼容：配置 authority 时，`publish_types` 会把“签名类型 ∪ 当前旧 key 类型”镜像写入旧 key `/oahd/service/types`（未签名 JSON），旧节点仍可发现类型；默认 `compat.legacy_types_merge = true`，新节点同时合并旧 key 类型。未配置 authority 时进入旧版兼容模式，读取并周期发布旧 key，启动时记录 Warning。
+- `compat.max_record_bytes` 默认 14 KiB，确保旧版 Kademlia 16 KiB 包能承载所有 DHT 写入；超过上限的 auth/service 写入直接拒绝，旧 key 镜像按上限裁剪。全量升级后再调大并关闭 legacy 合并。
 - `list_services` → 立即返回已验证类型缓存（`types_sync_secs` 后台刷新）与本地 `announced ∪ backend_ready`
 - `reannounce_services` → 清空本地 `announced` 缓存并重新 `start_providing`，立即返回 accepted
 - DHT 控制命令（`query_key`、`discover_providers`、`service_request`、`service_request_to`，以及 `providing=false` 的 `add_key`）在独立有界 worker 中执行；并发由 `services.dispatcher.max_inflight_dht` 控制（默认 4，范围 1–16）。`whoami`/`relay_status`/`pq_status`/`auth_status`/`list_services` 不等待 DHT
@@ -321,7 +326,7 @@ u32_be(len) || cbor(message)      # len <= 16 MiB
 | `auth.networks.<name>.authority` | 该网络权威 ed25519 公钥（base64） |
 | `require_auth` | 单个本地服务是否要求鉴权 |
 
-鉴权记录通过统一的 SWR 缓存读取：2 秒内直接命中，2–5 秒返回旧值并后台刷新，超过 5 秒等待刷新，刷新失败或文档过期则 fail-closed 拒绝。
+鉴权记录通过统一的 SWR 缓存读取：2 秒内直接命中，2–5 秒返回旧值并后台刷新，超过 5 秒等待刷新，刷新失败或文档过期则 fail-closed 拒绝。auth 写入使用 `Quorum::One`，并受 `compat.max_record_bytes` 限制，旧节点仍可存储与验证小文档。
 
 ## 日志
 

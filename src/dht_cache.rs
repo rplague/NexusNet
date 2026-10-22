@@ -98,7 +98,7 @@ impl CachePolicy {
     pub fn generic() -> Self {
         Self {
             fresh_for: Duration::from_secs(60),
-            max_stale: Duration::from_secs(5 * 60),
+            max_stale: Duration::from_secs(60),
             missing_fresh_for: Duration::from_secs(60),
             refresh_timeout: Duration::from_secs(15),
             refresh_backoff: Duration::from_secs(30),
@@ -110,7 +110,7 @@ impl CachePolicy {
     pub fn providers() -> Self {
         Self {
             fresh_for: Duration::from_secs(30),
-            max_stale: Duration::from_secs(2 * 60),
+            max_stale: Duration::from_secs(60),
             missing_fresh_for: Duration::from_secs(30),
             refresh_timeout: Duration::from_secs(15),
             refresh_backoff: Duration::from_secs(30),

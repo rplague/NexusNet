@@ -81,7 +81,7 @@ registry actor 订阅该 watch，用完整集合差分处理就绪/断开。
   - `fresh_for = services.dispatcher.types_sync_secs`
   - stale 允许到文档 `expires_at`
   - 只接受最高合法 `version`，整体替换
-- 发布：`publish_types` 控制指令，`Quorum::All`。
+- 发布：`publish_types` 控制指令，`Quorum::One`（旧网络兼容）。
 - 未配置 `services.registry.types_authority` 时进入旧版兼容模式（见下）。
 
 `list_services` = 类型缓存 ∪ `announced` ∪ `backend_ready`，立即返回并触发后台刷新。
@@ -115,14 +115,16 @@ registry actor 订阅该 watch，用完整集合差分处理就绪/断开。
 
 - 旧 key：`/oahd/service/types`，值为未签名 JSON 数组 `["cmd","ocr"]`。
 - 配置了 `types_authority`：
-  - 新节点只信任 `/oahd/service/authtypes/` 的签名文档；
-  - `publish_types` 同时把签名文档中的服务列表镜像写入旧 key，供旧节点读取；
-  - 签名文档缺失时，新节点回退读取旧 key（迁移期兼容）。
+  - 新节点使用 `/oahd/service/authtypes/` 的签名文档；
+  - 默认 `compat.legacy_types_merge = true`，`list_services` 同时合并旧 key 类型；
+  - `publish_types` 把“签名类型 ∪ 旧 key 类型”镜像写入旧 key，供旧节点读取；
+  - 签名文档缺失时，新节点仍然回退读取旧 key。
 - 未配置 `types_authority`：
   - 进入旧版模式，读取旧 key 并合并所有记录；
   - 周期（`types_sync_secs`）把 `旧 key 类型 ∪ 本地 announced` 发布回旧 key；
   - 启动日志记录 Warning，提示配置 `types_authority` 以启用签名索引。
 - 旧 key 与新 key 不冲突；`/oahd/service/authtypes/` 末尾的 `/` 也避免了与服务名 `authtypes` 的 provider key 冲突。
+- `compat.max_record_bytes` 默认 14 KiB；旧 key 镜像超过上限时按前缀裁剪并记录 Warning。
 
 ## 签名类型文档
 

@@ -29,3 +29,9 @@ pub const DHT_MAX_RECORD_BYTES: usize = 1 << 20;
 ///
 /// A record value plus protobuf framing and the closer-peer list must fit.
 pub const KAD_MAX_PACKET_BYTES: usize = DHT_MAX_RECORD_BYTES + 64 * 1024;
+
+/// Old libp2p-kad packet limit, kept for mixed-version compatibility checks.
+pub const OLD_KAD_PACKET_BYTES: usize = 16 * 1024;
+
+/// Conservative record value limit that still fits an old Kademlia packet.
+pub const OLD_COMPAT_RECORD_BYTES: usize = OLD_KAD_PACKET_BYTES - 2 * 1024;

@@ -177,8 +177,41 @@ pub fn parse_legacy_types(value: &[u8]) -> Option<Vec<String>> {
 }
 
 /// Encode a legacy unsigned JSON array for the compatibility mirror.
+#[allow(dead_code)]
 pub fn encode_legacy_types(services: &[String]) -> Option<Vec<u8>> {
     serde_json::to_vec(services).ok()
+}
+
+/// Encode at most as many leading services as fit in `max_bytes`.
+///
+/// Returns the encoded array and the number of included services. The input
+/// must already be sorted; callers use this to keep the legacy mirror under the
+/// old Kademlia packet limit.
+pub fn encode_legacy_types_capped(
+    services: &[String],
+    max_bytes: usize,
+) -> Option<(Vec<u8>, usize)> {
+    let full = serde_json::to_vec(services).ok()?;
+    if full.len() <= max_bytes {
+        return Some((full, services.len()));
+    }
+
+    let mut low = 0usize;
+    let mut high = services.len();
+    while low < high {
+        let mid = (low + high).div_ceil(2);
+        let encoded = serde_json::to_vec(&services[..mid]).ok()?;
+        if encoded.len() <= max_bytes {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    let encoded = serde_json::to_vec(&services[..low]).ok()?;
+    if encoded.len() > max_bytes {
+        return None;
+    }
+    Some((encoded, low))
 }
 
 #[cfg(test)]
@@ -256,6 +289,16 @@ mod tests {
         assert_eq!(names, vec!["cmd", "ocr", "cmd"]);
         let encoded = encode_legacy_types(&["cmd".to_string(), "ocr".to_string()]).unwrap();
         assert_eq!(parse_legacy_types(&encoded).unwrap(), vec!["cmd", "ocr"]);
+    }
+
+    #[test]
+    fn legacy_encoder_caps_to_limit() {
+        let services: Vec<String> = (0..100).map(|i| format!("svc{i:03}")).collect();
+        let (encoded, included) = encode_legacy_types_capped(&services, 64).unwrap();
+        assert!(encoded.len() <= 64);
+        assert!(included > 0 && included < services.len());
+        let decoded = parse_legacy_types(&encoded).unwrap();
+        assert_eq!(decoded.len(), included);
     }
 
     #[test]

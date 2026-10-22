@@ -65,6 +65,7 @@ pub struct NodeController {
     pub(super) signed_types_cache: Option<Arc<DhtCache<(), BTreeSet<String>, TypesFetcher>>>,
     pub(super) legacy_types_cache: Arc<DhtCache<(), BTreeSet<String>, LegacyTypesFetcher>>,
     pub(super) legacy_types_publisher: Option<Arc<LegacyTypesPublisher>>,
+    pub(super) legacy_types_merge: bool,
 }
 
 impl NodeController {
@@ -139,7 +140,11 @@ impl NodeController {
                 "未配置 services.registry.types_authority，使用旧版未签名索引",
             )
             .emit();
-            Some(LegacyTypesPublisher::new(swarm.clone(), types_interval))
+            Some(LegacyTypesPublisher::new(
+                swarm.clone(),
+                types_interval,
+                config.compat_max_record_bytes() as usize,
+            ))
         } else {
             None
         };
@@ -152,6 +157,7 @@ impl NodeController {
         let relay = RelayManager::new(config.clone(), swarm.clone(), my_peer_id);
         let bootstrap =
             BootstrapDiscovery::new(config.clone(), swarm.clone(), provider_cache.clone());
+        let legacy_types_merge = config.legacy_types_merge();
 
         Self {
             config,
@@ -174,6 +180,7 @@ impl NodeController {
             signed_types_cache,
             legacy_types_cache,
             legacy_types_publisher,
+            legacy_types_merge,
         }
     }
 
@@ -206,7 +213,7 @@ impl NodeController {
                     if let Some(cache) = &self.signed_types_cache {
                         cache.refresh_if_due(());
                     }
-                    if !signed_present {
+                    if self.legacy_types_merge || !signed_present {
                         self.legacy_types_cache.refresh_if_due(());
                     }
                     if let Some(publisher) = &self.legacy_types_publisher {
