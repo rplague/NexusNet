@@ -15,6 +15,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+use crate::limits::{DHT_MAX_RECORD_BYTES, OLD_COMPAT_RECORD_BYTES};
 use crate::paths;
 use crate::{LogLevel, LogStruct};
 use libp2p::multiaddr::Protocol;
@@ -71,6 +72,31 @@ fn default_auth_network() -> String {
     "none".to_string()
 }
 
+/// Compatibility knobs for mixed-version networks.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct CompatConfig {
+    /// Maximum size of a DHT record written by this node.
+    ///
+    /// The default fits under the old Kademlia 16 KiB packet limit so older
+    /// nodes can still store records. Raise it after every node supports the
+    /// larger limit.
+    #[serde(default = "default_compat_max_record_bytes")]
+    pub max_record_bytes: u64,
+}
+
+impl Default for CompatConfig {
+    fn default() -> Self {
+        Self {
+            max_record_bytes: default_compat_max_record_bytes(),
+        }
+    }
+}
+
+/// Conservative default: leaves room for protobuf framing and closer peers.
+fn default_compat_max_record_bytes() -> u64 {
+    OLD_COMPAT_RECORD_BYTES as u64
+}
+
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize, Default)]
 pub struct NodeConfig {
     #[serde(default)]
@@ -83,6 +109,8 @@ pub struct NodeConfig {
     pub crypto: CryptoConfig,
     #[serde(default)]
     pub auth: AuthConfig,
+    #[serde(default)]
+    pub compat: CompatConfig,
 }
 
 impl NodeConfig {
@@ -120,6 +148,13 @@ impl NodeConfig {
         }
         if !(1..=16).contains(&self.services.registry.max_inflight_dht) {
             return Err("services.registry.max_inflight_dht 必须在 1..=16".to_string());
+        }
+        if self.compat.max_record_bytes == 0
+            || self.compat.max_record_bytes > DHT_MAX_RECORD_BYTES as u64
+        {
+            return Err(format!(
+                "compat.max_record_bytes 必须在 1..={DHT_MAX_RECORD_BYTES}"
+            ));
         }
         if !(1..=16).contains(&self.services.dispatcher.max_inflight_dht) {
             return Err("services.dispatcher.max_inflight_dht 必须在 1..=16".to_string());
@@ -689,6 +724,10 @@ impl ConfigHandle {
         self.read().services.registry.max_inflight_dht as usize
     }
 
+    /// Maximum DHT record size this node writes.
+    pub fn compat_max_record_bytes(&self) -> u64 {
+        self.read().compat.max_record_bytes
+    }
     pub fn relay_retry_interval(&self) -> u32 {
         self.read().services.relay.retry_interval_secs
     }

@@ -15,12 +15,14 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use libp2p::{PeerId, kad};
 
 use crate::auth;
 use crate::controller::service_registry::ServiceCommand;
+use crate::dht_cache::DhtCache;
 use crate::log::{LogLevel, LogStruct};
 use crate::network::NetworkHandle;
 use crate::service_dispatcher::{ControlCommand, ToController};
@@ -28,6 +30,8 @@ use crate::service_protocol;
 use crate::sidecar_protocol::Message;
 
 use super::NodeController;
+use super::auth_gate::AuthGate;
+use super::dht_fetchers::{GenericRecordFetcher, ProviderFetcher};
 use super::peer_tracker::PeerTracker;
 use super::relay_manager::RELAY_TARGET;
 
@@ -108,90 +112,159 @@ fn can_run_in_dht_worker(msg: &Message) -> bool {
     }
 }
 
-fn log_command(kind: &str, elapsed: Duration) {
-    let level = if elapsed >= Duration::from_secs(1) {
-        LogLevel::Warning
-    } else {
-        LogLevel::Debug
-    };
-    LogStruct::new(
-        level,
-        "控制命令",
-        format!("{kind} {}ms", elapsed.as_millis()),
-    )
-    .emit();
+fn log_command_result(kind: &str, elapsed: Duration, result: &Result<Vec<u8>, String>) {
+    if let Err(error) = result {
+        LogStruct::new(LogLevel::Error, "控制命令失败", format!("{kind}: {error}")).emit();
+    } else if elapsed >= Duration::from_secs(1) {
+        LogStruct::new(
+            LogLevel::Warning,
+            "控制命令较慢",
+            format!("{kind} {}ms", elapsed.as_millis()),
+        )
+        .emit();
+    }
 }
 
 fn provider_strings(providers: Vec<PeerId>) -> Vec<String> {
     providers.into_iter().map(|peer| peer.to_string()).collect()
 }
 
+fn quorum_for_key(_key: &str) -> kad::Quorum {
+    // Old versions publish with Quorum::One. Keep this for mixed networks:
+    // Quorum::All fails if an older peer cannot store or answer.
+    kad::Quorum::One
+}
+
+fn check_compat_record_size(len: usize, max_bytes: u64) -> Result<(), String> {
+    if len as u64 > max_bytes {
+        return Err(format!(
+            "record exceeds compat.max_record_bytes ({max_bytes} bytes); raise it after all nodes support larger packets"
+        ));
+    }
+    Ok(())
+}
+
+async fn fetch_providers(
+    cache: &Arc<DhtCache<kad::RecordKey, Vec<PeerId>, ProviderFetcher>>,
+    key: kad::RecordKey,
+) -> Result<Vec<PeerId>, String> {
+    cache
+        .get(key)
+        .await
+        .map(|read| read.value.unwrap_or_default())
+        .map_err(|e| e.to_string())
+}
+
+async fn fetch_record(
+    cache: &Arc<DhtCache<kad::RecordKey, Vec<u8>, GenericRecordFetcher>>,
+    key: kad::RecordKey,
+) -> Result<Option<Vec<u8>>, String> {
+    cache
+        .get(key)
+        .await
+        .map(|read| read.value)
+        .map_err(|e| e.to_string())
+}
+
+async fn request_service(
+    swarm: &NetworkHandle,
+    peers: &PeerTracker,
+    provider_cache: &Arc<DhtCache<kad::RecordKey, Vec<PeerId>, ProviderFetcher>>,
+    my_peer_id: PeerId,
+    key: kad::RecordKey,
+    service: String,
+    payload: Vec<u8>,
+) -> Result<Vec<u8>, String> {
+    let mut last_error = None;
+    for attempt in 0..2 {
+        let providers = match fetch_providers(provider_cache, key.clone()).await {
+            Ok(providers) => providers,
+            Err(error) => {
+                provider_cache.invalidate(&key);
+                if attempt == 0 {
+                    last_error = Some(error);
+                    continue;
+                }
+                return Err(error);
+            }
+        };
+        let candidates: Vec<PeerId> = providers
+            .into_iter()
+            .filter(|peer| *peer != my_peer_id)
+            .collect();
+        if candidates.is_empty() {
+            return Err("No remote provider found".to_string());
+        }
+        let best = peers
+            .best_peer(&candidates)
+            .or_else(|| candidates.first().copied())
+            .expect("candidates is non-empty");
+        let request = service_protocol::Request {
+            service: service.clone(),
+            payload: payload.clone(),
+        };
+        match swarm.send_request(&best, request).await {
+            Ok(response) => return response_payload(response),
+            Err(error) => {
+                last_error = Some(error.to_string());
+                if attempt == 0 {
+                    provider_cache.invalidate(&key);
+                }
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| "service request failed".to_string()))
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run_dht_command(
     swarm: &NetworkHandle,
     peers: &PeerTracker,
+    record_cache: &Arc<DhtCache<kad::RecordKey, Vec<u8>, GenericRecordFetcher>>,
+    provider_cache: &Arc<DhtCache<kad::RecordKey, Vec<PeerId>, ProviderFetcher>>,
+    auth_gate: &AuthGate,
+    my_peer_id: PeerId,
+    max_record_bytes: u64,
     msg: Message,
 ) -> Result<Vec<u8>, String> {
     match msg {
         Message::DiscoverProviders { service, .. } => {
             let key = kad::RecordKey::new(&format!("/oahd/service/{service}"));
-            match swarm.get_providers(key).await {
-                Ok(providers) => Ok(to_cbor(&provider_strings(providers))),
-                Err(e) => Err(format!("{e:?}")),
-            }
+            let providers = fetch_providers(provider_cache, key).await?;
+            Ok(to_cbor(&provider_strings(providers)))
         }
         Message::QueryKey { key, .. } => {
             if key.is_empty() {
                 return Err("missing key".to_string());
             }
-            if let Ok(kad::GetRecordOk::FoundRecord(peer_record)) =
-                swarm.get_record(kad::RecordKey::new(&key)).await
-            {
-                let value = peer_record.record.value.clone();
-                let providers = swarm
-                    .get_providers(kad::RecordKey::new(&key))
-                    .await
-                    .unwrap_or_default();
-                return Ok(to_cbor(&QueryKeyResult {
-                    key,
-                    value: Some(value),
-                    providers: provider_strings(providers),
-                }));
-            }
-
-            let providers = swarm
-                .get_providers(kad::RecordKey::new(&key))
+            let record_key = kad::RecordKey::new(&key);
+            let value = fetch_record(record_cache, record_key.clone()).await?;
+            let providers = fetch_providers(provider_cache, record_key)
                 .await
                 .unwrap_or_default();
-            if providers.is_empty() {
-                Err("key not found".to_string())
-            } else {
-                Ok(to_cbor(&QueryKeyResult {
-                    key,
-                    value: None,
-                    providers: provider_strings(providers),
-                }))
+            if value.is_none() && providers.is_empty() {
+                return Err("key not found".to_string());
             }
+            Ok(to_cbor(&QueryKeyResult {
+                key,
+                value,
+                providers: provider_strings(providers),
+            }))
         }
         Message::ServiceRequest {
             service, payload, ..
         } => {
             let key = kad::RecordKey::new(&format!("/oahd/service/{service}"));
-            let providers = swarm
-                .get_providers(key)
-                .await
-                .map_err(|e| format!("{e:?}"))?;
-            if providers.is_empty() {
-                return Err("No provider found".to_string());
-            }
-            let best = peers
-                .best_peer(&providers)
-                .or_else(|| providers.first().copied())
-                .expect("providers is non-empty");
-            let response = swarm
-                .send_request(&best, service_protocol::Request { service, payload })
-                .await
-                .map_err(|e| e.to_string())?;
-            response_payload(response)
+            request_service(
+                swarm,
+                peers,
+                provider_cache,
+                my_peer_id,
+                key,
+                service,
+                payload,
+            )
+            .await
         }
         Message::ServiceRequestTo {
             service,
@@ -226,10 +299,16 @@ async fn run_dht_command(
             let Some(bytes) = value else {
                 return Err("at least one of 'value' or 'providing' is required".to_string());
             };
+            check_compat_record_size(bytes.len(), max_record_bytes)?;
+            let record_key = kad::RecordKey::new(&key);
             swarm
-                .put_record(kad::RecordKey::new(&key), bytes)
+                .put_record(record_key.clone(), bytes, quorum_for_key(&key))
                 .await
                 .map_err(|e| format!("put_record failed: {e}"))?;
+            record_cache.invalidate(&record_key);
+            if key.starts_with("/oahd/auth/") {
+                auth_gate.invalidate_all();
+            }
             Ok(to_cbor(&serde_json::json!({"success": true, "key": key})))
         }
         _ => Err("command not supported by DHT worker".to_string()),
@@ -260,17 +339,34 @@ impl NodeController {
             };
             let swarm = self.swarm.clone();
             let peers = self.peers.clone();
+            let record_cache = self.record_cache.clone();
+            let provider_cache = self.provider_cache.clone();
+            let auth_gate = self.auth.clone();
+            let my_peer_id = self.my_peer_id;
+            let max_record_bytes = self.config.compat_max_record_bytes();
             tokio::spawn(async move {
-                let result = run_dht_command(&swarm, &peers, msg).await;
-                log_command(kind, started.elapsed());
+                let result = run_dht_command(
+                    &swarm,
+                    &peers,
+                    &record_cache,
+                    &provider_cache,
+                    &auth_gate,
+                    my_peer_id,
+                    max_record_bytes,
+                    msg,
+                )
+                .await;
+                log_command_result(kind, started.elapsed(), &result);
                 let _ = resp_tx.send(result);
                 drop(permit);
             });
         } else {
-            let result = self.run_command(msg).await;
-            log_command(kind, started.elapsed());
-            let _ = resp_tx
-                .send(result.unwrap_or_else(|| Err("command produced no result".to_string())));
+            let result = self
+                .run_command(msg)
+                .await
+                .unwrap_or_else(|| Err("command produced no result".to_string()));
+            log_command_result(kind, started.elapsed(), &result);
+            let _ = resp_tx.send(result);
         }
     }
 
@@ -324,13 +420,8 @@ impl NodeController {
 
     async fn cmd_discover_providers(&self, service: &str) -> Result<Vec<u8>, String> {
         let key = kad::RecordKey::new(&format!("/oahd/service/{}", service));
-        match self.swarm.get_providers(key).await {
-            Ok(providers) => {
-                let providers: Vec<String> = providers.into_iter().map(|p| p.to_string()).collect();
-                Ok(to_cbor(&providers))
-            }
-            Err(e) => Err(format!("{e:?}")),
-        }
+        let providers = fetch_providers(&self.provider_cache, key).await?;
+        Ok(to_cbor(&provider_strings(providers)))
     }
 
     fn cmd_query_public_ip(&self) -> Result<Vec<u8>, String> {
@@ -377,6 +468,7 @@ impl NodeController {
                 self.bootstrap.reset();
                 self.send_service(ServiceCommand::Reset).await;
                 self.auth.reload();
+                self.invalidate_caches();
                 serde_json::json!({"success": true})
             }
             Err(e) => serde_json::json!({"success": false, "error": e.to_string()}),
@@ -385,6 +477,7 @@ impl NodeController {
     }
 
     async fn cmd_refresh_cache(&self) -> Result<Vec<u8>, String> {
+        self.invalidate_caches();
         let result = match self.swarm.refresh_record_cache().await {
             Ok(cleared) => serde_json::json!({"success": true, "cleared": cleared}),
             Err(e) => serde_json::json!({"success": false, "error": e.to_string()}),
@@ -459,10 +552,13 @@ impl NodeController {
         let ack = || to_cbor(&serde_json::json!({"success": true, "key": key.clone()}));
         match value {
             Some(bytes) => {
+                check_compat_record_size(bytes.len(), self.config.compat_max_record_bytes())?;
+                let record_key = kad::RecordKey::new(&key);
                 self.swarm
-                    .put_record(kad::RecordKey::new(&key), bytes)
+                    .put_record(record_key, bytes, quorum_for_key(&key))
                     .await
                     .map_err(|e| format!("put_record failed: {e}"))?;
+                self.invalidate_record_key(&key);
                 if providing {
                     self.start_providing_record(&key).await?;
                 }
@@ -509,6 +605,7 @@ impl NodeController {
                 .await
                 .map_err(|e| format!("remove_record failed: {e}"))?;
         }
+        self.invalidate_record_key(&key);
         Ok(to_cbor(&serde_json::json!({
             "success": true,
             "key": key,
@@ -521,36 +618,19 @@ impl NodeController {
         if key.is_empty() {
             return Err("missing key".to_string());
         }
-        if let Ok(kad::GetRecordOk::FoundRecord(peer_record)) =
-            self.swarm.get_record(kad::RecordKey::new(&key)).await
-        {
-            let value = peer_record.record.value.clone();
-            let providers = self
-                .swarm
-                .get_providers(kad::RecordKey::new(&key))
-                .await
-                .unwrap_or_default();
-            return Ok(to_cbor(&QueryKeyResult {
-                key,
-                value: Some(value),
-                providers: providers.into_iter().map(|p| p.to_string()).collect(),
-            }));
-        }
-
-        let providers = self
-            .swarm
-            .get_providers(kad::RecordKey::new(&key))
+        let record_key = kad::RecordKey::new(&key);
+        let value = fetch_record(&self.record_cache, record_key.clone()).await?;
+        let providers = fetch_providers(&self.provider_cache, record_key)
             .await
             .unwrap_or_default();
-        if providers.is_empty() {
-            Err("key not found".to_string())
-        } else {
-            Ok(to_cbor(&QueryKeyResult {
-                key,
-                value: None,
-                providers: providers.into_iter().map(|p| p.to_string()).collect(),
-            }))
+        if value.is_none() && providers.is_empty() {
+            return Err("key not found".to_string());
         }
+        Ok(to_cbor(&QueryKeyResult {
+            key,
+            value,
+            providers: provider_strings(providers),
+        }))
     }
 
     async fn cmd_service_request(
@@ -559,26 +639,16 @@ impl NodeController {
         payload: Vec<u8>,
     ) -> Result<Vec<u8>, String> {
         let key = kad::RecordKey::new(&format!("/oahd/service/{}", service));
-        let providers = self
-            .swarm
-            .get_providers(key)
-            .await
-            .map_err(|e| format!("{e:?}"))?;
-        if providers.is_empty() {
-            return Err("No provider found".to_string());
-        }
-        let best = self
-            .peers
-            .best_peer(&providers)
-            .or_else(|| providers.first().copied())
-            .expect("providers is non-empty");
-        let request = service_protocol::Request { service, payload };
-        let response = self
-            .swarm
-            .send_request(&best, request)
-            .await
-            .map_err(|e| e.to_string())?;
-        response_payload(response)
+        request_service(
+            &self.swarm,
+            &self.peers,
+            &self.provider_cache,
+            self.my_peer_id,
+            key,
+            service,
+            payload,
+        )
+        .await
     }
 
     async fn cmd_service_request_to(
@@ -694,6 +764,12 @@ mod tests {
         }));
         assert!(!can_run_in_dht_worker(&Message::Whoami { id }));
         assert!(!can_run_in_dht_worker(&Message::ListServices { id }));
+    }
+
+    #[test]
+    fn compat_record_size_guard_rejects_oversized_values() {
+        assert!(check_compat_record_size(14 * 1024, 14 * 1024).is_ok());
+        assert!(check_compat_record_size(14 * 1024 + 1, 14 * 1024).is_err());
     }
 
     #[test]

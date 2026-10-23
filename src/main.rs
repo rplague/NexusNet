@@ -18,6 +18,9 @@
 mod auth;
 mod config;
 mod controller;
+mod cose;
+mod dht_cache;
+mod limits;
 mod log;
 mod network;
 mod paths;

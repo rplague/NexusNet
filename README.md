@@ -130,6 +130,9 @@ max_inflight_dht = 4             # 1..=16，registry DHT job 并发上限
 retry_interval_secs = 60
 max_failures = 3
 
+[compat]
+max_record_bytes = 14336     # 默认适配旧版 16 KiB Kademlia 包
+
 [crypto]
 pq_transport_enabled = false
 pq_identity_enabled = false
@@ -193,6 +196,9 @@ main()
 | **service_dispatcher** | 后端连接管理与就绪状态上报 |
 | **network** | 网络层门面：身份、地址探测、行为装配、Swarm Actor（`network/identity`、`network/addr`、`network/behaviour`、`network/builder`、`network/actor`） |
 | **config** | 提供ConfigHandle |
+| **dht_cache** | read-through + 每 key 单飞的 DHT 读缓存 |
+| **cose** | 共享的 COSE_Sign1 EdDSA 签名/验签 |
+| **limits** | DHT 记录与 Kademlia 包大小上限 |
 | **service_protocol** | 提供通讯协议 |
 | **auth** | 鉴权记录层：COSE_Sign1 验签、TUF-lite 一致性防护、内存缓存与判定 |
 | **log** | 自动检测输出模式：systemd 下交 journald，其余终端+文件轮转 |
@@ -224,6 +230,7 @@ u32_be(len) || cbor(message)      # len <= 16 MiB
 - `add_key` 的 `value` 为 `bstr`，二进制安全（无需 base64）。
 - `remove_key`：撤销 provider 宣告 / 删除本地记录，`{ key, ? providing=true, ? record=false }`。两项均为**本地操作**——远端 provider 记录需待对端 provider TTL 过期才消失，远端 value 副本按 `services.kademlia.record_ttl_seconds` 过期；撤销只影响发现，不阻止直接 `service_request_to` 调用。
 - `add_key` / `remove_key` 仅允许 `/oahd/service/<name>` 与 `/oahd/auth/...`；`/oahd/service/types` 和 `/oahd/bootstrap` 由节点自身维护，后端不可写。
+- `refresh_cache`：清空应用层 DHT 缓存，并删除 Kademlia 本地 store 中非本节点发布的副本；本节点自己发布的记录保留。
 - 默认超时 30 秒，超时以 `error{code:"timeout"}` 应答。
 
 ## P2P 服务调用流程
@@ -246,19 +253,36 @@ u32_be(len) || cbor(message)      # len <= 16 MiB
 
 - 本地服务列表由 `config.services.dispatcher.local_services` 定义
 - `ServiceDispatcher` 持有唯一一份 `backend_ready`（后端 `hello` 握手成功），并通过 watch 发布；ServiceRegistry 订阅该状态，不再由 NodeController 转发
-- 服务注册、撤销和类型索引 reconcile 在独立的异步 registry actor 中执行；NodeController 不再等待 DHT。并发由 `services.registry.max_inflight_dht` 控制（默认 4，范围 1–16）
+- 服务注册、撤销和类型索引 reconcile 在独立的异步 registry actor 中执行；NodeController 不再等待这些 DHT 操作。并发由 `services.registry.max_inflight_dht` 控制（默认 4，范围 1–16）
 - 仅当 DHT bootstrap 完成**且**对应后端 TCP 握手（`hello`）成功后，才自动调用 `start_providing`，key 为 `/oahd/service/<name>`——避免提前宣告尚不可用的服务
 - 后端连接断开后进入 3 秒宽限期（由 1 秒 tick 检查，实际撤销窗口约 3–4 秒）：期间重连则不撤销；超时仍未恢复则 `stop_providing` 撤销宣告
 - 撤销为本地行为，远端 provider 记录需待 provider TTL 过期才会消失
 - 双栈节点在 `allow_bootstrap = true` 时声明为 `/oahd/bootstrap` provider；其他节点仅在 `accept_bootstrap_providers = true` 时才会把 Identify 发现的 provider 自动写入 bootstrap 列表
-- 同步 `/oahd/service/types` 全局服务类型记录（仅新增、不清理）：本地维护一个**单调并集**，并周期（`services.dispatcher.types_sync_secs`，默认 300s）从 DHT 对端读取（绕过本地 store 副本与 60s 缓存，避免自我遮蔽）后重新发布，使各节点即使遭遇并发覆盖也能收敛到完整列表；读取/写入由 registry actor 异步完成，单飞并带 dirty 重跑
+- Kademlia 成员准入：启动时把配置 bootstrap 地址中的 PeerId 直接视为已识别；其他 peer 只有 Identify 的 `agent_version` 以 `/nexusnet` 开头才加入路由表。进入路由表的未识别 PeerId 会被移除；Kademlia 查询仍可能短暂拨号，但不会保留。
+- 同步 `/oahd/service/types` 全局服务类型记录（仅新增、不清理）：本地维护一个**单调并集**，并周期（`services.dispatcher.types_sync_secs`，默认 300s）从 DHT 对端读取（绕过本地 store 副本与缓存，避免自我遮蔽）后重新发布，使各节点即使遭遇并发覆盖也能收敛到完整列表；读取/写入由 registry actor 异步完成，单飞并带 dirty 重跑
+- `compat.max_record_bytes` 默认 14 KiB，确保旧版 Kademlia 16 KiB 包能承载 DHT 写入；超过上限的 auth/service 写入直接拒绝。全量升级后再调大。
+- `BootstrapCompleted` / `reannounce_services` 会清空本地 `announced` 状态并重新宣告，避免 DHT 重建后停留在旧状态。
 - `list_services` → 立即返回本地快照，并在后台触发一次类型索引刷新（最终一致）
-- `reannounce_services` → 投递后台重新宣告任务后立即返回 accepted
+- `reannounce_services` → 清空本地 `announced` 缓存并重新 `start_providing`，立即返回 accepted
 - DHT 控制命令（`query_key`、`discover_providers`、`service_request`、`service_request_to`，以及 `providing=false` 的 `add_key`）在独立有界 worker 中执行；并发由 `services.dispatcher.max_inflight_dht` 控制（默认 4，范围 1–16）。`whoami`/`relay_status`/`pq_status`/`auth_status`/`list_services` 不等待 DHT
-- `add_key` 的 `providing=true` 仍由 NodeController 处理，用于保持与 ServiceRegistry 宣告状态一致
+- `add_key` 的 `providing=true` 由 NodeController 直接调用 `start_providing`；ServiceRegistry 仍独立维护自动宣告状态
 - 本地调用优先：`service_request` 命中已就绪的本地服务时直接走 `ServiceDispatcher`，不查 DHT、不使用 PQ、不经过 AuthGate；`service_request_to(self, service)` 同样走本地。本地未就绪时，`service_request` 回退远端，`service_request_to(self)` 返回 `backend_not_ready`
 - `discover_providers` → DHT get_providers 获取提供者列表
 - `service_request` → 本地就绪优先；否则查询 provider，RTT 排序选优，P2P 调用
+
+## DHT 读缓存
+
+应用层 DHT 读缓存只做 read-through + 每 key 单飞刷新：
+
+- 有上一次结果时立即返回，同时如果该 key 没有正在进行的查询，就在后台启动一次 DHT 查询。
+- 后台查询完成后覆盖缓存；成功查到“不存在”也会覆盖为空结果。
+- 冷启动没有旧结果时，等待第一次查询完成，并返回其结果或真实错误。
+- 后台刷新失败时保留旧结果，只记录错误；下一次查询会再次触发刷新。
+- 没有 fresh/stale 窗口、全局 permit、缓存层 timeout 或失败退避。
+- auth 缓存仍由 `AuthGate` 检查 `expires_at` 与 `version`；文档过期或 rollback 仍然拒绝。
+- `/oahd/service/types` 使用旧版 registry 并集，不进入这个缓存。
+
+`refresh_cache` 清空上述应用缓存，并删除 Kademlia 本地 store 中非本节点发布的副本。
 
 ## 抗量子加密
 
@@ -302,7 +326,7 @@ u32_be(len) || cbor(message)      # len <= 16 MiB
 | `auth.networks.<name>.authority` | 该网络权威 ed25519 公钥（base64） |
 | `require_auth` | 单个本地服务是否要求鉴权 |
 
-鉴权记录按需从 DHT 读取，经 60 秒本地记录缓存；没有独立的鉴权缓存或后台刷新任务。
+鉴权记录通过统一缓存读取：有旧结果立即返回并后台刷新；冷启动等待第一次查询；`expires_at` 过期或 rollback 仍拒绝。auth 写入使用 `Quorum::One`，并受 `compat.max_record_bytes` 限制，旧节点仍可存储与验证小文档。
 
 ## 日志
 
@@ -320,7 +344,7 @@ u32_be(len) || cbor(message)      # len <= 16 MiB
 
 ## 开发状态
 
-当前版本：**0.5.1-1432** — 完成度 **5.5/10**
+当前版本：**0.5.2** — 完成度 **6/10**
 
 ## 许可
 

@@ -18,10 +18,11 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use libp2p::{PeerId, identify, ping};
+use libp2p::{PeerId, identify, kad, ping};
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::config::ConfigHandle;
+use crate::dht_cache::DhtCache;
 use crate::log::{LogLevel, LogStruct};
 use crate::network::{AGENT_NAME, NetworkEvent, NetworkHandle, NetworkStart};
 use crate::service_dispatcher::{BackendReadiness, InboundRequest, ToController};
@@ -29,6 +30,7 @@ use crate::service_protocol;
 
 use super::auth_gate::{AuthGate, Decision};
 use super::bootstrap::BootstrapDiscovery;
+use super::dht_fetchers::{GenericRecordFetcher, ProviderFetcher};
 use super::peer_tracker::PeerTracker;
 use super::relay_manager::RelayManager;
 use super::service_registry::{self, ServiceCommand, ServiceSnapshot};
@@ -54,6 +56,8 @@ pub struct NodeController {
     pub(super) services_snapshot: watch::Receiver<Arc<ServiceSnapshot>>,
     pub(super) relay: RelayManager,
     pub(super) bootstrap: BootstrapDiscovery,
+    pub(super) record_cache: Arc<DhtCache<kad::RecordKey, Vec<u8>, GenericRecordFetcher>>,
+    pub(super) provider_cache: Arc<DhtCache<kad::RecordKey, Vec<PeerId>, ProviderFetcher>>,
 }
 
 impl NodeController {
@@ -88,6 +92,20 @@ impl NodeController {
         let dht_permits = Arc::new(tokio::sync::Semaphore::new(
             config.dispatcher_max_inflight_dht().clamp(1, 16),
         ));
+        let record_cache = DhtCache::new(
+            Arc::new(GenericRecordFetcher {
+                swarm: swarm.clone(),
+            }),
+            1024,
+            64 << 20,
+        );
+        let provider_cache = DhtCache::new(
+            Arc::new(ProviderFetcher {
+                swarm: swarm.clone(),
+            }),
+            1024,
+            16 << 20,
+        );
         let services = service_registry::spawn(
             config.clone(),
             swarm.clone(),
@@ -95,8 +113,8 @@ impl NodeController {
             shutdown_rx.clone(),
         );
         let relay = RelayManager::new(config.clone(), swarm.clone(), my_peer_id);
-        let bootstrap = BootstrapDiscovery::new(config.clone(), swarm.clone());
-
+        let bootstrap =
+            BootstrapDiscovery::new(config.clone(), swarm.clone(), provider_cache.clone());
         Self {
             config,
             my_peer_id,
@@ -113,6 +131,8 @@ impl NodeController {
             services_snapshot: services.snapshot,
             relay,
             bootstrap,
+            record_cache,
+            provider_cache,
         }
     }
 
@@ -155,6 +175,7 @@ impl NodeController {
             NetworkEvent::Ping(event) => self.handle_ping(event),
             NetworkEvent::Identify(event) => self.handle_identify(event).await,
             NetworkEvent::BootstrapCompleted => {
+                self.bootstrap.reset();
                 self.send_service(ServiceCommand::BootstrapCompleted).await;
                 self.bootstrap.announce_self().await;
                 self.relay.tick().await;
@@ -174,6 +195,22 @@ impl NodeController {
                     self.relay.tick().await;
                 }
             }
+        }
+    }
+
+    pub(super) fn invalidate_caches(&self) {
+        self.record_cache.invalidate_all();
+        self.provider_cache.invalidate_all();
+        self.auth.invalidate_all();
+    }
+    pub(super) fn invalidate_record_key(&self, key: &str) {
+        let record_key = kad::RecordKey::new(&key);
+        self.record_cache.invalidate(&record_key);
+        if key.starts_with("/oahd/auth/") {
+            self.auth.invalidate_all();
+        }
+        if key.starts_with("/oahd/service/") {
+            self.provider_cache.invalidate(&record_key);
         }
     }
 

@@ -98,7 +98,7 @@ pub enum Message {
     ReloadConfig {
         id: Uuid,
     },
-    /// Clear the local DHT record cache; later queries go back to the network.
+    /// Clear application SWR caches and non-self local Kademlia replicas.
     RefreshCache {
         id: Uuid,
     },

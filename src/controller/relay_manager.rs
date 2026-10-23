@@ -79,82 +79,43 @@ impl RelayManager {
 
     /// Relay server (inbound reservation) events: informational only.
     pub fn on_relay_event(&self, event: relay::Event) {
-        match event {
-            relay::Event::ReservationReqAccepted { src_peer_id, .. } => {
-                LogStruct::new(
-                    LogLevel::Debug,
-                    "中继预约已接受",
-                    format!("对端: {}", src_peer_id),
-                )
-                .emit();
-            }
-            relay::Event::ReservationReqDenied {
-                src_peer_id,
-                status,
-                ..
-            } => {
-                LogStruct::new(
-                    LogLevel::Debug,
-                    "中继预约被拒绝",
-                    format!("对端: {}, 状态: {:?}", src_peer_id, status),
-                )
-                .emit();
-            }
-            relay::Event::CircuitReqAccepted {
-                src_peer_id,
-                dst_peer_id,
-                ..
-            } => {
-                LogStruct::new(
-                    LogLevel::Debug,
-                    "中继电路已建立",
-                    format!("来源: {}, 目标: {}", src_peer_id, dst_peer_id),
-                )
-                .emit();
-            }
-            _ => {}
+        if let relay::Event::ReservationReqDenied {
+            src_peer_id,
+            status,
+            ..
+        } = event
+        {
+            LogStruct::new(
+                LogLevel::Warning,
+                "中继预约被拒绝",
+                format!("对端: {}, 状态: {:?}", src_peer_id, status),
+            )
+            .emit();
         }
     }
 
     /// Relay client (outbound) events: track reservation successes.
     pub fn on_relay_client_event(&mut self, event: relay::client::Event) {
-        match event {
-            relay::client::Event::ReservationReqAccepted {
-                relay_peer_id,
-                renewal,
-                ..
-            } => {
-                self.pending.remove(&relay_peer_id);
-                self.active.insert(relay_peer_id);
-                self.failures.remove(&relay_peer_id);
-                self.backoff.remove(&relay_peer_id);
-                LogStruct::new(
-                    LogLevel::Preset,
-                    if renewal {
-                        "中继预约续期"
-                    } else {
-                        "中继预约成功"
-                    },
-                    format!("{}/{}: {}", self.active.len(), RELAY_TARGET, relay_peer_id),
-                )
-                .emit();
-            }
-            relay::client::Event::OutboundCircuitEstablished { relay_peer_id, .. } => {
-                LogStruct::new(
-                    LogLevel::Debug,
-                    "出站中继电路已建立",
-                    format!("中继节点: {}", relay_peer_id),
-                )
-                .emit();
-            }
-            relay::client::Event::InboundCircuitEstablished { src_peer_id, .. } => {
-                LogStruct::new(
-                    LogLevel::Debug,
-                    "入站中继电路已建立",
-                    format!("来源: {}", src_peer_id),
-                )
-                .emit();
-            }
+        if let relay::client::Event::ReservationReqAccepted {
+            relay_peer_id,
+            renewal,
+            ..
+        } = event
+        {
+            self.pending.remove(&relay_peer_id);
+            self.active.insert(relay_peer_id);
+            self.failures.remove(&relay_peer_id);
+            self.backoff.remove(&relay_peer_id);
+            LogStruct::new(
+                LogLevel::Preset,
+                if renewal {
+                    "中继预约续期"
+                } else {
+                    "中继预约成功"
+                },
+                format!("{}/{}: {}", self.active.len(), RELAY_TARGET, relay_peer_id),
+            )
+            .emit();
         }
     }
 
@@ -176,7 +137,7 @@ impl RelayManager {
             }
             lost = true;
             if was_active {
-                LogStruct::new(LogLevel::Warning, "中继连接断开", peer_id.to_string()).emit();
+                LogStruct::new(LogLevel::Error, "中继连接断开", peer_id.to_string()).emit();
             }
             self.record_failure(peer_id, Instant::now());
         }
@@ -229,7 +190,7 @@ impl RelayManager {
                 }
                 Err(e) => {
                     LogStruct::new(
-                        LogLevel::Warning,
+                        LogLevel::Error,
                         "中继预约请求失败",
                         format!("{}: {}", peer_id, e),
                     )
@@ -259,8 +220,8 @@ impl RelayManager {
         }
     }
 
-    /// Record a relay failure and set exponential backoff; at the threshold,
-    /// evict the node from the bootstrap list.
+    /// Record a relay failure and set exponential backoff. Bootstrap
+    /// configuration is never modified; a failing relay is only retried later.
     fn record_failure(&mut self, peer_id: PeerId, now: Instant) {
         let count = {
             let c = self.failures.entry(peer_id).or_insert(0);
@@ -268,39 +229,13 @@ impl RelayManager {
             *c
         };
 
-        self.backoff.insert(
-            peer_id,
-            now + Duration::from_secs(relay_backoff_secs(count)),
-        );
-
         let max = self.config.relay_max_failures();
-        if max > 0 && count >= max {
-            self.evict_bootstrap(peer_id);
-        }
-    }
-
-    /// Remove a failed node from the bootstrap list and persist (no floor kept).
-    fn evict_bootstrap(&mut self, peer_id: PeerId) {
-        let filtered: Vec<Multiaddr> = self
-            .config
-            .bootstrap_nodes()
-            .into_iter()
-            .filter(|addr| extract_peer_id_from_multiaddr(addr) != Some(peer_id))
-            .collect();
-        self.config.set_bootstrap_nodes(filtered);
-        self.config.save_to_default();
-
-        self.active.remove(&peer_id);
-        self.pending.remove(&peer_id);
-        self.failures.remove(&peer_id);
-        self.backoff.remove(&peer_id);
-
-        LogStruct::new(
-            LogLevel::Warning,
-            "移除失效中继",
-            format!("已从 bootstrap 列表移除: {}", peer_id),
-        )
-        .emit();
+        let delay = if max > 0 && count >= max {
+            Duration::from_secs(3600)
+        } else {
+            Duration::from_secs(relay_backoff_secs(count))
+        };
+        self.backoff.insert(peer_id, now + delay);
     }
 }
 

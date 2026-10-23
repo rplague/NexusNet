@@ -34,6 +34,7 @@ use crate::service_protocol;
 use crate::{LogLevel, LogStruct};
 
 use libp2p::futures::StreamExt;
+use libp2p::kad::store::RecordStore as _;
 use libp2p::swarm::{ConnectionId, SwarmEvent};
 use libp2p::{
     Multiaddr, PeerId, StreamProtocol, Swarm, identify, identity, kad, ping, relay,
@@ -46,17 +47,14 @@ use uuid::Uuid;
 
 /// Commands sent to the actor by `NodeController` through [`NetworkHandle`].
 pub enum SwarmCommand {
-    KadGetRecord {
+    /// Fetch every record returned by the DHT query.
+    ///
+    /// The query is not finalized on the first `FoundRecord`: libp2p first
+    /// replays the local store copy and then collects responses from peers.
+    /// Callers are expected to verify and select the best record themselves.
+    KadGetRecordAll {
         key: kad::RecordKey,
-        resp: oneshot::Sender<Result<kad::GetRecordOk, NetworkError>>,
-    },
-    /// Like `KadGetRecord`, but ignores the local store copy and the record
-    /// cache so the freshest value held by peers is returned. Used to build the
-    /// merged global service-type index without a node's own publisher record
-    /// shadowing remote updates.
-    KadGetRecordNetwork {
-        key: kad::RecordKey,
-        resp: oneshot::Sender<Result<kad::GetRecordOk, NetworkError>>,
+        resp: oneshot::Sender<Result<Vec<kad::PeerRecord>, NetworkError>>,
     },
     KadGetProviders {
         key: kad::RecordKey,
@@ -65,6 +63,7 @@ pub enum SwarmCommand {
     KadPutRecord {
         key: kad::RecordKey,
         value: Vec<u8>,
+        quorum: kad::Quorum,
         resp: oneshot::Sender<Result<(), NetworkError>>,
     },
     KadStartProviding {
@@ -161,9 +160,13 @@ impl NetworkHandle {
         rx.await.map_err(|_| NetworkError::ActorGone)
     }
 
-    pub async fn get_record(&self, key: kad::RecordKey) -> Result<kad::GetRecordOk, NetworkError> {
+    /// Fetch all records returned by a DHT query.
+    pub async fn get_record_all(
+        &self,
+        key: kad::RecordKey,
+    ) -> Result<Vec<kad::PeerRecord>, NetworkError> {
         match self
-            .request(|resp| SwarmCommand::KadGetRecord { key, resp })
+            .request(|resp| SwarmCommand::KadGetRecordAll { key, resp })
             .await
         {
             Ok(inner) => inner,
@@ -171,20 +174,26 @@ impl NetworkHandle {
         }
     }
 
-    /// Fetch a record from the DHT peers, ignoring the local store copy and the
-    /// 60s result cache. A network-only `NotFound` is reported as
-    /// `FinishedWithNoAdditionalRecord`, so callers can treat an absent record
-    /// as an empty result. See `SwarmCommand::KadGetRecordNetwork`.
+    /// Fetch one record from the network, ignoring the local store copy.
+    ///
+    /// Used by the legacy service-type index to avoid a node's own publisher
+    /// record shadowing remote updates. Returns `FinishedWithNoAdditionalRecord`
+    /// when no remote copy exists.
     pub async fn get_record_network(
         &self,
         key: kad::RecordKey,
     ) -> Result<kad::GetRecordOk, NetworkError> {
-        match self
-            .request(|resp| SwarmCommand::KadGetRecordNetwork { key, resp })
-            .await
+        let records = self.get_record_all(key).await?;
+        if let Some(record) = records
+            .into_iter()
+            .rev()
+            .find(|record| record.peer.is_some())
         {
-            Ok(inner) => inner,
-            Err(e) => Err(e),
+            Ok(kad::GetRecordOk::FoundRecord(record))
+        } else {
+            Ok(kad::GetRecordOk::FinishedWithNoAdditionalRecord {
+                cache_candidates: Default::default(),
+            })
         }
     }
 
@@ -198,7 +207,7 @@ impl NetworkHandle {
         }
     }
 
-    /// Clear the `get_record` result cache; returns the number of entries
+    /// Remove non-self local Kademlia record replicas; returns the number
     /// removed.
     pub async fn refresh_record_cache(&self) -> Result<usize, NetworkError> {
         match self
@@ -214,9 +223,15 @@ impl NetworkHandle {
         &self,
         key: kad::RecordKey,
         value: Vec<u8>,
+        quorum: kad::Quorum,
     ) -> Result<(), NetworkError> {
         match self
-            .request(|resp| SwarmCommand::KadPutRecord { key, value, resp })
+            .request(|resp| SwarmCommand::KadPutRecord {
+                key,
+                value,
+                quorum,
+                resp,
+            })
             .await
         {
             Ok(inner) => inner,
@@ -322,11 +337,9 @@ impl NetworkHandle {
 /// A pending Kademlia query entry.
 enum KadPending {
     GetRecord {
-        key: kad::RecordKey,
-        resp: oneshot::Sender<Result<kad::GetRecordOk, NetworkError>>,
-        /// When set, the local store copy (`peer == None`) is ignored and only a
-        /// record obtained from the DHT finalizes the query.
-        network_only: bool,
+        resp: oneshot::Sender<Result<Vec<kad::PeerRecord>, NetworkError>>,
+        /// Records accumulated until the query finalizes.
+        records: Vec<kad::PeerRecord>,
     },
     GetProviders {
         resp: oneshot::Sender<Result<Vec<PeerId>, NetworkError>>,
@@ -336,7 +349,6 @@ enum KadPending {
     },
     PutRecord {
         key: kad::RecordKey,
-        value: Vec<u8>,
         resp: oneshot::Sender<Result<(), NetworkError>>,
     },
     StartProviding(oneshot::Sender<Result<(), NetworkError>>),
@@ -362,17 +374,6 @@ impl KadPending {
     }
 }
 
-/// TTL of the in-memory `get_record` result cache.
-const RECORD_CACHE_TTL: Duration = Duration::from_secs(60);
-/// Maximum number of cached records; when full a random third is evicted.
-const RECORD_CACHE_CAPACITY: usize = 1024;
-
-/// A cached `get_record` result. `value == None` is a negative cache entry.
-struct CachedRecord {
-    value: Option<Vec<u8>>,
-    fetched_at: Instant,
-}
-
 /// Accumulate progress events for a `GetProviders` query.
 ///
 /// libp2p reports providers whose records hit the local store first via
@@ -384,39 +385,7 @@ struct CachedRecord {
 /// Returns `None` once the query finalized and the result was sent via `resp`;
 /// `Some` means more events are needed (the pending entry is returned as-is).
 /// Non-`GetProviders` entries are returned as-is.
-fn cacheable_record(
-    result: &Result<kad::GetRecordOk, kad::GetRecordError>,
-    network_only: bool,
-) -> Option<Option<Vec<u8>>> {
-    match result {
-        Ok(kad::GetRecordOk::FoundRecord(peer_record)) => {
-            Some(Some(peer_record.record.value.clone()))
-        }
-        Ok(kad::GetRecordOk::FinishedWithNoAdditionalRecord { .. }) if !network_only => Some(None),
-        _ => None,
-    }
-}
-
-/// Normalize a finished `GetRecord` query.
-///
-/// For network-only reads, `NotFound` is the definitive "the DHT has no such
-/// record" answer, not a failure. Reporting it as an empty completed query lets
-/// callers (e.g. the service-type index) publish their local monotonic union
-/// instead of retrying forever.
-fn finalize_get_record(
-    result: Result<kad::GetRecordOk, kad::GetRecordError>,
-    network_only: bool,
-) -> Result<kad::GetRecordOk, NetworkError> {
-    match result {
-        Err(kad::GetRecordError::NotFound { .. }) if network_only => {
-            Ok(kad::GetRecordOk::FinishedWithNoAdditionalRecord {
-                cache_candidates: Default::default(),
-            })
-        }
-        other => other.map_err(|e| NetworkError::Kad(format!("{e:?}"))),
-    }
-}
-
+/// Accumulate provider batches until the query finalizes.
 fn apply_get_providers(
     pending: KadPending,
     result: Result<kad::GetProvidersOk, kad::GetProvidersError>,
@@ -544,7 +513,12 @@ pub(crate) struct SwarmActor {
     cmd_rx: mpsc::UnboundedReceiver<SwarmCommand>,
     cmd_tx: mpsc::UnboundedSender<SwarmCommand>,
     event_tx: mpsc::UnboundedSender<NetworkEvent>,
-    bootstrap_triggered: bool,
+    last_bootstrap_notice: Option<Instant>,
+    /// Peers allowed in the Kademlia routing table.
+    ///
+    /// Bootstrap peers are seeded at startup; other peers are added only after
+    /// an Identify whose agent version starts with [`AGENT_NAME`].
+    identified_peers: HashSet<PeerId>,
     /// Protocols announced by the peer (from Identify), used to decide PQ
     /// capability.
     peer_protocols: HashMap<PeerId, HashSet<StreamProtocol>>,
@@ -555,8 +529,14 @@ pub(crate) struct SwarmActor {
     pending_outbound_pq: HashMap<request_response::OutboundRequestId, PqOutboundPending>,
     pending_pq_identity: HashMap<request_response::OutboundRequestId, PeerId>,
     pending_inbound: HashMap<String, PendingInboundEntry>,
-    /// `get_record` result cache (including negative entries).
-    record_cache: HashMap<kad::RecordKey, CachedRecord>,
+}
+
+/// Extract the `/p2p/<PeerId>` component of a bootstrap multiaddr.
+fn peer_id_from_multiaddr(addr: &Multiaddr) -> Option<PeerId> {
+    addr.iter().find_map(|proto| match proto {
+        libp2p::multiaddr::Protocol::P2p(peer) => Some(peer),
+        _ => None,
+    })
 }
 
 /// Build the Swarm and start the actor task.
@@ -572,6 +552,12 @@ pub fn spawn(
 
     let handle = NetworkHandle::new(cmd_tx.clone());
 
+    let identified_peers = config
+        .bootstrap_nodes()
+        .iter()
+        .filter_map(peer_id_from_multiaddr)
+        .collect();
+
     let mut actor = SwarmActor {
         swarm,
         config,
@@ -580,7 +566,8 @@ pub fn spawn(
         cmd_rx,
         cmd_tx,
         event_tx,
-        bootstrap_triggered: false,
+        last_bootstrap_notice: None,
+        identified_peers,
         peer_protocols: HashMap::new(),
         pq_identities: HashMap::new(),
         pending_kad: HashMap::new(),
@@ -588,7 +575,6 @@ pub fn spawn(
         pending_outbound_pq: HashMap::new(),
         pending_pq_identity: HashMap::new(),
         pending_inbound: HashMap::new(),
-        record_cache: HashMap::new(),
     };
 
     let task = tokio::spawn(async move {
@@ -630,54 +616,6 @@ impl SwarmActor {
             .kademlia
             .as_mut()
             .ok_or(NetworkError::Disabled)
-    }
-
-    /// Return a fresh cached `get_record` result, if any.
-    ///
-    /// Positive entries rebuild a `FoundRecord`; negative entries report
-    /// `FinishedWithNoAdditionalRecord` (i.e. not found).
-    fn cached_record(&self, key: &kad::RecordKey) -> Option<kad::GetRecordOk> {
-        let entry = self.record_cache.get(key)?;
-        if entry.fetched_at.elapsed() >= RECORD_CACHE_TTL {
-            return None;
-        }
-        Some(match &entry.value {
-            Some(value) => kad::GetRecordOk::FoundRecord(kad::PeerRecord {
-                peer: None,
-                record: kad::Record::new(key.clone(), value.clone()),
-            }),
-            None => kad::GetRecordOk::FinishedWithNoAdditionalRecord {
-                cache_candidates: Default::default(),
-            },
-        })
-    }
-
-    /// Insert a record into the cache, evicting entries when at capacity.
-    fn insert_cached(&mut self, key: kad::RecordKey, value: Option<Vec<u8>>) {
-        if self.record_cache.len() >= RECORD_CACHE_CAPACITY && !self.record_cache.contains_key(&key)
-        {
-            // Purge expired entries first; if still full, drop a random third.
-            self.record_cache
-                .retain(|_, entry| entry.fetched_at.elapsed() < RECORD_CACHE_TTL);
-            if self.record_cache.len() >= RECORD_CACHE_CAPACITY {
-                let victims: Vec<kad::RecordKey> = self
-                    .record_cache
-                    .keys()
-                    .take(self.record_cache.len() / 3)
-                    .cloned()
-                    .collect();
-                for victim in victims {
-                    self.record_cache.remove(&victim);
-                }
-            }
-        }
-        self.record_cache.insert(
-            key,
-            CachedRecord {
-                value,
-                fetched_at: Instant::now(),
-            },
-        );
     }
 
     async fn handle_event(&mut self, event: SwarmEvent<NetBehaviourEvent>) {
@@ -731,6 +669,29 @@ impl SwarmActor {
                     .event_tx
                     .send(NetworkEvent::ListenerClosed { addresses });
             }
+            SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+                LogStruct::new(
+                    LogLevel::Error,
+                    "出站连接失败",
+                    format!("{:?}: {error}", peer_id),
+                )
+                .emit();
+            }
+            SwarmEvent::IncomingConnectionError {
+                send_back_addr,
+                error,
+                ..
+            } => {
+                LogStruct::new(
+                    LogLevel::Error,
+                    "入站连接失败",
+                    format!("{send_back_addr}: {error}"),
+                )
+                .emit();
+            }
+            SwarmEvent::ListenerError { error, .. } => {
+                LogStruct::new(LogLevel::Error, "监听器错误", error.to_string()).emit();
+            }
             _ => {}
         }
     }
@@ -748,6 +709,7 @@ impl SwarmActor {
         if !info.agent_version.starts_with(AGENT_NAME) {
             return;
         }
+        self.identified_peers.insert(peer_id);
         // Identify -> Kademlia address bridge
         if let Ok(kad) = self.kad() {
             for addr in &info.listen_addrs {
@@ -780,46 +742,75 @@ impl SwarmActor {
         }
     }
 
+    fn is_allowed_peer(&self, peer: &PeerId) -> bool {
+        peer == self.swarm.local_peer_id() || self.identified_peers.contains(peer)
+    }
+
     /// Handle Kademlia query progress events, waking the matching pending entry
     /// by `QueryId`.
     fn handle_kad_event(&mut self, event: kad::Event) {
-        let kad::Event::OutboundQueryProgressed { result, id, .. } = event else {
-            return;
+        let (result, id) = match event {
+            kad::Event::RoutingUpdated { peer, .. } => {
+                if !self.is_allowed_peer(&peer) {
+                    if let Ok(kad) = self.kad() {
+                        kad.remove_peer(&peer);
+                    }
+                    LogStruct::new(LogLevel::Debug, "未识别节点移出 DHT", peer.to_string()).emit();
+                }
+                return;
+            }
+            kad::Event::OutboundQueryProgressed { result, id, .. } => (result, id),
+            _ => return,
         };
 
         match result {
             kad::QueryResult::Bootstrap(result) => {
-                if result.is_ok() && !self.bootstrap_triggered {
-                    self.bootstrap_triggered = true;
-                    let _ = self.event_tx.send(NetworkEvent::BootstrapCompleted);
+                if result.is_ok() {
+                    let now = Instant::now();
+                    let due = self
+                        .last_bootstrap_notice
+                        .is_none_or(|last| now.duration_since(last) >= Duration::from_secs(30));
+                    if due {
+                        self.last_bootstrap_notice = Some(now);
+                        LogStruct::new(LogLevel::Important, "DHT bootstrap 完成", "").emit();
+                        let _ = self.event_tx.send(NetworkEvent::BootstrapCompleted);
+                    }
+                } else {
+                    LogStruct::new(
+                        LogLevel::Error,
+                        "Kademlia bootstrap 失败",
+                        format!("{result:?}"),
+                    )
+                    .emit();
                 }
             }
             kad::QueryResult::GetRecord(result) => {
-                // A network-only read must not be satisfied by the local store
-                // copy; keep waiting for a peer record or the terminal event.
-                let network_only = matches!(
-                    self.pending_kad.get(&id),
-                    Some(KadPending::GetRecord {
-                        network_only: true,
-                        ..
-                    })
-                );
-                if network_only
-                    && let Ok(kad::GetRecordOk::FoundRecord(peer_record)) = &result
-                    && peer_record.peer.is_none()
-                {
+                let Some(KadPending::GetRecord { resp, mut records }) =
+                    self.pending_kad.remove(&id)
+                else {
                     return;
-                }
-                if let Some(KadPending::GetRecord {
-                    key,
-                    resp,
-                    network_only,
-                }) = self.pending_kad.remove(&id)
-                {
-                    if let Some(value) = cacheable_record(&result, network_only) {
-                        self.insert_cached(key, value);
+                };
+                match result {
+                    Ok(kad::GetRecordOk::FoundRecord(peer_record)) => {
+                        records.push(peer_record);
+                        self.pending_kad
+                            .insert(id, KadPending::GetRecord { resp, records });
                     }
-                    let _ = resp.send(finalize_get_record(result, network_only));
+                    Ok(kad::GetRecordOk::FinishedWithNoAdditionalRecord { .. }) => {
+                        let _ = resp.send(Ok(records));
+                    }
+                    Err(kad::GetRecordError::NotFound { .. }) => {
+                        // A definitive "not found" is an empty result, not a
+                        // transport failure.
+                        let _ = resp.send(Ok(records));
+                    }
+                    Err(error) => {
+                        if records.is_empty() {
+                            let _ = resp.send(Err(NetworkError::Kad(format!("{error:?}"))));
+                        } else {
+                            let _ = resp.send(Ok(records));
+                        }
+                    }
                 }
             }
             kad::QueryResult::GetProviders(result) => {
@@ -831,11 +822,14 @@ impl SwarmActor {
                 }
             }
             kad::QueryResult::PutRecord(result) => {
-                if let Some(KadPending::PutRecord { key, value, resp }) =
-                    self.pending_kad.remove(&id)
-                {
-                    if result.is_ok() {
-                        self.insert_cached(key, Some(value));
+                if let Some(KadPending::PutRecord { key, resp }) = self.pending_kad.remove(&id) {
+                    if result.is_err()
+                        && let Ok(kad) = self.kad()
+                    {
+                        // libp2p stores locally before the network query. A
+                        // failed publication must not leave a local-only value
+                        // that later reads would treat as published.
+                        kad.remove_record(&key);
                     }
                     let _ = resp.send(
                         result
@@ -1185,13 +1179,9 @@ impl SwarmActor {
     /// Handle one command; returns `false` to ask the actor to exit.
     async fn handle_command(&mut self, cmd: SwarmCommand) -> bool {
         match cmd {
-            SwarmCommand::KadGetRecord { key, resp } => {
-                if let Some(cached) = self.cached_record(&key) {
-                    let _ = resp.send(Ok(cached));
-                    return true;
-                }
+            SwarmCommand::KadGetRecordAll { key, resp } => {
                 let query_id = match self.kad() {
-                    Ok(kad) => kad.get_record(key.clone()),
+                    Ok(kad) => kad.get_record(key),
                     Err(e) => {
                         let _ = resp.send(Err(e));
                         return true;
@@ -1200,29 +1190,8 @@ impl SwarmActor {
                 self.pending_kad.insert(
                     query_id,
                     KadPending::GetRecord {
-                        key,
                         resp,
-                        network_only: false,
-                    },
-                );
-            }
-            SwarmCommand::KadGetRecordNetwork { key, resp } => {
-                // Drop the cached entry so it cannot shadow the network value,
-                // then ignore the local store copy while the query runs.
-                self.record_cache.remove(&key);
-                let query_id = match self.kad() {
-                    Ok(kad) => kad.get_record(key.clone()),
-                    Err(e) => {
-                        let _ = resp.send(Err(e));
-                        return true;
-                    }
-                };
-                self.pending_kad.insert(
-                    query_id,
-                    KadPending::GetRecord {
-                        key,
-                        resp,
-                        network_only: true,
+                        records: Vec::new(),
                     },
                 );
             }
@@ -1242,10 +1211,15 @@ impl SwarmActor {
                     },
                 );
             }
-            SwarmCommand::KadPutRecord { key, value, resp } => {
-                let record = kad::Record::new(key.clone(), value.clone());
+            SwarmCommand::KadPutRecord {
+                key,
+                value,
+                quorum,
+                resp,
+            } => {
+                let record = kad::Record::new(key.clone(), value);
                 let result = match self.kad() {
-                    Ok(kad) => kad.put_record(record, kad::Quorum::One),
+                    Ok(kad) => kad.put_record(record, quorum),
                     Err(e) => {
                         let _ = resp.send(Err(e));
                         return true;
@@ -1254,7 +1228,7 @@ impl SwarmActor {
                 match result {
                     Ok(query_id) => {
                         self.pending_kad
-                            .insert(query_id, KadPending::PutRecord { key, value, resp });
+                            .insert(query_id, KadPending::PutRecord { key, resp });
                     }
                     Err(e) => {
                         let _ = resp.send(Err(NetworkError::Kad(format!("{e:?}"))));
@@ -1289,7 +1263,6 @@ impl SwarmActor {
                 }
             },
             SwarmCommand::KadRemoveRecord { key, resp } => {
-                self.record_cache.remove(&key);
                 match self.kad() {
                     Ok(kad) => {
                         // Local, publisher-only operation (see libp2p docs).
@@ -1302,9 +1275,19 @@ impl SwarmActor {
                 }
             }
             SwarmCommand::KadCacheRefresh { resp } => {
-                let cleared = self.record_cache.len();
-                self.record_cache.clear();
-                let _ = resp.send(Ok(cleared));
+                let local_peer = self.keypair.public().to_peer_id();
+                match self.kad() {
+                    Ok(kad) => {
+                        let before = kad.store_mut().records().count();
+                        kad.store_mut()
+                            .retain(|_, record| record.publisher == Some(local_peer));
+                        let after = kad.store_mut().records().count();
+                        let _ = resp.send(Ok(before.saturating_sub(after)));
+                    }
+                    Err(e) => {
+                        let _ = resp.send(Err(e));
+                    }
+                }
             }
             SwarmCommand::ServiceSendRequest {
                 peer,
@@ -1647,10 +1630,16 @@ impl SwarmActor {
         self.pending_pq_identity.clear();
         self.pq_identities.clear();
         self.peer_protocols.clear();
-        self.record_cache.clear();
+        self.identified_peers.clear();
+        self.identified_peers.extend(
+            self.config
+                .bootstrap_nodes()
+                .iter()
+                .filter_map(peer_id_from_multiaddr),
+        );
 
         self.swarm = new_swarm;
-        self.bootstrap_triggered = false;
+        self.last_bootstrap_notice = None;
 
         for addr in self.config.bootstrap_nodes() {
             let _ = self.swarm.dial(addr);
@@ -1786,6 +1775,18 @@ fn describe_inbound_failure(
 mod tests {
     use super::*;
 
+    #[test]
+    fn bootstrap_multiaddr_yields_peer_id() {
+        let peer = PeerId::random();
+        let addr: Multiaddr = format!("/ip4/127.0.0.1/tcp/5000/p2p/{peer}")
+            .parse()
+            .expect("valid multiaddr");
+        assert_eq!(peer_id_from_multiaddr(&addr), Some(peer));
+
+        let addr: Multiaddr = "/ip4/127.0.0.1/tcp/5000".parse().expect("valid multiaddr");
+        assert_eq!(peer_id_from_multiaddr(&addr), None);
+    }
+
     type ProvidersRx = oneshot::Receiver<Result<Vec<PeerId>, NetworkError>>;
 
     fn pending_providers() -> (KadPending, ProvidersRx) {
@@ -1863,57 +1864,6 @@ mod tests {
         };
         assert!(apply_get_providers(pending, Err(err)).is_none());
         assert!(rx.try_recv().unwrap().is_err());
-    }
-
-    #[test]
-    fn cacheable_record_ignores_transport_errors() {
-        let key = kad::RecordKey::new(b"k");
-        let err = kad::GetRecordError::Timeout { key };
-        assert_eq!(cacheable_record(&Err(err), false), None);
-    }
-
-    #[test]
-    fn cacheable_record_positive_on_found() {
-        let key = kad::RecordKey::new(b"k");
-        let value = b"v".to_vec();
-        let ok = kad::GetRecordOk::FoundRecord(kad::PeerRecord {
-            peer: None,
-            record: kad::Record::new(key, value.clone()),
-        });
-        assert_eq!(cacheable_record(&Ok(ok), false), Some(Some(value)));
-    }
-
-    #[test]
-    fn cacheable_record_negative_only_on_regular_miss() {
-        let ok = kad::GetRecordOk::FinishedWithNoAdditionalRecord {
-            cache_candidates: Default::default(),
-        };
-        assert_eq!(cacheable_record(&Ok(ok), false), Some(None));
-
-        let ok = kad::GetRecordOk::FinishedWithNoAdditionalRecord {
-            cache_candidates: Default::default(),
-        };
-        assert_eq!(cacheable_record(&Ok(ok), true), None);
-    }
-
-    #[test]
-    fn network_only_not_found_is_an_empty_result() {
-        let key = kad::RecordKey::new(b"/oahd/service/types");
-        let not_found = || kad::GetRecordError::NotFound {
-            key: key.clone(),
-            closest_peers: Vec::new(),
-        };
-
-        let normalized = finalize_get_record(Err(not_found()), true).unwrap();
-        assert!(matches!(
-            normalized,
-            kad::GetRecordOk::FinishedWithNoAdditionalRecord { .. }
-        ));
-
-        assert!(matches!(
-            finalize_get_record(Err(not_found()), false),
-            Err(NetworkError::Kad(_))
-        ));
     }
 
     #[test]

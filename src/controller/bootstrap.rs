@@ -15,12 +15,17 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+use std::sync::Arc;
+
 use libp2p::multiaddr::Protocol;
 use libp2p::{Multiaddr, PeerId, identify, kad};
 
 use crate::config::ConfigHandle;
+use crate::dht_cache::DhtCache;
 use crate::log::{LogLevel, LogStruct};
 use crate::network::NetworkHandle;
+
+use super::dht_fetchers::ProviderFetcher;
 
 /// DHT provider key: announce/discover bootstrap nodes.
 const BOOTSTRAP_PROVIDER_KEY: &[u8] = b"/oahd/bootstrap";
@@ -30,14 +35,20 @@ const BOOTSTRAP_PROVIDER_KEY: &[u8] = b"/oahd/bootstrap";
 pub struct BootstrapDiscovery {
     config: ConfigHandle,
     swarm: NetworkHandle,
+    provider_cache: Arc<DhtCache<kad::RecordKey, Vec<PeerId>, ProviderFetcher>>,
     is_bootstrap_provider: bool,
 }
 
 impl BootstrapDiscovery {
-    pub fn new(config: ConfigHandle, swarm: NetworkHandle) -> Self {
+    pub fn new(
+        config: ConfigHandle,
+        swarm: NetworkHandle,
+        provider_cache: Arc<DhtCache<kad::RecordKey, Vec<PeerId>, ProviderFetcher>>,
+    ) -> Self {
         Self {
             config,
             swarm,
+            provider_cache,
             is_bootstrap_provider: false,
         }
     }
@@ -85,11 +96,14 @@ impl BootstrapDiscovery {
             return;
         }
         let key = kad::RecordKey::new(&BOOTSTRAP_PROVIDER_KEY);
-        let is_provider = matches!(
-            self.swarm.get_providers(key).await,
-            Ok(providers) if providers.contains(&peer_id)
-        );
-        if !is_provider {
+        // Never block the controller on a DHT lookup. A stale or missing
+        // cache entry triggers one background refresh.
+        self.provider_cache.refresh(key.clone());
+        let providers = match self.provider_cache.peek(&key) {
+            Some(read) => read.value.unwrap_or_default(),
+            None => return,
+        };
+        if !providers.contains(&peer_id) {
             return;
         }
         let candidates = bootstrap_addrs_from(&info.listen_addrs, peer_id);

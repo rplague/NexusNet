@@ -213,10 +213,18 @@ impl RegistryState {
         match command {
             ServiceCommand::BootstrapCompleted => {
                 self.bootstrapped = true;
+                // The DHT may have been rebuilt or partitioned. Drop the local
+                // "already announced" cache and let the planner re-announce.
+                self.announced.clear();
+                self.announce_retry_at.clear();
                 self.mark_types_dirty(now);
             }
             ServiceCommand::Tick => {}
             ServiceCommand::Reannounce => {
+                // Re-announce for real: clearing `announced` makes `plan`
+                // schedule `start_providing` again.
+                self.announced.clear();
+                self.announce_retry_at.clear();
                 self.mark_types_dirty(now);
             }
             ServiceCommand::RefreshTypes => {
@@ -412,14 +420,14 @@ impl RegistryState {
                             self.announce_retry_at
                                 .insert(service.clone(), now + Self::retry_delay(failures));
                             LogStruct::new(
-                                LogLevel::Warning,
+                                LogLevel::Error,
                                 "注册服务失败，稍后重试",
                                 format!("{service}: {error}"),
                             )
                             .emit();
                         } else {
                             LogStruct::new(
-                                LogLevel::Warning,
+                                LogLevel::Error,
                                 "注册服务失败",
                                 format!("{service}: {error}"),
                             )
@@ -452,7 +460,7 @@ impl RegistryState {
                     }
                     Err(error) => {
                         LogStruct::new(
-                            LogLevel::Warning,
+                            LogLevel::Error,
                             "撤销服务宣告失败",
                             format!("{service}: {error}"),
                         )
@@ -486,8 +494,20 @@ impl RegistryState {
                             }
                         } else {
                             let list: Vec<String> = self.known_types.iter().cloned().collect();
-                            match serde_json::to_vec(&list) {
-                                Ok(value) => {
+                            let max_bytes = self.config.compat_max_record_bytes() as usize;
+                            match encode_types_limited(&list, max_bytes) {
+                                Ok((value, included)) => {
+                                    if included < list.len() {
+                                        LogStruct::new(
+                                            LogLevel::Warning,
+                                            "服务类型索引已裁剪",
+                                            format!(
+                                                "{included}/{} 个类型，超出 compat.max_record_bytes",
+                                                list.len()
+                                            ),
+                                        )
+                                        .emit();
+                                    }
                                     self.pending_types_write = Some(value);
                                     self.reconcile = ReconcileState::ReadyToWrite;
                                     self.reconcile_dirty = false;
@@ -507,7 +527,7 @@ impl RegistryState {
                         }
                     }
                     Err(error) => {
-                        LogStruct::new(LogLevel::Warning, "读取服务类型列表失败", error).emit();
+                        LogStruct::new(LogLevel::Error, "读取服务类型列表失败", error).emit();
                         self.reconcile = ReconcileState::Idle;
                         self.pending_types_write = None;
                         self.next_types_sync = Some(now + RECONCILE_RETRY);
@@ -524,7 +544,7 @@ impl RegistryState {
                 }
                 let success = result.is_ok();
                 if let Err(error) = result {
-                    LogStruct::new(LogLevel::Warning, "更新服务类型列表失败", error).emit();
+                    LogStruct::new(LogLevel::Error, "更新服务类型列表失败", error).emit();
                 }
                 self.reconcile = ReconcileState::Idle;
                 self.pending_types_write = None;
@@ -607,7 +627,7 @@ impl DhtClient {
     async fn put_record(&self, key: kad::RecordKey, value: Vec<u8>) -> Result<(), String> {
         match self {
             DhtClient::Real(swarm) => swarm
-                .put_record(key, value)
+                .put_record(key, value, kad::Quorum::One)
                 .await
                 .map_err(|e| e.to_string()),
             #[cfg(test)]
@@ -762,6 +782,28 @@ impl ServiceRegistryActor {
     }
 }
 
+fn encode_types_limited(
+    list: &[String],
+    max_bytes: usize,
+) -> Result<(Vec<u8>, usize), serde_json::Error> {
+    let full = serde_json::to_vec(list)?;
+    if full.len() <= max_bytes {
+        return Ok((full, list.len()));
+    }
+    let mut low = 0usize;
+    let mut high = list.len();
+    while low < high {
+        let mid = (low + high).div_ceil(2);
+        let encoded = serde_json::to_vec(&list[..mid])?;
+        if encoded.len() <= max_bytes {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    Ok((serde_json::to_vec(&list[..low])?, low))
+}
+
 fn parse_types(value: &[u8]) -> Result<Vec<String>, serde_json::Error> {
     let types: Vec<String> = serde_json::from_slice(value)?;
     Ok(types
@@ -886,6 +928,15 @@ mod tests {
         }
         state.handle(ServiceCommand::BootstrapCompleted, now);
         state.plan(now, 8)
+    }
+
+    #[test]
+    fn type_index_encoder_caps_to_limit() {
+        let list: Vec<String> = (0..100).map(|i| format!("svc{i:03}")).collect();
+        let (value, included) = encode_types_limited(&list, 64).unwrap();
+        assert!(value.len() <= 64);
+        assert!(included > 0 && included < list.len());
+        assert_eq!(parse_types(&value).unwrap().len(), included);
     }
 
     #[test]
@@ -1051,8 +1102,8 @@ mod tests {
     fn empty_network_index_bootstraps_announced_types() {
         let mut state = RegistryState::new(config_with_services(&["cmd"]));
         let now = Instant::now();
-        state.announced.insert("cmd".to_string());
         state.handle(ServiceCommand::BootstrapCompleted, now);
+        state.announced.insert("cmd".to_string());
 
         let jobs = state.plan(now, 4);
         let JobSpec::ReadTypes { generation } = jobs

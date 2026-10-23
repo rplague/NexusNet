@@ -68,6 +68,13 @@ registry actor 订阅该 watch，用完整集合差分处理就绪/断开，不�
 - 成功：从 `announced` 移除；若后端已恢复，重新调度 announce。
 - 失败：重新设置重试 deadline。
 
+### bootstrap / reannounce
+
+`BootstrapCompleted` 与 `Reannounce` 都会清空 `announced` 和
+`announce_retry_at`，因此下一次 `plan` 会重新执行 `start_providing`。
+`BootstrapCompleted` 每次 DHT bootstrap 成功都会触发（actor 侧 30 秒去抖），
+避免网络分区或 DHT 重建后永久停留在“已宣告”状态。
+
 ### reconcile types
 
 ```text

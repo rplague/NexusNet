@@ -9,7 +9,8 @@ message = hello / request / reply
         / reconnect-bootstrap / reannounce-services / reload-config
         / refresh-cache
         / relay-status / pq-status / auth-status
-        / query-key / add-key / remove-key / service-request / service-request-to
+        / query-key / add-key / remove-key
+        / service-request / service-request-to
 
 ; 关联 id：UUID 的 16 字节
 uuid = bstr .size 16

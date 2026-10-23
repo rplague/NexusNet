@@ -1,0 +1,51 @@
+version: 1
+
+on:
+  push:
+    branches: ["*"]
+  pull_request:
+    branches: ["*"]
+
+jobs:
+  test:
+    runs-on: native
+    env:
+      RUST_BACKTRACE: "1"
+    steps:
+      - name: 运行测试 | Run tests
+        run: cargo test --verbose
+
+  fmt:
+    runs-on: native
+    needs: [test]
+    steps:
+      - name: 格式化检查 | Check formatting
+        run: cargo fmt -- --check
+
+  build-linux:
+    runs-on: native
+    needs: [test]
+    steps:
+      - name: 生产构建 | Build release
+        run: cargo build --release
+      - name: 构建 deb 包 | Build deb
+        run: ./deploy/build-deb.sh
+
+  build-windows:
+    runs-on: native
+    needs: [test]
+    steps:
+      - name: 交叉编译并打包 Windows | Cross build and package Windows
+        run: |
+          set -e
+          if ! command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then
+            echo "缺少 mingw-w64，跳过 Windows 打包"
+            exit 0
+          fi
+          if ! command -v makensis >/dev/null 2>&1; then
+            echo "缺少 NSIS (makensis)，跳过 Windows 打包"
+            exit 0
+          fi
+          rustup target add x86_64-pc-windows-gnu
+          cargo build --release --target x86_64-pc-windows-gnu
+          ./deploy/build-win.sh
