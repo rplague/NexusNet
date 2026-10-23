@@ -174,6 +174,29 @@ impl NetworkHandle {
         }
     }
 
+    /// Fetch one record from the network, ignoring the local store copy.
+    ///
+    /// Used by the legacy service-type index to avoid a node's own publisher
+    /// record shadowing remote updates. Returns `FinishedWithNoAdditionalRecord`
+    /// when no remote copy exists.
+    pub async fn get_record_network(
+        &self,
+        key: kad::RecordKey,
+    ) -> Result<kad::GetRecordOk, NetworkError> {
+        let records = self.get_record_all(key).await?;
+        if let Some(record) = records
+            .into_iter()
+            .rev()
+            .find(|record| record.peer.is_some())
+        {
+            Ok(kad::GetRecordOk::FoundRecord(record))
+        } else {
+            Ok(kad::GetRecordOk::FinishedWithNoAdditionalRecord {
+                cache_candidates: Default::default(),
+            })
+        }
+    }
+
     pub async fn get_providers(&self, key: kad::RecordKey) -> Result<Vec<PeerId>, NetworkError> {
         match self
             .request(|resp| SwarmCommand::KadGetProviders { key, resp })
@@ -491,6 +514,11 @@ pub(crate) struct SwarmActor {
     cmd_tx: mpsc::UnboundedSender<SwarmCommand>,
     event_tx: mpsc::UnboundedSender<NetworkEvent>,
     last_bootstrap_notice: Option<Instant>,
+    /// Peers allowed in the Kademlia routing table.
+    ///
+    /// Bootstrap peers are seeded at startup; other peers are added only after
+    /// an Identify whose agent version starts with [`AGENT_NAME`].
+    identified_peers: HashSet<PeerId>,
     /// Protocols announced by the peer (from Identify), used to decide PQ
     /// capability.
     peer_protocols: HashMap<PeerId, HashSet<StreamProtocol>>,
@@ -501,6 +529,14 @@ pub(crate) struct SwarmActor {
     pending_outbound_pq: HashMap<request_response::OutboundRequestId, PqOutboundPending>,
     pending_pq_identity: HashMap<request_response::OutboundRequestId, PeerId>,
     pending_inbound: HashMap<String, PendingInboundEntry>,
+}
+
+/// Extract the `/p2p/<PeerId>` component of a bootstrap multiaddr.
+fn peer_id_from_multiaddr(addr: &Multiaddr) -> Option<PeerId> {
+    addr.iter().find_map(|proto| match proto {
+        libp2p::multiaddr::Protocol::P2p(peer) => Some(peer),
+        _ => None,
+    })
 }
 
 /// Build the Swarm and start the actor task.
@@ -516,6 +552,12 @@ pub fn spawn(
 
     let handle = NetworkHandle::new(cmd_tx.clone());
 
+    let identified_peers = config
+        .bootstrap_nodes()
+        .iter()
+        .filter_map(peer_id_from_multiaddr)
+        .collect();
+
     let mut actor = SwarmActor {
         swarm,
         config,
@@ -525,6 +567,7 @@ pub fn spawn(
         cmd_tx,
         event_tx,
         last_bootstrap_notice: None,
+        identified_peers,
         peer_protocols: HashMap::new(),
         pq_identities: HashMap::new(),
         pending_kad: HashMap::new(),
@@ -626,6 +669,29 @@ impl SwarmActor {
                     .event_tx
                     .send(NetworkEvent::ListenerClosed { addresses });
             }
+            SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+                LogStruct::new(
+                    LogLevel::Error,
+                    "出站连接失败",
+                    format!("{:?}: {error}", peer_id),
+                )
+                .emit();
+            }
+            SwarmEvent::IncomingConnectionError {
+                send_back_addr,
+                error,
+                ..
+            } => {
+                LogStruct::new(
+                    LogLevel::Error,
+                    "入站连接失败",
+                    format!("{send_back_addr}: {error}"),
+                )
+                .emit();
+            }
+            SwarmEvent::ListenerError { error, .. } => {
+                LogStruct::new(LogLevel::Error, "监听器错误", error.to_string()).emit();
+            }
             _ => {}
         }
     }
@@ -643,6 +709,7 @@ impl SwarmActor {
         if !info.agent_version.starts_with(AGENT_NAME) {
             return;
         }
+        self.identified_peers.insert(peer_id);
         // Identify -> Kademlia address bridge
         if let Ok(kad) = self.kad() {
             for addr in &info.listen_addrs {
@@ -675,11 +742,25 @@ impl SwarmActor {
         }
     }
 
+    fn is_allowed_peer(&self, peer: &PeerId) -> bool {
+        peer == self.swarm.local_peer_id() || self.identified_peers.contains(peer)
+    }
+
     /// Handle Kademlia query progress events, waking the matching pending entry
     /// by `QueryId`.
     fn handle_kad_event(&mut self, event: kad::Event) {
-        let kad::Event::OutboundQueryProgressed { result, id, .. } = event else {
-            return;
+        let (result, id) = match event {
+            kad::Event::RoutingUpdated { peer, .. } => {
+                if !self.is_allowed_peer(&peer) {
+                    if let Ok(kad) = self.kad() {
+                        kad.remove_peer(&peer);
+                    }
+                    LogStruct::new(LogLevel::Debug, "未识别节点移出 DHT", peer.to_string()).emit();
+                }
+                return;
+            }
+            kad::Event::OutboundQueryProgressed { result, id, .. } => (result, id),
+            _ => return,
         };
 
         match result {
@@ -691,8 +772,16 @@ impl SwarmActor {
                         .is_none_or(|last| now.duration_since(last) >= Duration::from_secs(30));
                     if due {
                         self.last_bootstrap_notice = Some(now);
+                        LogStruct::new(LogLevel::Important, "DHT bootstrap 完成", "").emit();
                         let _ = self.event_tx.send(NetworkEvent::BootstrapCompleted);
                     }
+                } else {
+                    LogStruct::new(
+                        LogLevel::Error,
+                        "Kademlia bootstrap 失败",
+                        format!("{result:?}"),
+                    )
+                    .emit();
                 }
             }
             kad::QueryResult::GetRecord(result) => {
@@ -1541,6 +1630,13 @@ impl SwarmActor {
         self.pending_pq_identity.clear();
         self.pq_identities.clear();
         self.peer_protocols.clear();
+        self.identified_peers.clear();
+        self.identified_peers.extend(
+            self.config
+                .bootstrap_nodes()
+                .iter()
+                .filter_map(peer_id_from_multiaddr),
+        );
 
         self.swarm = new_swarm;
         self.last_bootstrap_notice = None;
@@ -1678,6 +1774,18 @@ fn describe_inbound_failure(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bootstrap_multiaddr_yields_peer_id() {
+        let peer = PeerId::random();
+        let addr: Multiaddr = format!("/ip4/127.0.0.1/tcp/5000/p2p/{peer}")
+            .parse()
+            .expect("valid multiaddr");
+        assert_eq!(peer_id_from_multiaddr(&addr), Some(peer));
+
+        let addr: Multiaddr = "/ip4/127.0.0.1/tcp/5000".parse().expect("valid multiaddr");
+        assert_eq!(peer_id_from_multiaddr(&addr), None);
+    }
 
     type ProvidersRx = oneshot::Receiver<Result<Vec<PeerId>, NetworkError>>;
 

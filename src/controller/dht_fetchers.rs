@@ -17,16 +17,12 @@
 
 //! Cache fetchers for plain DHT records and provider lists.
 
-use std::collections::BTreeSet;
-
 use libp2p::PeerId;
 use libp2p::futures::future::BoxFuture;
-use libp2p::identity::ed25519;
 use libp2p::kad;
 
 use crate::dht_cache::{Fetched, Fetcher};
 use crate::network::NetworkHandle;
-use crate::types_doc;
 
 /// Fetch a plain record, preferring values obtained from the network over the
 /// local Kademlia store copy.
@@ -53,7 +49,6 @@ impl Fetcher<kad::RecordKey, Vec<u8>> for GenericRecordFetcher {
             Ok(selected.map(|record| Fetched {
                 value: record.record.value.clone(),
                 version: None,
-                expires_at: None,
                 size: record.record.value.len(),
             }))
         })
@@ -80,91 +75,6 @@ impl Fetcher<kad::RecordKey, Vec<PeerId>> for ProviderFetcher {
             Ok(Some(Fetched {
                 value: providers,
                 version: None,
-                expires_at: None,
-                size,
-            }))
-        })
-    }
-}
-
-/// Fetch and verify the signed global service-type index.
-pub struct TypesFetcher {
-    pub swarm: NetworkHandle,
-    pub authority: ed25519::PublicKey,
-    pub max_ttl_seconds: u64,
-}
-
-impl Fetcher<(), BTreeSet<String>> for TypesFetcher {
-    fn fetch<'a>(
-        &'a self,
-        _key: &'a (),
-    ) -> BoxFuture<'a, Result<Option<Fetched<BTreeSet<String>>>, String>> {
-        Box::pin(async move {
-            let records = self
-                .swarm
-                .get_record_all(kad::RecordKey::new(&types_doc::TYPES_KEY))
-                .await
-                .map_err(|e| e.to_string())?;
-            let selected = types_doc::select_types(
-                &records,
-                &self.authority,
-                crate::auth::now_unix(),
-                self.max_ttl_seconds,
-            )
-            .map_err(|e| e.to_string())?;
-            Ok(selected.map(|(doc, size)| Fetched {
-                value: doc.services.into_iter().collect(),
-                version: Some(doc.version),
-                expires_at: Some(doc.expires_at),
-                size,
-            }))
-        })
-    }
-}
-
-/// Read the legacy unsigned `/oahd/service/types` JSON array.
-///
-/// This is a compatibility path: new nodes use it only when the signed index is
-/// unavailable or `types_authority` is not configured. All records are unioned
-/// to match the old nodes' monotonic-union behavior.
-pub struct LegacyTypesFetcher {
-    pub swarm: NetworkHandle,
-}
-
-impl Fetcher<(), BTreeSet<String>> for LegacyTypesFetcher {
-    fn fetch<'a>(
-        &'a self,
-        _key: &'a (),
-    ) -> BoxFuture<'a, Result<Option<Fetched<BTreeSet<String>>>, String>> {
-        Box::pin(async move {
-            let records = self
-                .swarm
-                .get_record_all(kad::RecordKey::new(&types_doc::LEGACY_TYPES_KEY))
-                .await
-                .map_err(|e| e.to_string())?;
-            let mut services = BTreeSet::new();
-            let mut saw_valid = false;
-            let mut size = 0;
-            for record in &records {
-                let Some(names) = types_doc::parse_legacy_types(&record.record.value) else {
-                    continue;
-                };
-                saw_valid = true;
-                size = size.max(record.record.value.len());
-                for name in names {
-                    if services.len() >= types_doc::MAX_TYPES {
-                        break;
-                    }
-                    services.insert(name);
-                }
-            }
-            if !saw_valid {
-                return Ok(None);
-            }
-            Ok(Some(Fetched {
-                value: services,
-                version: None,
-                expires_at: None,
                 size,
             }))
         })

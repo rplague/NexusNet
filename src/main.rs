@@ -27,7 +27,6 @@ mod paths;
 mod service_dispatcher;
 mod service_protocol;
 mod sidecar_protocol;
-mod types_doc;
 
 use crate::config::ConfigHandle;
 use controller::NodeController;

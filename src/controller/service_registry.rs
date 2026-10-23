@@ -32,17 +32,36 @@ use crate::network::NetworkHandle;
 use crate::service_dispatcher::BackendReadiness;
 
 const WITHDRAW_GRACE: Duration = Duration::from_secs(3);
+const TYPES_KEY: &[u8] = b"/oahd/service/types";
+const MAX_TYPES: usize = 4096;
 const COMMAND_QUEUE_CAPACITY: usize = 256;
 const ANNOUNCE_RETRY_INITIAL: Duration = Duration::from_secs(5);
 const ANNOUNCE_RETRY_MAX: Duration = Duration::from_secs(60);
+const RECONCILE_RETRY: Duration = Duration::from_secs(30);
+
+fn types_key() -> kad::RecordKey {
+    kad::RecordKey::new(&TYPES_KEY)
+}
 
 fn service_key(name: &str) -> kad::RecordKey {
     kad::RecordKey::new(&format!("/oahd/service/{name}"))
 }
 
+fn merge_type_set(known: &mut BTreeSet<String>, incoming: impl IntoIterator<Item = String>) {
+    for name in incoming {
+        if known.len() >= MAX_TYPES {
+            break;
+        }
+        if auth::is_valid_service_name(&name) {
+            known.insert(name);
+        }
+    }
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone, Default)]
 pub struct ServiceSnapshot {
+    pub types: Vec<String>,
     pub announced: Vec<String>,
     pub backend_ready: Vec<String>,
     pub bootstrapped: bool,
@@ -53,6 +72,7 @@ pub enum ServiceCommand {
     BootstrapCompleted,
     Tick,
     Reannounce,
+    RefreshTypes,
     Reset,
 }
 
@@ -68,6 +88,13 @@ enum JobSpec {
         service: String,
         key: kad::RecordKey,
     },
+    ReadTypes {
+        generation: u64,
+    },
+    WriteTypes {
+        generation: u64,
+        value: Vec<u8>,
+    },
 }
 
 enum JobResult {
@@ -81,6 +108,22 @@ enum JobResult {
         service: String,
         result: Result<(), String>,
     },
+    TypesRead {
+        generation: u64,
+        result: Result<Vec<String>, String>,
+    },
+    TypesWritten {
+        generation: u64,
+        result: Result<(), String>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReconcileState {
+    Idle,
+    Reading,
+    ReadyToWrite,
+    Writing,
 }
 
 struct RegistryState {
@@ -93,6 +136,11 @@ struct RegistryState {
     withdraw_inflight: HashSet<String>,
     announce_failures: HashMap<String, u32>,
     announce_retry_at: HashMap<String, Instant>,
+    known_types: BTreeSet<String>,
+    reconcile: ReconcileState,
+    reconcile_dirty: bool,
+    next_types_sync: Option<Instant>,
+    pending_types_write: Option<Vec<u8>>,
     generation: u64,
 }
 
@@ -108,13 +156,29 @@ impl RegistryState {
             withdraw_inflight: HashSet::new(),
             announce_failures: HashMap::new(),
             announce_retry_at: HashMap::new(),
+            known_types: BTreeSet::new(),
+            reconcile: ReconcileState::Idle,
+            reconcile_dirty: false,
+            next_types_sync: None,
+            pending_types_write: None,
             generation: 0,
         }
+    }
+
+    fn sync_interval(&self) -> Duration {
+        Duration::from_secs(self.config.dispatcher_types_sync_interval() as u64)
     }
 
     fn retry_delay(failures: u32) -> Duration {
         let shift = failures.saturating_sub(1).min(4);
         (ANNOUNCE_RETRY_INITIAL * (1u32 << shift)).min(ANNOUNCE_RETRY_MAX)
+    }
+
+    fn mark_types_dirty(&mut self, now: Instant) {
+        self.reconcile_dirty = true;
+        if self.reconcile == ReconcileState::Idle {
+            self.next_types_sync = Some(now);
+        }
     }
 
     fn replace_backend_ready(&mut self, ready: &HashSet<String>, now: Instant) {
@@ -145,7 +209,7 @@ impl RegistryState {
         self.replace_backend_ready(&set, now);
     }
 
-    fn handle(&mut self, command: ServiceCommand, _now: Instant) {
+    fn handle(&mut self, command: ServiceCommand, now: Instant) {
         match command {
             ServiceCommand::BootstrapCompleted => {
                 self.bootstrapped = true;
@@ -153,6 +217,7 @@ impl RegistryState {
                 // "already announced" cache and let the planner re-announce.
                 self.announced.clear();
                 self.announce_retry_at.clear();
+                self.mark_types_dirty(now);
             }
             ServiceCommand::Tick => {}
             ServiceCommand::Reannounce => {
@@ -160,6 +225,10 @@ impl RegistryState {
                 // schedule `start_providing` again.
                 self.announced.clear();
                 self.announce_retry_at.clear();
+                self.mark_types_dirty(now);
+            }
+            ServiceCommand::RefreshTypes => {
+                self.mark_types_dirty(now);
             }
             ServiceCommand::Reset => {
                 self.generation = self.generation.wrapping_add(1);
@@ -170,6 +239,10 @@ impl RegistryState {
                 self.withdraw_inflight.clear();
                 self.announce_failures.clear();
                 self.announce_retry_at.clear();
+                self.reconcile = ReconcileState::Idle;
+                self.reconcile_dirty = false;
+                self.next_types_sync = None;
+                self.pending_types_write = None;
             }
         }
     }
@@ -276,6 +349,35 @@ impl RegistryState {
             }
         }
 
+        if slots > 0 {
+            match self.reconcile {
+                ReconcileState::Idle => {
+                    let due =
+                        self.reconcile_dirty || self.next_types_sync.is_some_and(|at| at <= now);
+                    if due {
+                        self.next_types_sync = None;
+                        self.reconcile = ReconcileState::Reading;
+                        self.reconcile_dirty = false;
+                        jobs.push(JobSpec::ReadTypes {
+                            generation: self.generation,
+                        });
+                    }
+                }
+                ReconcileState::ReadyToWrite => {
+                    if let Some(value) = self.pending_types_write.take() {
+                        self.reconcile = ReconcileState::Writing;
+                        jobs.push(JobSpec::WriteTypes {
+                            generation: self.generation,
+                            value,
+                        });
+                    } else {
+                        self.reconcile = ReconcileState::Idle;
+                    }
+                }
+                ReconcileState::Reading | ReconcileState::Writing => {}
+            }
+        }
+
         jobs
     }
 
@@ -295,6 +397,7 @@ impl RegistryState {
                         self.announce_failures.remove(&service);
                         self.announce_retry_at.remove(&service);
                         self.announced.insert(service.clone());
+                        self.mark_types_dirty(now);
                         if self.backend_ready.contains(&service) && self.bootstrapped {
                             LogStruct::new(
                                 LogLevel::Preset,
@@ -317,14 +420,14 @@ impl RegistryState {
                             self.announce_retry_at
                                 .insert(service.clone(), now + Self::retry_delay(failures));
                             LogStruct::new(
-                                LogLevel::Warning,
+                                LogLevel::Error,
                                 "注册服务失败，稍后重试",
                                 format!("{service}: {error}"),
                             )
                             .emit();
                         } else {
                             LogStruct::new(
-                                LogLevel::Warning,
+                                LogLevel::Error,
                                 "注册服务失败",
                                 format!("{service}: {error}"),
                             )
@@ -357,7 +460,7 @@ impl RegistryState {
                     }
                     Err(error) => {
                         LogStruct::new(
-                            LogLevel::Warning,
+                            LogLevel::Error,
                             "撤销服务宣告失败",
                             format!("{service}: {error}"),
                         )
@@ -371,10 +474,98 @@ impl RegistryState {
                     }
                 }
             }
+            JobResult::TypesRead { generation, result } => {
+                if generation != self.generation || self.reconcile != ReconcileState::Reading {
+                    return;
+                }
+                match result {
+                    Ok(network_types) => {
+                        let network_set: BTreeSet<String> = network_types.iter().cloned().collect();
+                        merge_type_set(&mut self.known_types, network_types);
+                        let announced: Vec<String> = self.announced.iter().cloned().collect();
+                        merge_type_set(&mut self.known_types, announced);
+                        if self.known_types.is_empty() || self.known_types == network_set {
+                            self.reconcile = ReconcileState::Idle;
+                            self.pending_types_write = None;
+                            self.next_types_sync = Some(now + self.sync_interval());
+                            if self.reconcile_dirty {
+                                self.reconcile_dirty = false;
+                                self.next_types_sync = Some(now);
+                            }
+                        } else {
+                            let list: Vec<String> = self.known_types.iter().cloned().collect();
+                            let max_bytes = self.config.compat_max_record_bytes() as usize;
+                            match encode_types_limited(&list, max_bytes) {
+                                Ok((value, included)) => {
+                                    if included < list.len() {
+                                        LogStruct::new(
+                                            LogLevel::Warning,
+                                            "服务类型索引已裁剪",
+                                            format!(
+                                                "{included}/{} 个类型，超出 compat.max_record_bytes",
+                                                list.len()
+                                            ),
+                                        )
+                                        .emit();
+                                    }
+                                    self.pending_types_write = Some(value);
+                                    self.reconcile = ReconcileState::ReadyToWrite;
+                                    self.reconcile_dirty = false;
+                                }
+                                Err(error) => {
+                                    LogStruct::new(
+                                        LogLevel::Warning,
+                                        "序列化服务类型列表失败",
+                                        error.to_string(),
+                                    )
+                                    .emit();
+                                    self.reconcile = ReconcileState::Idle;
+                                    self.pending_types_write = None;
+                                    self.next_types_sync = Some(now + RECONCILE_RETRY);
+                                }
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        LogStruct::new(LogLevel::Error, "读取服务类型列表失败", error).emit();
+                        self.reconcile = ReconcileState::Idle;
+                        self.pending_types_write = None;
+                        self.next_types_sync = Some(now + RECONCILE_RETRY);
+                        if self.reconcile_dirty {
+                            self.reconcile_dirty = false;
+                            self.next_types_sync = Some(now);
+                        }
+                    }
+                }
+            }
+            JobResult::TypesWritten { generation, result } => {
+                if generation != self.generation || self.reconcile != ReconcileState::Writing {
+                    return;
+                }
+                let success = result.is_ok();
+                if let Err(error) = result {
+                    LogStruct::new(LogLevel::Error, "更新服务类型列表失败", error).emit();
+                }
+                self.reconcile = ReconcileState::Idle;
+                self.pending_types_write = None;
+                self.next_types_sync = Some(
+                    now + if success {
+                        self.sync_interval()
+                    } else {
+                        RECONCILE_RETRY
+                    },
+                );
+                if self.reconcile_dirty {
+                    self.reconcile_dirty = false;
+                    self.next_types_sync = Some(now);
+                }
+            }
         }
     }
 
     fn snapshot(&self) -> ServiceSnapshot {
+        let mut types = self.known_types.clone();
+        types.extend(self.announced.iter().cloned());
         let announced: Vec<String> = self
             .announced
             .iter()
@@ -390,6 +581,7 @@ impl RegistryState {
             .into_iter()
             .collect();
         ServiceSnapshot {
+            types: types.into_iter().collect(),
             announced,
             backend_ready,
             bootstrapped: self.bootstrapped,
@@ -418,6 +610,28 @@ impl DhtClient {
             DhtClient::Real(swarm) => swarm.stop_providing(key).await.map_err(|e| e.to_string()),
             #[cfg(test)]
             DhtClient::Mock(mock) => mock.stop_providing().await,
+        }
+    }
+
+    async fn get_record_network(&self, key: kad::RecordKey) -> Result<kad::GetRecordOk, String> {
+        match self {
+            DhtClient::Real(swarm) => swarm
+                .get_record_network(key)
+                .await
+                .map_err(|e| e.to_string()),
+            #[cfg(test)]
+            DhtClient::Mock(mock) => mock.get_record_network(),
+        }
+    }
+
+    async fn put_record(&self, key: kad::RecordKey, value: Vec<u8>) -> Result<(), String> {
+        match self {
+            DhtClient::Real(swarm) => swarm
+                .put_record(key, value, kad::Quorum::One)
+                .await
+                .map_err(|e| e.to_string()),
+            #[cfg(test)]
+            DhtClient::Mock(mock) => mock.put_record(value),
         }
     }
 }
@@ -487,6 +701,24 @@ impl ServiceRegistryActor {
                     }
                 });
             }
+            JobSpec::ReadTypes { generation } => {
+                self.jobs.spawn(async move {
+                    let result = match dht.get_record_network(types_key()).await {
+                        Ok(kad::GetRecordOk::FoundRecord(record)) => {
+                            parse_types(&record.record.value).map_err(|e| e.to_string())
+                        }
+                        Ok(_) => Ok(Vec::new()),
+                        Err(error) => Err(error),
+                    };
+                    JobResult::TypesRead { generation, result }
+                });
+            }
+            JobSpec::WriteTypes { generation, value } => {
+                self.jobs.spawn(async move {
+                    let result = dht.put_record(types_key(), value).await;
+                    JobResult::TypesWritten { generation, result }
+                });
+            }
         }
     }
 
@@ -550,6 +782,37 @@ impl ServiceRegistryActor {
     }
 }
 
+fn encode_types_limited(
+    list: &[String],
+    max_bytes: usize,
+) -> Result<(Vec<u8>, usize), serde_json::Error> {
+    let full = serde_json::to_vec(list)?;
+    if full.len() <= max_bytes {
+        return Ok((full, list.len()));
+    }
+    let mut low = 0usize;
+    let mut high = list.len();
+    while low < high {
+        let mid = (low + high).div_ceil(2);
+        let encoded = serde_json::to_vec(&list[..mid])?;
+        if encoded.len() <= max_bytes {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    Ok((serde_json::to_vec(&list[..low])?, low))
+}
+
+fn parse_types(value: &[u8]) -> Result<Vec<String>, serde_json::Error> {
+    let types: Vec<String> = serde_json::from_slice(value)?;
+    Ok(types
+        .into_iter()
+        .filter(|name| auth::is_valid_service_name(name))
+        .take(MAX_TYPES)
+        .collect())
+}
+
 pub fn spawn(
     config: ConfigHandle,
     swarm: NetworkHandle,
@@ -597,6 +860,7 @@ fn spawn_with_dht(
 struct MockDht {
     start_delay: Duration,
     fail_start: std::sync::atomic::AtomicBool,
+    types: std::sync::Mutex<Vec<String>>,
 }
 
 #[cfg(test)]
@@ -605,6 +869,7 @@ impl MockDht {
         Self {
             start_delay,
             fail_start: std::sync::atomic::AtomicBool::new(false),
+            types: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -618,6 +883,21 @@ impl MockDht {
     }
 
     async fn stop_providing(&self) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn get_record_network(&self) -> Result<kad::GetRecordOk, String> {
+        let types = self.types.lock().expect("mock types poisoned");
+        let value = serde_json::to_vec(&*types).map_err(|e| e.to_string())?;
+        Ok(kad::GetRecordOk::FoundRecord(kad::PeerRecord {
+            peer: None,
+            record: kad::Record::new(types_key(), value),
+        }))
+    }
+
+    fn put_record(&self, value: Vec<u8>) -> Result<(), String> {
+        let types: Vec<String> = serde_json::from_slice(&value).map_err(|e| e.to_string())?;
+        *self.types.lock().expect("mock types poisoned") = types;
         Ok(())
     }
 }
@@ -648,6 +928,15 @@ mod tests {
         }
         state.handle(ServiceCommand::BootstrapCompleted, now);
         state.plan(now, 8)
+    }
+
+    #[test]
+    fn type_index_encoder_caps_to_limit() {
+        let list: Vec<String> = (0..100).map(|i| format!("svc{i:03}")).collect();
+        let (value, included) = encode_types_limited(&list, 64).unwrap();
+        assert!(value.len() <= 64);
+        assert!(included > 0 && included < list.len());
+        assert_eq!(parse_types(&value).unwrap().len(), included);
     }
 
     #[test]
@@ -765,6 +1054,85 @@ mod tests {
     }
 
     #[test]
+    fn late_announce_schedules_type_sync() {
+        let mut state = RegistryState::new(config_with_services(&["cmd"]));
+        let now = Instant::now();
+        state.handle(ServiceCommand::BootstrapCompleted, now);
+        let jobs = state.plan(now, 4);
+        let generation = state.generation;
+        assert!(
+            jobs.iter()
+                .any(|job| matches!(job, JobSpec::ReadTypes { .. }))
+        );
+        state.apply(
+            JobResult::TypesRead {
+                generation,
+                result: Ok(Vec::new()),
+            },
+            now,
+        );
+        assert_eq!(state.reconcile, ReconcileState::Idle);
+
+        state.set_backend_ready("cmd", true, now);
+        let jobs = state.plan(now, 4);
+        let JobSpec::Announce {
+            generation,
+            service,
+            ..
+        } = jobs
+            .into_iter()
+            .find(|job| matches!(job, JobSpec::Announce { .. }))
+            .unwrap()
+        else {
+            panic!("expected announce");
+        };
+        state.apply(
+            JobResult::Announced {
+                generation,
+                service,
+                result: Ok(()),
+            },
+            now,
+        );
+        assert!(state.reconcile_dirty);
+        assert!(state.next_types_sync.is_some_and(|at| at <= now));
+    }
+
+    #[test]
+    fn empty_network_index_bootstraps_announced_types() {
+        let mut state = RegistryState::new(config_with_services(&["cmd"]));
+        let now = Instant::now();
+        state.handle(ServiceCommand::BootstrapCompleted, now);
+        state.announced.insert("cmd".to_string());
+
+        let jobs = state.plan(now, 4);
+        let JobSpec::ReadTypes { generation } = jobs
+            .into_iter()
+            .find(|job| matches!(job, JobSpec::ReadTypes { .. }))
+            .unwrap()
+        else {
+            panic!("expected read");
+        };
+        state.apply(
+            JobResult::TypesRead {
+                generation,
+                result: Ok(Vec::new()),
+            },
+            now,
+        );
+
+        let jobs = state.plan(now, 4);
+        let JobSpec::WriteTypes { value, .. } = jobs
+            .into_iter()
+            .find(|job| matches!(job, JobSpec::WriteTypes { .. }))
+            .unwrap()
+        else {
+            panic!("expected write");
+        };
+        assert_eq!(parse_types(&value).unwrap(), vec!["cmd".to_string()]);
+    }
+
+    #[test]
     fn failed_withdraw_is_retried() {
         let mut state = RegistryState::new(config_with_services(&["cmd"]));
         let now = Instant::now();
@@ -813,6 +1181,52 @@ mod tests {
             state.plan(now + Duration::from_secs(10), 4).as_slice(),
             [JobSpec::Withdraw { .. }]
         ));
+    }
+
+    #[test]
+    fn reconcile_dirty_reruns_after_write() {
+        let mut state = RegistryState::new(config_with_services(&["cmd"]));
+        let now = Instant::now();
+        state.known_types.insert("ocr".to_string());
+        state.handle(ServiceCommand::BootstrapCompleted, now);
+        let jobs = state.plan(now, 4);
+        let JobSpec::ReadTypes { generation } = jobs
+            .into_iter()
+            .find(|job| matches!(job, JobSpec::ReadTypes { .. }))
+            .unwrap()
+        else {
+            panic!("expected read");
+        };
+        state.apply(
+            JobResult::TypesRead {
+                generation,
+                result: Ok(vec!["cmd".to_string()]),
+            },
+            now,
+        );
+        let jobs = state.plan(now, 4);
+        let JobSpec::WriteTypes { generation, .. } = jobs
+            .into_iter()
+            .find(|job| matches!(job, JobSpec::WriteTypes { .. }))
+            .unwrap()
+        else {
+            panic!("expected write");
+        };
+        state.handle(ServiceCommand::RefreshTypes, now);
+        state.apply(
+            JobResult::TypesWritten {
+                generation,
+                result: Ok(()),
+            },
+            now,
+        );
+        assert!(state.next_types_sync.is_some_and(|at| at <= now));
+        assert!(
+            state
+                .plan(now, 4)
+                .iter()
+                .any(|job| matches!(job, JobSpec::ReadTypes { .. }))
+        );
     }
 
     #[test]
@@ -866,6 +1280,59 @@ mod tests {
             now,
         );
         assert!(state.snapshot().announced.is_empty());
+        assert!(state.snapshot().types.is_empty());
+    }
+
+    #[test]
+    fn reconcile_is_single_flight_and_publishes_types() {
+        let mut state = RegistryState::new(config_with_services(&["cmd"]));
+        let now = Instant::now();
+        state.known_types.insert("ocr".to_string());
+        state.handle(ServiceCommand::BootstrapCompleted, now);
+        let jobs = state.plan(now, 4);
+        let JobSpec::ReadTypes { generation } = jobs
+            .iter()
+            .find(|job| matches!(job, JobSpec::ReadTypes { .. }))
+            .cloned()
+            .unwrap()
+        else {
+            panic!("expected read");
+        };
+        assert!(
+            state
+                .plan(now, 4)
+                .iter()
+                .all(|job| !matches!(job, JobSpec::ReadTypes { .. }))
+        );
+
+        state.apply(
+            JobResult::TypesRead {
+                generation,
+                result: Ok(vec!["cmd".to_string()]),
+            },
+            now,
+        );
+        let jobs = state.plan(now, 4);
+        let JobSpec::WriteTypes { generation, .. } = jobs
+            .iter()
+            .find(|job| matches!(job, JobSpec::WriteTypes { .. }))
+            .cloned()
+            .unwrap()
+        else {
+            panic!("expected write");
+        };
+        assert_eq!(
+            state.snapshot().types,
+            vec!["cmd".to_string(), "ocr".to_string()]
+        );
+        state.apply(
+            JobResult::TypesWritten {
+                generation,
+                result: Ok(()),
+            },
+            now,
+        );
+        assert_eq!(state.reconcile, ReconcileState::Idle);
     }
 
     #[tokio::test]

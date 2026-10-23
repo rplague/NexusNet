@@ -9,7 +9,7 @@ message = hello / request / reply
         / reconnect-bootstrap / reannounce-services / reload-config
         / refresh-cache
         / relay-status / pq-status / auth-status
-        / query-key / add-key / publish-types / remove-key
+        / query-key / add-key / remove-key
         / service-request / service-request-to
 
 ; 关联 id：UUID 的 16 字节
@@ -48,11 +48,6 @@ add-key             = {
   ? value: bstr,
   ? providing: bool,
 }
-publish-types       = {
-  t: "publish_types",
-  id: uuid,
-  value: bstr,          ; COSE_Sign1 签名的 TypesDoc（CBOR payload）
-}                       ; 同时镜像旧 key /oahd/service/types 供旧版节点读取
 remove-key          = {
   t: "remove_key",
   id: uuid,
@@ -77,6 +72,5 @@ service-request-to  = { t: "service_request_to",  id: uuid, service: tstr, peer:
 ;   auth_status         -> { network: tstr, state: tstr, local_required: [* tstr], ... }
 ;   query_key           -> { key: tstr, ? value: bstr, ? providers: [* tstr] }
 ;   add_key             -> { success: bool, key: tstr }
-;   publish_types       -> { success: bool, version: uint }
 ;   remove_key          -> { success: bool, key: tstr, providing: bool, record: bool }
 ;   service_request*    -> 原始服务响应字节

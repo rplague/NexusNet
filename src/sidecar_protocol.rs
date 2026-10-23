@@ -123,11 +123,6 @@ pub enum Message {
         #[serde(default)]
         providing: bool,
     },
-    /// Publish a signed service-type index (COSE_Sign1 bytes).
-    PublishTypes {
-        id: Uuid,
-        value: Vec<u8>,
-    },
     /// Stop providing and/or remove the locally stored record for `key`.
     ///
     /// `providing` (default true) stops announcing this node as a provider;
@@ -175,7 +170,6 @@ impl Message {
             | Message::AuthStatus { id }
             | Message::QueryKey { id, .. }
             | Message::AddKey { id, .. }
-            | Message::PublishTypes { id, .. }
             | Message::RemoveKey { id, .. }
             | Message::ServiceRequest { id, .. }
             | Message::ServiceRequestTo { id, .. } => Some(*id),
@@ -334,10 +328,6 @@ mod tests {
             key: "/k".into(),
             value: Some(vec![9, 8, 7]),
             providing: true,
-        });
-        round_trip(Message::PublishTypes {
-            id,
-            value: vec![1, 2, 3],
         });
         round_trip(Message::RemoveKey {
             id,

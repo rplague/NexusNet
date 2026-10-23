@@ -79,82 +79,43 @@ impl RelayManager {
 
     /// Relay server (inbound reservation) events: informational only.
     pub fn on_relay_event(&self, event: relay::Event) {
-        match event {
-            relay::Event::ReservationReqAccepted { src_peer_id, .. } => {
-                LogStruct::new(
-                    LogLevel::Debug,
-                    "中继预约已接受",
-                    format!("对端: {}", src_peer_id),
-                )
-                .emit();
-            }
-            relay::Event::ReservationReqDenied {
-                src_peer_id,
-                status,
-                ..
-            } => {
-                LogStruct::new(
-                    LogLevel::Debug,
-                    "中继预约被拒绝",
-                    format!("对端: {}, 状态: {:?}", src_peer_id, status),
-                )
-                .emit();
-            }
-            relay::Event::CircuitReqAccepted {
-                src_peer_id,
-                dst_peer_id,
-                ..
-            } => {
-                LogStruct::new(
-                    LogLevel::Debug,
-                    "中继电路已建立",
-                    format!("来源: {}, 目标: {}", src_peer_id, dst_peer_id),
-                )
-                .emit();
-            }
-            _ => {}
+        if let relay::Event::ReservationReqDenied {
+            src_peer_id,
+            status,
+            ..
+        } = event
+        {
+            LogStruct::new(
+                LogLevel::Warning,
+                "中继预约被拒绝",
+                format!("对端: {}, 状态: {:?}", src_peer_id, status),
+            )
+            .emit();
         }
     }
 
     /// Relay client (outbound) events: track reservation successes.
     pub fn on_relay_client_event(&mut self, event: relay::client::Event) {
-        match event {
-            relay::client::Event::ReservationReqAccepted {
-                relay_peer_id,
-                renewal,
-                ..
-            } => {
-                self.pending.remove(&relay_peer_id);
-                self.active.insert(relay_peer_id);
-                self.failures.remove(&relay_peer_id);
-                self.backoff.remove(&relay_peer_id);
-                LogStruct::new(
-                    LogLevel::Preset,
-                    if renewal {
-                        "中继预约续期"
-                    } else {
-                        "中继预约成功"
-                    },
-                    format!("{}/{}: {}", self.active.len(), RELAY_TARGET, relay_peer_id),
-                )
-                .emit();
-            }
-            relay::client::Event::OutboundCircuitEstablished { relay_peer_id, .. } => {
-                LogStruct::new(
-                    LogLevel::Debug,
-                    "出站中继电路已建立",
-                    format!("中继节点: {}", relay_peer_id),
-                )
-                .emit();
-            }
-            relay::client::Event::InboundCircuitEstablished { src_peer_id, .. } => {
-                LogStruct::new(
-                    LogLevel::Debug,
-                    "入站中继电路已建立",
-                    format!("来源: {}", src_peer_id),
-                )
-                .emit();
-            }
+        if let relay::client::Event::ReservationReqAccepted {
+            relay_peer_id,
+            renewal,
+            ..
+        } = event
+        {
+            self.pending.remove(&relay_peer_id);
+            self.active.insert(relay_peer_id);
+            self.failures.remove(&relay_peer_id);
+            self.backoff.remove(&relay_peer_id);
+            LogStruct::new(
+                LogLevel::Preset,
+                if renewal {
+                    "中继预约续期"
+                } else {
+                    "中继预约成功"
+                },
+                format!("{}/{}: {}", self.active.len(), RELAY_TARGET, relay_peer_id),
+            )
+            .emit();
         }
     }
 
@@ -176,7 +137,7 @@ impl RelayManager {
             }
             lost = true;
             if was_active {
-                LogStruct::new(LogLevel::Warning, "中继连接断开", peer_id.to_string()).emit();
+                LogStruct::new(LogLevel::Error, "中继连接断开", peer_id.to_string()).emit();
             }
             self.record_failure(peer_id, Instant::now());
         }
@@ -229,7 +190,7 @@ impl RelayManager {
                 }
                 Err(e) => {
                     LogStruct::new(
-                        LogLevel::Warning,
+                        LogLevel::Error,
                         "中继预约请求失败",
                         format!("{}: {}", peer_id, e),
                     )

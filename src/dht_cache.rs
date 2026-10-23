@@ -15,35 +15,35 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-//! Stale-while-revalidate cache for DHT reads.
+//! Read-through DHT cache.
 //!
-//! Every application-level DHT read cache uses this module. A read returns the
-//! last validated value immediately, schedules at most one background refresh
-//! per key, and replaces the entry when the refresh completes. Security
-//! sensitive callers configure a short stale window and fail closed once it is
-//! exceeded.
+//! The contract is deliberately small:
 //!
-//! The cache never stores raw network bytes: the [`Fetcher`] is responsible for
-//! verifying and selecting a value (highest version for signed documents,
-//! remote over local store copies for plain records).
+//! - A cached value is returned immediately.
+//! - If no refresh is in flight for that key, one is started in the background.
+//! - The background result replaces the cached entry when it completes.
+//! - If there is no cached value yet (cold start), the caller waits for the
+//!   first refresh and receives either the value or the real fetch error.
+//!
+//! There are no freshness windows, per-cache permits, cache-level timeouts or
+//! failure backoffs. Concurrency control is per key: at most one refresh.
 
 use std::collections::HashMap;
 use std::fmt;
 use std::hash::Hash;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 
 use libp2p::futures::future::BoxFuture;
-use tokio::sync::{Semaphore, watch};
-use tokio::time::timeout;
+use tokio::sync::watch;
+
+use crate::log::{LogLevel, LogStruct};
 
 /// A value fetched from the network, already verified by the fetcher.
 pub struct Fetched<V> {
     pub value: V,
     pub version: Option<u64>,
-    /// Unix seconds after which the value must not be used.
-    pub expires_at: Option<u64>,
     /// Approximate size in bytes, used for cache accounting.
     pub size: usize,
 }
@@ -53,81 +53,10 @@ pub trait Fetcher<K, V>: Send + Sync + 'static {
     fn fetch<'a>(&'a self, key: &'a K) -> BoxFuture<'a, Result<Option<Fetched<V>>, String>>;
 }
 
-/// Policy for one cache namespace.
-#[derive(Debug, Clone)]
-pub struct CachePolicy {
-    /// Entries younger than this are returned without a refresh.
-    pub fresh_for: Duration,
-    /// Values may be served while refreshing until this age is reached.
-    pub max_stale: Duration,
-    /// How long a "record not found" result is considered fresh.
-    pub missing_fresh_for: Duration,
-    /// Upper bound for one background refresh.
-    pub refresh_timeout: Duration,
-    /// Delay before retrying a failed refresh.
-    pub refresh_backoff: Duration,
-    pub max_entries: usize,
-    pub max_bytes: usize,
-}
-
-impl CachePolicy {
-    pub fn auth() -> Self {
-        Self {
-            fresh_for: Duration::from_secs(2),
-            max_stale: Duration::from_secs(5),
-            missing_fresh_for: Duration::from_secs(2),
-            refresh_timeout: Duration::from_secs(10),
-            refresh_backoff: Duration::from_secs(5),
-            max_entries: 1024,
-            max_bytes: 64 * 1024 * 1024,
-        }
-    }
-
-    pub fn types(sync_interval: Duration) -> Self {
-        Self {
-            fresh_for: sync_interval,
-            max_stale: Duration::from_secs(24 * 60 * 60),
-            missing_fresh_for: Duration::from_secs(30),
-            refresh_timeout: Duration::from_secs(15),
-            refresh_backoff: Duration::from_secs(30),
-            max_entries: 4,
-            max_bytes: 16 * 1024 * 1024,
-        }
-    }
-
-    pub fn generic() -> Self {
-        Self {
-            fresh_for: Duration::from_secs(60),
-            max_stale: Duration::from_secs(60),
-            missing_fresh_for: Duration::from_secs(60),
-            refresh_timeout: Duration::from_secs(15),
-            refresh_backoff: Duration::from_secs(30),
-            max_entries: 1024,
-            max_bytes: 64 * 1024 * 1024,
-        }
-    }
-
-    pub fn providers() -> Self {
-        Self {
-            fresh_for: Duration::from_secs(30),
-            max_stale: Duration::from_secs(60),
-            missing_fresh_for: Duration::from_secs(30),
-            refresh_timeout: Duration::from_secs(15),
-            refresh_backoff: Duration::from_secs(30),
-            max_entries: 1024,
-            max_bytes: 16 * 1024 * 1024,
-        }
-    }
-}
-
-/// Result of a cache read. `value == None` means the record was absent at the
-/// last successful refresh.
+/// Result of a cache read.
 #[allow(dead_code)]
 pub struct CacheRead<V> {
     pub value: Option<V>,
-    pub version: Option<u64>,
-    pub age: Duration,
-    pub stale: bool,
     pub last_error: Option<String>,
 }
 
@@ -148,205 +77,81 @@ impl std::error::Error for CacheError {}
 
 #[derive(Clone)]
 struct Entry<V> {
+    /// `Some` = a value was found; `None` = a successful lookup found nothing.
     value: Option<V>,
-    fetched_at: Instant,
-    expires_at: Option<u64>,
     version: Option<u64>,
     last_error: Option<String>,
-    next_refresh_at: Instant,
     last_access: Instant,
     size: usize,
 }
 
-/// Concurrent, policy-driven DHT read cache.
+type RefreshReceiver = watch::Receiver<Option<Result<(), String>>>;
+
+/// Read-through DHT cache with per-key single-flight refreshes.
 pub struct DhtCache<K, V, F> {
     entries: Mutex<HashMap<K, Entry<V>>>,
-    /// Per-key completion signal for a running refresh.
-    inflight: Mutex<HashMap<K, watch::Receiver<bool>>>,
+    inflight: Mutex<HashMap<K, RefreshReceiver>>,
     global_generation: AtomicU64,
     key_generation: Mutex<HashMap<K, u64>>,
     fetcher: Arc<F>,
-    policy: CachePolicy,
-    permits: Arc<Semaphore>,
+    max_entries: usize,
+    max_bytes: usize,
 }
 
 impl<K, V, F> DhtCache<K, V, F>
 where
-    K: Clone + Eq + Hash + Send + Sync + 'static,
+    K: Clone + Eq + Hash + fmt::Debug + Send + Sync + 'static,
     V: Clone + PartialEq + Send + Sync + 'static,
     F: Fetcher<K, V>,
 {
-    pub fn new(fetcher: Arc<F>, policy: CachePolicy, refresh_permits: usize) -> Arc<Self> {
+    pub fn new(fetcher: Arc<F>, max_entries: usize, max_bytes: usize) -> Arc<Self> {
         Arc::new(Self {
             entries: Mutex::new(HashMap::new()),
             inflight: Mutex::new(HashMap::new()),
             global_generation: AtomicU64::new(0),
             key_generation: Mutex::new(HashMap::new()),
             fetcher,
-            policy,
-            permits: Arc::new(Semaphore::new(refresh_permits.max(1))),
+            max_entries: max_entries.max(1),
+            max_bytes: max_bytes.max(1),
         })
     }
 
-    /// Return a cached value without starting a refresh.
+    /// Return the last cached value without starting a refresh.
     pub fn peek(&self, key: &K) -> Option<CacheRead<V>> {
-        let now = Instant::now();
-        let entry = self.entry(key)?;
-        if is_expired(&entry, unix_now()) {
-            return None;
-        }
-        let age = now.saturating_duration_since(entry.fetched_at);
-        let horizon = if entry.value.is_some() {
-            self.policy.max_stale
-        } else {
-            self.policy.missing_fresh_for
-        };
-        if age > horizon {
-            return None;
-        }
-        Some(read_from(entry, age, self.policy.fresh_for))
+        self.entry(key).map(read_from)
     }
 
-    /// Read with stale-while-revalidate semantics.
+    /// Return the last cached value and schedule a background refresh.
+    ///
+    /// If there is no cached value yet, wait for the first refresh.
     pub async fn get(self: &Arc<Self>, key: K) -> Result<CacheRead<V>, CacheError> {
-        let now = Instant::now();
-        let unix = unix_now();
-
-        if let Some(entry) = self.entry(&key)
-            && !is_expired(&entry, unix)
-        {
-            let age = now.saturating_duration_since(entry.fetched_at);
-            let horizon = if entry.value.is_some() {
-                self.policy.fresh_for
-            } else {
-                self.policy.missing_fresh_for
-            };
-            if age <= horizon {
-                return Ok(read_from(entry, age, self.policy.fresh_for));
-            }
-            if entry.value.is_some() && age <= self.policy.max_stale {
-                self.refresh(key);
-                return Ok(read_from(entry, age, self.policy.fresh_for));
-            }
+        if let Some(entry) = self.entry(&key) {
+            self.refresh(key);
+            return Ok(read_from(entry));
         }
 
-        // Cold start, expired value, or stale beyond the allowed window: wait
-        // for one refresh. Concurrent readers share the same in-flight query.
-        for _ in 0..3 {
-            if let Some(mut rx) = self.inflight_receiver(&key) {
-                let _ = timeout(
-                    self.policy.refresh_timeout + Duration::from_secs(3),
-                    rx.wait_for(|done| *done),
-                )
-                .await;
-            } else {
-                self.refresh(key.clone());
-                if let Some(mut rx) = self.inflight_receiver(&key) {
-                    let _ = timeout(
-                        self.policy.refresh_timeout + Duration::from_secs(3),
-                        rx.wait_for(|done| *done),
-                    )
-                    .await;
-                }
-            }
-
-            let now = Instant::now();
-            let unix = unix_now();
-            if let Some(entry) = self.entry(&key) {
-                if !is_expired(&entry, unix) {
-                    let age = now.saturating_duration_since(entry.fetched_at);
-                    let horizon = if entry.value.is_some() {
-                        self.policy.max_stale
-                    } else {
-                        self.policy.missing_fresh_for
-                    };
-                    if age <= horizon {
-                        return Ok(read_from(entry, age, self.policy.fresh_for));
-                    }
-                }
-                if let Some(error) = entry.last_error {
-                    return Err(CacheError::Unavailable(error));
-                }
-            }
-        }
-
-        Err(CacheError::Unavailable(
-            "refresh did not produce a usable value".to_string(),
-        ))
-    }
-
-    /// Schedule a background refresh unless one is already running.
-    pub fn refresh(self: &Arc<Self>, key: K) {
-        if let Some(entry) = self.entry(&key)
-            && entry.last_error.is_some()
-            && entry.next_refresh_at > Instant::now()
-        {
-            return;
-        }
-        let permit = match self.permits.clone().try_acquire_owned() {
-            Ok(permit) => permit,
-            Err(_) => return,
+        let mut rx = self.ensure_refresh(key.clone());
+        let outcome = rx.wait_for(|value| value.is_some()).await;
+        let outcome = match outcome {
+            Ok(value) => value.clone(),
+            Err(_) => None,
         };
 
-        let (tx, rx) = watch::channel(false);
-        {
-            let mut inflight = self.inflight.lock().expect("dht cache inflight poisoned");
-            if inflight.contains_key(&key) {
-                return;
-            }
-            inflight.insert(key.clone(), rx);
+        match outcome {
+            Some(Ok(())) => match self.entry(&key) {
+                Some(entry) => Ok(read_from(entry)),
+                None => Err(CacheError::Unavailable("cache invalidated".to_string())),
+            },
+            Some(Err(error)) => Err(CacheError::Unavailable(error)),
+            None => Err(CacheError::Unavailable(
+                "refresh task exited without a result".to_string(),
+            )),
         }
-
-        let this = Arc::clone(self);
-        let key_for_task = key.clone();
-        tokio::spawn(async move {
-            let generation = this.generation(&key_for_task);
-            let fetched = timeout(
-                this.policy.refresh_timeout,
-                this.fetcher.fetch(&key_for_task),
-            )
-            .await;
-
-            if generation == this.generation(&key_for_task) {
-                match fetched {
-                    Ok(Ok(Some(value))) => this.store(&key_for_task, value),
-                    Ok(Ok(None)) => this.store_missing(&key_for_task),
-                    Ok(Err(error)) => this.store_error(&key_for_task, error),
-                    Err(_) => this.store_error(
-                        &key_for_task,
-                        format!(
-                            "refresh timed out after {}s",
-                            this.policy.refresh_timeout.as_secs()
-                        ),
-                    ),
-                }
-            }
-
-            let mut inflight = this.inflight.lock().expect("dht cache inflight poisoned");
-            inflight.remove(&key_for_task);
-            drop(inflight);
-            let _ = tx.send(true);
-            drop(permit);
-        });
     }
 
-    /// Refresh now if the entry is stale, missing, or its retry deadline passed.
-    pub fn refresh_if_due(self: &Arc<Self>, key: K) {
-        let now = Instant::now();
-        match self.entry(&key) {
-            Some(entry) => {
-                let age = now.saturating_duration_since(entry.fetched_at);
-                let horizon = if entry.value.is_some() {
-                    self.policy.fresh_for
-                } else {
-                    self.policy.missing_fresh_for
-                };
-                if age > horizon || entry.next_refresh_at <= now {
-                    self.refresh(key);
-                }
-            }
-            None => self.refresh(key),
-        }
+    /// Start a background refresh unless one is already running for this key.
+    pub fn refresh(self: &Arc<Self>, key: K) {
+        let _ = self.ensure_refresh(key);
     }
 
     /// Drop one key and invalidate any refresh currently in flight for it.
@@ -365,7 +170,7 @@ where
             .remove(key);
     }
 
-    /// Drop everything, e.g. after a config/trust-domain reload.
+    /// Drop everything, e.g. after a config reload or `refresh_cache`.
     pub fn invalidate_all(&self) {
         self.global_generation.fetch_add(1, Ordering::Relaxed);
         self.entries
@@ -378,25 +183,60 @@ where
             .clear();
     }
 
-    /// Keep the value but make the next read schedule a refresh.
-    pub fn mark_stale(&self, key: &K) {
-        let mut entries = self.entries.lock().expect("dht cache entries poisoned");
-        if let Some(entry) = entries.get_mut(key) {
-            entry.fetched_at = Instant::now()
-                .checked_sub(self.policy.fresh_for + Duration::from_millis(1))
-                .unwrap_or_else(Instant::now);
-            entry.next_refresh_at = Instant::now();
+    fn ensure_refresh(self: &Arc<Self>, key: K) -> RefreshReceiver {
+        let mut inflight = self.inflight.lock().expect("dht cache inflight poisoned");
+        if let Some(rx) = inflight.get(&key) {
+            return rx.clone();
         }
+
+        let (tx, rx) = watch::channel(None);
+        inflight.insert(key.clone(), rx.clone());
+        drop(inflight);
+
+        let generation = self.generation(&key);
+        let this = Arc::clone(self);
+        tokio::spawn(async move {
+            this.run_refresh(key, tx, generation).await;
+        });
+        rx
     }
 
-    pub fn mark_all_stale(&self) {
-        let mut entries = self.entries.lock().expect("dht cache entries poisoned");
-        let fetched_at = Instant::now()
-            .checked_sub(self.policy.fresh_for + Duration::from_millis(1))
-            .unwrap_or_else(Instant::now);
-        for entry in entries.values_mut() {
-            entry.fetched_at = fetched_at;
-            entry.next_refresh_at = Instant::now();
+    async fn run_refresh(
+        self: Arc<Self>,
+        key: K,
+        tx: watch::Sender<Option<Result<(), String>>>,
+        generation: (u64, u64),
+    ) {
+        let guard_cache = Arc::clone(&self);
+        let guard_key = key.clone();
+        scopeguard::defer! {
+            guard_cache
+                .inflight
+                .lock()
+                .expect("dht cache inflight poisoned")
+                .remove(&guard_key);
+        }
+
+        let result = self.fetcher.fetch(&key).await;
+
+        if generation != self.generation(&key) {
+            let _ = tx.send(Some(Err("cache invalidated".to_string())));
+            return;
+        }
+
+        match result {
+            Ok(Some(fetched)) => {
+                self.store(&key, fetched);
+                let _ = tx.send(Some(Ok(())));
+            }
+            Ok(None) => {
+                self.store_missing(&key);
+                let _ = tx.send(Some(Ok(())));
+            }
+            Err(error) => {
+                self.mark_error(&key, &error);
+                let _ = tx.send(Some(Err(error)));
+            }
         }
     }
 
@@ -405,14 +245,6 @@ where
         let entry = entries.get_mut(key)?;
         entry.last_access = Instant::now();
         Some(entry.clone())
-    }
-
-    fn inflight_receiver(&self, key: &K) -> Option<watch::Receiver<bool>> {
-        self.inflight
-            .lock()
-            .expect("dht cache inflight poisoned")
-            .get(key)
-            .cloned()
     }
 
     fn generation(&self, key: &K) -> (u64, u64) {
@@ -452,8 +284,10 @@ where
         }
         if conflict {
             let entry = entries.get_mut(key).expect("entry exists");
-            entry.last_error = Some("conflicting content for the same version".into());
-            entry.next_refresh_at = now + self.policy.refresh_backoff;
+            entry.last_error = Some("conflicting content for the same version".to_string());
+            entry.last_access = now;
+            drop(entries);
+            LogStruct::new(LogLevel::Error, "DHT 刷新内容冲突", format!("{key:?}")).emit();
             return;
         }
 
@@ -461,16 +295,13 @@ where
             key.clone(),
             Entry {
                 value: Some(fetched.value),
-                fetched_at: now,
-                expires_at: fetched.expires_at,
                 version: fetched.version,
                 last_error: None,
-                next_refresh_at: now + self.policy.fresh_for,
                 last_access: now,
                 size: fetched.size,
             },
         );
-        evict(&mut entries, &self.policy);
+        evict(&mut entries, self.max_entries, self.max_bytes);
     }
 
     fn store_missing(&self, key: &K) {
@@ -480,79 +311,48 @@ where
             key.clone(),
             Entry {
                 value: None,
-                fetched_at: now,
-                expires_at: None,
                 version: None,
                 last_error: None,
-                next_refresh_at: now + self.policy.missing_fresh_for,
                 last_access: now,
                 size: 0,
             },
         );
-        evict(&mut entries, &self.policy);
+        evict(&mut entries, self.max_entries, self.max_bytes);
     }
 
-    fn store_error(&self, key: &K, error: String) {
-        let now = Instant::now();
-        let mut entries = self.entries.lock().expect("dht cache entries poisoned");
-        match entries.get_mut(key) {
-            Some(entry) => {
-                entry.last_error = Some(error);
-                entry.next_refresh_at = now + self.policy.refresh_backoff;
+    fn mark_error(&self, key: &K, error: &str) {
+        let should_log = {
+            let mut entries = self.entries.lock().expect("dht cache entries poisoned");
+            match entries.get_mut(key) {
+                Some(entry) => {
+                    let changed = entry.last_error.as_deref() != Some(error);
+                    entry.last_error = Some(error.to_string());
+                    entry.last_access = Instant::now();
+                    changed
+                }
+                None => true,
             }
-            None => {
-                entries.insert(
-                    key.clone(),
-                    Entry {
-                        value: None,
-                        fetched_at: now
-                            .checked_sub(self.policy.missing_fresh_for + Duration::from_millis(1))
-                            .unwrap_or(now),
-                        expires_at: None,
-                        version: None,
-                        last_error: Some(error),
-                        next_refresh_at: now + self.policy.refresh_backoff,
-                        last_access: now,
-                        size: 0,
-                    },
-                );
-            }
+        };
+        if should_log {
+            LogStruct::new(LogLevel::Error, "DHT 刷新失败", format!("{key:?}: {error}")).emit();
         }
-        evict(&mut entries, &self.policy);
     }
 }
 
-fn read_from<V: Clone>(entry: Entry<V>, age: Duration, fresh_for: Duration) -> CacheRead<V> {
+fn read_from<V: Clone>(entry: Entry<V>) -> CacheRead<V> {
     CacheRead {
         value: entry.value,
-        version: entry.version,
-        age,
-        stale: age > fresh_for,
         last_error: entry.last_error,
     }
 }
 
-fn is_expired<V>(entry: &Entry<V>, now_unix: u64) -> bool {
-    entry.expires_at.is_some_and(|expires| now_unix > expires)
-}
-
-fn unix_now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-fn evict<K: Eq + Hash + Clone, V>(entries: &mut HashMap<K, Entry<V>>, policy: &CachePolicy) {
-    if entries.len() <= policy.max_entries {
-        let total: usize = entries.values().map(|entry| entry.size).sum();
-        if total <= policy.max_bytes {
-            return;
-        }
-    }
-
-    while entries.len() > policy.max_entries
-        || entries.values().map(|entry| entry.size).sum::<usize>() > policy.max_bytes
+fn evict<K: Eq + Hash + Clone, V>(
+    entries: &mut HashMap<K, Entry<V>>,
+    max_entries: usize,
+    max_bytes: usize,
+) {
+    while entries.len() > max_entries
+        || entries.values().map(|entry| entry.size).sum::<usize>() > max_bytes
     {
         let Some(victim) = entries
             .iter()
@@ -573,6 +373,7 @@ mod tests {
     use super::*;
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     struct MockFetcher {
         responses: Mutex<VecDeque<Result<Option<Fetched<i32>>, String>>>,
@@ -613,73 +414,95 @@ mod tests {
         Some(Fetched {
             value,
             version: Some(version),
-            expires_at: None,
             size: 4,
         })
     }
 
-    fn policy(fresh: Duration, stale: Duration) -> CachePolicy {
-        CachePolicy {
-            fresh_for: fresh,
-            max_stale: stale,
-            missing_fresh_for: Duration::from_millis(5),
-            refresh_timeout: Duration::from_secs(2),
-            refresh_backoff: Duration::from_millis(5),
-            max_entries: 16,
-            max_bytes: 1 << 20,
-        }
-    }
-
     #[tokio::test]
-    async fn fresh_value_is_served_without_refresh() {
-        let fetcher = Arc::new(MockFetcher::new(vec![Ok(fetched(1, 1))], Duration::ZERO));
-        let cache = DhtCache::new(
-            fetcher.clone(),
-            policy(Duration::from_secs(60), Duration::from_secs(60)),
-            2,
-        );
-        assert_eq!(cache.get(()).await.unwrap().value, Some(1));
-        assert_eq!(cache.get(()).await.unwrap().value, Some(1));
-        assert_eq!(fetcher.calls.load(Ordering::Relaxed), 1);
-    }
-
-    #[tokio::test]
-    async fn stale_value_is_returned_while_refreshing() {
+    async fn cached_value_is_returned_immediately_while_refreshing() {
         let fetcher = Arc::new(MockFetcher::new(
             vec![Ok(fetched(1, 1)), Ok(fetched(2, 2))],
-            Duration::ZERO,
+            Duration::from_millis(50),
         ));
-        let cache = DhtCache::new(
-            fetcher.clone(),
-            policy(Duration::ZERO, Duration::from_secs(5)),
-            2,
-        );
+        let cache = DhtCache::new(fetcher.clone(), 16, 1 << 20);
+
         assert_eq!(cache.get(()).await.unwrap().value, Some(1));
-        let stale = cache.get(()).await.unwrap();
-        assert_eq!(stale.value, Some(1));
-        assert!(stale.stale);
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        assert_eq!(cache.get(()).await.unwrap().value, Some(2));
+
+        let started = std::time::Instant::now();
+        let cached = cache.get(()).await.unwrap();
+        assert_eq!(cached.value, Some(1));
+        assert!(
+            started.elapsed() < Duration::from_millis(40),
+            "cached read waited for the background refresh"
+        );
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(cache.peek(&()).unwrap().value, Some(2));
         assert_eq!(fetcher.calls.load(Ordering::Relaxed), 2);
     }
 
     #[tokio::test]
-    async fn concurrent_cold_reads_share_one_refresh() {
+    async fn cold_start_concurrent_reads_share_one_refresh() {
         let fetcher = Arc::new(MockFetcher::new(
             vec![Ok(fetched(1, 1))],
             Duration::from_millis(30),
         ));
-        let cache = DhtCache::new(
-            fetcher.clone(),
-            policy(Duration::from_secs(60), Duration::from_secs(60)),
-            2,
-        );
-        let a = cache.clone();
-        let b = cache.clone();
-        let (ra, rb) = tokio::join!(a.get(()), b.get(()));
-        assert_eq!(ra.unwrap().value, Some(1));
-        assert_eq!(rb.unwrap().value, Some(1));
+        let cache = DhtCache::new(fetcher.clone(), 16, 1 << 20);
+
+        let (a, b) = tokio::join!(cache.get(()), cache.get(()));
+        assert_eq!(a.unwrap().value, Some(1));
+        assert_eq!(b.unwrap().value, Some(1));
         assert_eq!(fetcher.calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn background_failure_keeps_old_value() {
+        let fetcher = Arc::new(MockFetcher::new(
+            vec![Ok(fetched(1, 1)), Err("boom".to_string())],
+            Duration::ZERO,
+        ));
+        let cache = DhtCache::new(fetcher.clone(), 16, 1 << 20);
+
+        assert_eq!(cache.get(()).await.unwrap().value, Some(1));
+        assert_eq!(cache.get(()).await.unwrap().value, Some(1));
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let entry = cache.peek(&()).expect("old value must remain");
+        assert_eq!(entry.value, Some(1));
+        assert_eq!(entry.last_error.as_deref(), Some("boom"));
+        assert_eq!(fetcher.calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn cold_start_failure_returns_real_error() {
+        let fetcher = Arc::new(MockFetcher::new(
+            vec![Err("boom".to_string())],
+            Duration::ZERO,
+        ));
+        let cache = DhtCache::new(fetcher, 16, 1 << 20);
+
+        let error = match cache.get(()).await {
+            Ok(_) => panic!("cold failure must surface"),
+            Err(error) => error,
+        };
+        assert_eq!(error.to_string(), "DHT value unavailable: boom");
+    }
+
+    #[tokio::test]
+    async fn missing_result_overwrites_old_value() {
+        let fetcher = Arc::new(MockFetcher::new(
+            vec![Ok(fetched(1, 1)), Ok(None)],
+            Duration::ZERO,
+        ));
+        let cache = DhtCache::new(fetcher.clone(), 16, 1 << 20);
+
+        assert_eq!(cache.get(()).await.unwrap().value, Some(1));
+        assert_eq!(cache.get(()).await.unwrap().value, Some(1));
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let entry = cache.peek(&()).expect("missing result is cached");
+        assert!(entry.value.is_none());
+        assert_eq!(fetcher.calls.load(Ordering::Relaxed), 2);
     }
 
     #[tokio::test]
@@ -688,25 +511,29 @@ mod tests {
             vec![Ok(fetched(2, 2)), Ok(fetched(1, 1))],
             Duration::ZERO,
         ));
-        let cache = DhtCache::new(
-            fetcher.clone(),
-            policy(Duration::ZERO, Duration::from_secs(5)),
-            2,
-        );
+        let cache = DhtCache::new(fetcher, 16, 1 << 20);
+
         assert_eq!(cache.get(()).await.unwrap().value, Some(2));
-        let _ = cache.get(()).await.unwrap();
+        assert_eq!(cache.get(()).await.unwrap().value, Some(2));
+
         tokio::time::sleep(Duration::from_millis(20)).await;
-        assert_eq!(cache.get(()).await.unwrap().value, Some(2));
+        assert_eq!(cache.peek(&()).unwrap().value, Some(2));
     }
 
     #[tokio::test]
-    async fn missing_record_is_reported() {
-        let fetcher = Arc::new(MockFetcher::new(vec![Ok(None)], Duration::ZERO));
-        let cache = DhtCache::new(
-            fetcher,
-            policy(Duration::from_secs(60), Duration::from_secs(60)),
-            2,
-        );
-        assert!(cache.get(()).await.unwrap().value.is_none());
+    async fn invalidate_discards_an_inflight_refresh() {
+        let fetcher = Arc::new(MockFetcher::new(
+            vec![Ok(fetched(1, 1)), Ok(fetched(2, 2))],
+            Duration::from_millis(30),
+        ));
+        let cache = DhtCache::new(fetcher.clone(), 16, 1 << 20);
+
+        cache.refresh(());
+        cache.invalidate(&());
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert!(cache.peek(&()).is_none());
+
+        assert_eq!(cache.get(()).await.unwrap().value, Some(2));
+        assert_eq!(fetcher.calls.load(Ordering::Relaxed), 2);
     }
 }

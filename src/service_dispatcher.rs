@@ -97,7 +97,6 @@ fn command_timeout(msg: &Message, base: Duration, kad: Duration) -> Duration {
         | Message::DiscoverProviders { .. }
         | Message::ReannounceServices { .. } => kad,
         Message::AddKey { .. } => kad.saturating_add(kad),
-        Message::PublishTypes { .. } => kad.saturating_add(kad),
         _ => Duration::ZERO,
     };
     required.max(base).saturating_add(Duration::from_secs(5))

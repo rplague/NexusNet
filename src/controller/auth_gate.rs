@@ -23,7 +23,7 @@ use libp2p::{PeerId, kad};
 
 use crate::auth::{self, AuthNetwork, AuthVersions, IndexDoc, ServiceEntry, WhitelistDoc};
 use crate::config::ConfigHandle;
-use crate::dht_cache::{CachePolicy, DhtCache, Fetched, Fetcher};
+use crate::dht_cache::{DhtCache, Fetched, Fetcher};
 use crate::log::{LogLevel, LogStruct};
 use crate::network::NetworkHandle;
 
@@ -70,7 +70,7 @@ fn same_trust_domain(a: &AuthState, b: &AuthState) -> bool {
     }
 }
 
-#[derive(Clone, Eq)]
+#[derive(Clone, Debug, Eq)]
 struct WhitelistKey {
     service: String,
     hash: Vec<u8>,
@@ -115,7 +115,6 @@ impl Fetcher<kad::RecordKey, IndexDoc> for AuthIndexFetcher {
             select_index(&records, &self.net, auth::now_unix()).map(|selected| {
                 selected.map(|(doc, size)| Fetched {
                     version: Some(doc.version),
-                    expires_at: Some(doc.expires_at),
                     value: doc,
                     size,
                 })
@@ -152,7 +151,6 @@ impl Fetcher<WhitelistKey, WhitelistDoc> for AuthWhitelistFetcher {
             select_whitelist(&records, &self.net, key, &entry).map(|selected| {
                 selected.map(|(doc, size)| Fetched {
                     version: Some(doc.version),
-                    expires_at: Some(key.index_expires_at),
                     value: doc,
                     size,
                 })
@@ -227,8 +225,8 @@ fn build_caches(net: &AuthNetwork, swarm: &NetworkHandle) -> Arc<AuthCaches> {
         net: net.clone(),
     });
     Arc::new(AuthCaches {
-        index: DhtCache::new(index_fetcher, CachePolicy::auth(), 8),
-        whitelist: DhtCache::new(whitelist_fetcher, CachePolicy::auth(), 8),
+        index: DhtCache::new(index_fetcher, 1024, 64 << 20),
+        whitelist: DhtCache::new(whitelist_fetcher, 1024, 64 << 20),
     })
 }
 
@@ -278,16 +276,7 @@ impl AuthGate {
                 .clear();
         }
         if let (AuthState::Active(net), true) = (&next, same_domain) {
-            if let Some(caches) = self
-                .caches
-                .read()
-                .expect("auth caches poisoned")
-                .as_ref()
-                .cloned()
-            {
-                caches.index.mark_all_stale();
-                caches.whitelist.mark_all_stale();
-            } else {
+            if self.caches.read().expect("auth caches poisoned").is_none() {
                 *self.caches.write().expect("auth caches poisoned") =
                     Some(build_caches(net, &self.swarm));
             }
@@ -305,8 +294,8 @@ impl AuthGate {
         }
     }
 
-    /// Authorization: use the verified SWR cache; a short stale window is
-    /// allowed, after which a failed refresh is fail-closed.
+    /// Authorization: return the last verified record immediately and refresh
+    /// it in the background. Expired documents are still rejected.
     pub async fn authorize(&self, peer: &PeerId, service: &str) -> Decision {
         let state = self.state.read().expect("auth state poisoned").clone();
         let net = match &state {
@@ -335,6 +324,9 @@ impl AuthGate {
         let Some(index) = index.value else {
             return Decision::Deny("auth index unavailable".to_string());
         };
+        if auth::now_unix() > index.expires_at {
+            return Decision::Deny("auth index expired".to_string());
+        }
         if self
             .versions
             .lock()
@@ -377,20 +369,6 @@ impl AuthGate {
             Decision::Allow
         } else {
             Decision::Deny("peer not authorized".to_string())
-        }
-    }
-
-    /// Force the next authorization to revalidate the trust records.
-    pub fn mark_all_stale(&self) {
-        if let Some(caches) = self
-            .caches
-            .read()
-            .expect("auth caches poisoned")
-            .as_ref()
-            .cloned()
-        {
-            caches.index.mark_all_stale();
-            caches.whitelist.mark_all_stale();
         }
     }
 

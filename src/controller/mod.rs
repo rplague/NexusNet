@@ -21,7 +21,6 @@ mod auth_gate;
 mod bootstrap;
 mod command;
 pub(crate) mod dht_fetchers;
-mod legacy_types;
 mod node_controller;
 mod peer_tracker;
 mod relay_manager;

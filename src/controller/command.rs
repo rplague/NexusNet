@@ -15,7 +15,6 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -72,8 +71,7 @@ fn response_payload(resp: service_protocol::Response) -> Result<Vec<u8>, String>
 }
 
 fn is_writable_key(key: &str) -> bool {
-    if key == "/oahd/service/authtypes/" || key == "/oahd/service/types" || key == "/oahd/bootstrap"
-    {
+    if key == "/oahd/service/types" || key == "/oahd/bootstrap" {
         return false;
     }
     key.starts_with("/oahd/auth/") || key.starts_with("/oahd/service/")
@@ -97,7 +95,6 @@ fn command_name(msg: &Message) -> &'static str {
         Message::AuthStatus { .. } => "auth_status",
         Message::QueryKey { .. } => "query_key",
         Message::AddKey { .. } => "add_key",
-        Message::PublishTypes { .. } => "publish_types",
         Message::RemoveKey { .. } => "remove_key",
         Message::ServiceRequest { .. } => "service_request",
         Message::ServiceRequestTo { .. } => "service_request_to",
@@ -115,18 +112,17 @@ fn can_run_in_dht_worker(msg: &Message) -> bool {
     }
 }
 
-fn log_command(kind: &str, elapsed: Duration) {
-    let level = if elapsed >= Duration::from_secs(1) {
-        LogLevel::Warning
-    } else {
-        LogLevel::Debug
-    };
-    LogStruct::new(
-        level,
-        "控制命令",
-        format!("{kind} {}ms", elapsed.as_millis()),
-    )
-    .emit();
+fn log_command_result(kind: &str, elapsed: Duration, result: &Result<Vec<u8>, String>) {
+    if let Err(error) = result {
+        LogStruct::new(LogLevel::Error, "控制命令失败", format!("{kind}: {error}")).emit();
+    } else if elapsed >= Duration::from_secs(1) {
+        LogStruct::new(
+            LogLevel::Warning,
+            "控制命令较慢",
+            format!("{kind} {}ms", elapsed.as_millis()),
+        )
+        .emit();
+    }
 }
 
 fn provider_strings(providers: Vec<PeerId>) -> Vec<String> {
@@ -360,15 +356,17 @@ impl NodeController {
                     msg,
                 )
                 .await;
-                log_command(kind, started.elapsed());
+                log_command_result(kind, started.elapsed(), &result);
                 let _ = resp_tx.send(result);
                 drop(permit);
             });
         } else {
-            let result = self.run_command(msg).await;
-            log_command(kind, started.elapsed());
-            let _ = resp_tx
-                .send(result.unwrap_or_else(|| Err("command produced no result".to_string())));
+            let result = self
+                .run_command(msg)
+                .await
+                .unwrap_or_else(|| Err("command produced no result".to_string()));
+            log_command_result(kind, started.elapsed(), &result);
+            let _ = resp_tx.send(result);
         }
     }
 
@@ -394,7 +392,6 @@ impl NodeController {
                 providing,
                 ..
             } => Some(self.cmd_add_key(key, value, providing).await),
-            Message::PublishTypes { value, .. } => Some(self.cmd_publish_types(value).await),
             Message::RemoveKey {
                 key,
                 providing,
@@ -416,32 +413,9 @@ impl NodeController {
     }
 
     async fn cmd_list_services(&mut self) -> Result<Vec<u8>, String> {
-        let signed = self
-            .signed_types_cache
-            .as_ref()
-            .and_then(|cache| cache.peek(&()).and_then(|read| read.value));
-        let use_legacy = self.legacy_types_merge || signed.is_none();
-        if use_legacy {
-            self.legacy_types_cache.refresh_if_due(());
-        }
-        let mut types: BTreeSet<String> = signed.unwrap_or_default();
-        if use_legacy
-            && let Some(legacy) = self
-                .legacy_types_cache
-                .peek(&())
-                .and_then(|read| read.value)
-        {
-            types.extend(legacy);
-        }
-        if let Some(cache) = &self.signed_types_cache {
-            cache.refresh_if_due(());
-        }
-        {
-            let snapshot = self.services_snapshot.borrow();
-            types.extend(snapshot.announced.iter().cloned());
-            types.extend(snapshot.backend_ready.iter().cloned());
-        }
-        Ok(to_cbor(&types.into_iter().collect::<Vec<_>>()))
+        let types = self.services_snapshot.borrow().types.clone();
+        let _ = self.services_tx.try_send(ServiceCommand::RefreshTypes);
+        Ok(to_cbor(&types))
     }
 
     async fn cmd_discover_providers(&self, service: &str) -> Result<Vec<u8>, String> {
@@ -561,83 +535,6 @@ impl NodeController {
         report["whitelist_versions"] = serde_json::Value::Object(whitelist_versions);
 
         Ok(to_cbor(&report))
-    }
-
-    async fn cmd_publish_types(&mut self, value: Vec<u8>) -> Result<Vec<u8>, String> {
-        let Some(authority) = self.config.types_authority_key() else {
-            return Err("services.registry.types_authority is not configured".to_string());
-        };
-        let doc = crate::types_doc::verify_types(
-            &authority,
-            &value,
-            auth::now_unix(),
-            self.config.types_ttl_seconds(),
-        )
-        .map_err(|e| format!("invalid types document: {e}"))?;
-        let max_record_bytes = self.config.compat_max_record_bytes();
-        check_compat_record_size(value.len(), max_record_bytes)?;
-        self.swarm
-            .put_record(
-                kad::RecordKey::new(&crate::types_doc::TYPES_KEY),
-                value,
-                quorum_for_key("/oahd/service/authtypes/"),
-            )
-            .await
-            .map_err(|e| format!("put_record failed: {e}"))?;
-
-        // Compatibility mirror for older nodes. Preserve legacy-only services
-        // so publishing a signed document never shrinks the old key.
-        let mut services: BTreeSet<String> = doc.services.iter().cloned().collect();
-        // Force a fresh legacy read so the mirror preserves old-only services.
-        self.legacy_types_cache.invalidate(&());
-        if let Ok(read) = self.legacy_types_cache.get(()).await
-            && let Some(legacy) = read.value
-        {
-            services.extend(legacy);
-        }
-        let list: Vec<String> = services.into_iter().collect();
-        match crate::types_doc::encode_legacy_types_capped(&list, max_record_bytes as usize) {
-            Some((legacy, included)) => {
-                if included < list.len() {
-                    LogStruct::new(
-                        LogLevel::Warning,
-                        "旧版类型镜像已裁剪",
-                        format!(
-                            "{included}/{} 个服务，超出 compat.max_record_bytes",
-                            list.len()
-                        ),
-                    )
-                    .emit();
-                }
-                if let Err(error) = self
-                    .swarm
-                    .put_record(
-                        kad::RecordKey::new(&crate::types_doc::LEGACY_TYPES_KEY),
-                        legacy,
-                        quorum_for_key("/oahd/service/types"),
-                    )
-                    .await
-                {
-                    LogStruct::new(LogLevel::Warning, "旧版类型镜像发布失败", error.to_string())
-                        .emit();
-                }
-            }
-            None => {
-                LogStruct::new(
-                    LogLevel::Warning,
-                    "旧版类型镜像无法编码",
-                    format!("compat.max_record_bytes={max_record_bytes}"),
-                )
-                .emit();
-            }
-        }
-        if let Some(cache) = &self.signed_types_cache {
-            cache.mark_stale(&());
-        }
-        self.legacy_types_cache.mark_stale(&());
-        Ok(to_cbor(
-            &serde_json::json!({"success": true, "version": doc.version}),
-        ))
     }
 
     async fn cmd_add_key(
@@ -883,7 +780,6 @@ mod tests {
 
     #[test]
     fn writable_key_rejects_reserved_and_foreign_keys() {
-        assert!(!is_writable_key("/oahd/service/authtypes/"));
         assert!(!is_writable_key("/oahd/service/types"));
         assert!(!is_writable_key("/oahd/bootstrap"));
         assert!(!is_writable_key("/oahd/other"));

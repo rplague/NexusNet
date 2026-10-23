@@ -98,7 +98,7 @@ impl BootstrapDiscovery {
         let key = kad::RecordKey::new(&BOOTSTRAP_PROVIDER_KEY);
         // Never block the controller on a DHT lookup. A stale or missing
         // cache entry triggers one background refresh.
-        self.provider_cache.refresh_if_due(key.clone());
+        self.provider_cache.refresh(key.clone());
         let providers = match self.provider_cache.peek(&key) {
             Some(read) => read.value.unwrap_or_default(),
             None => return,
