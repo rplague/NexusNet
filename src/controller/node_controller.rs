@@ -138,6 +138,8 @@ impl NodeController {
 
     /// Run the node orchestration loop.
     pub async fn run(mut self) {
+        self.notify_relay_state().await;
+
         // Periodic relay top-up.
         let retry = Duration::from_secs(self.config.relay_retry_interval().max(1) as u64);
         let mut relay_tick = tokio::time::interval_at(tokio::time::Instant::now() + retry, retry);
@@ -189,13 +191,26 @@ impl NodeController {
             } => self.enqueue_auth(peer, request_id, service, payload, response_tx),
             NetworkEvent::Relay(event) => self.relay.on_relay_event(event),
             NetworkEvent::RelayClient(event) => self.relay.on_relay_client_event(event),
+            NetworkEvent::RelayCircuitReady { addr } => {
+                self.relay.on_circuit_ready(&addr);
+                self.notify_relay_state().await;
+            }
             NetworkEvent::ListenerClosed { addresses } => {
                 // Relay dropped: try to top up to the target immediately.
                 if self.relay.on_listener_closed(addresses).await {
+                    self.notify_relay_state().await;
                     self.relay.tick().await;
                 }
             }
         }
+    }
+
+    async fn notify_relay_state(&self) {
+        self.send_service(ServiceCommand::RelayStateChanged {
+            need_relay: self.relay.need_relay(),
+            active: self.relay.active().len(),
+        })
+        .await;
     }
 
     pub(super) fn invalidate_caches(&self) {
