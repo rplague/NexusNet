@@ -90,8 +90,9 @@ enum BackendEvent {
 
 fn command_timeout(msg: &Message, base: Duration, kad: Duration) -> Duration {
     let required = match msg {
-        Message::ServiceRequest { .. } => kad.saturating_add(service_protocol::REQUEST_TIMEOUT),
-        Message::ServiceRequestTo { .. } => service_protocol::REQUEST_TIMEOUT,
+        Message::ServiceRequest { .. } | Message::ServiceRequestTo { .. } => {
+            kad.saturating_add(service_protocol::REQUEST_TIMEOUT.saturating_mul(2))
+        }
         Message::QueryKey { .. } => kad.saturating_add(kad),
         Message::ListServices { .. }
         | Message::DiscoverProviders { .. }
@@ -689,7 +690,21 @@ mod tests {
             payload: vec![],
         };
         let expected = KAD
-            .saturating_add(service_protocol::REQUEST_TIMEOUT)
+            .saturating_add(service_protocol::REQUEST_TIMEOUT.saturating_mul(2))
+            .saturating_add(MARGIN);
+        assert_eq!(command_timeout(&msg, BASE, KAD), expected);
+    }
+
+    #[test]
+    fn service_request_to_budget_covers_lookup_and_relay_retry() {
+        let msg = Message::ServiceRequestTo {
+            id: id(),
+            service: "cmd".into(),
+            peer: PeerId::random().to_string(),
+            payload: vec![],
+        };
+        let expected = KAD
+            .saturating_add(service_protocol::REQUEST_TIMEOUT.saturating_mul(2))
             .saturating_add(MARGIN);
         assert_eq!(command_timeout(&msg, BASE, KAD), expected);
     }
