@@ -83,6 +83,8 @@ pub fn update_config_with_public_ip(
         .copied()
         .collect();
 
+    config.set_has_public_address(!public_ips.is_empty());
+
     if ipv4_addrs.is_empty() && ipv6_addrs.is_empty() {
         LogStruct::new(LogLevel::Warning, "未发现公网IP", "无法自动更新网络配置").emit();
         return Ok(());
