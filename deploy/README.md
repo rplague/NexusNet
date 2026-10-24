@@ -27,6 +27,17 @@ NexusNet 以原生的 Debian 打包（`.deb`）分发，由 `dpkg`/`apt` 管理�
 与 `NEXUSNET_LOG_MODE` 环境变量锚定，见 `src/paths.rs`。本地 `cargo run`（不设任何环境变量）
 仍回退当前目录 `./config.toml` / `./keypair.bin` / `./log`。
 
+## 网络规划
+
+- 至少一台机器需要**双栈公网地址**，并在各 NAT 节点的
+  `services.kademlia.bootstrap_nodes` 中配置为 bootstrap。
+- 双栈 bootstrap 会自动开启 Circuit Relay v2 server；NAT 节点无需公网 IP。
+- NAT 节点在第一个 relay 就绪前不会宣告服务，最后一个 relay 失效后会撤销宣告。
+- 中继电路上限自动取 `max_request_bytes + max_response_bytes`，bootstrap 的
+  这两个值应不小于客户端。
+- 调用方通过 `get_closest_peers` 解析 provider 的 relay 地址，详见
+  [../docs/nat-relay.md](../docs/nat-relay.md)。
+
 ## 安装
 
 在 Debian / Ubuntu 上以 root 执行：
