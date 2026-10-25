@@ -75,6 +75,18 @@ PeerId。当前 `request_service` 在直连失败时会自动执行这一步。
 Kademlia 的 provider 记录是每个服务一条，不是每个 relay 一条；relay 地址由
 Identify/peer lookup 提供。
 
+## 传输层
+
+TCP 和 relay 客户端优先协商 TLS，旧节点可回退 Noise：
+
+- 双方都支持时使用 TLS；
+- 只支持 Noise 的旧节点仍可连接；
+- 不需要修改 relay 预约或 provider 发现流程；
+- relay server 对两种安全协议都透明支持。
+
+TLS 证书由 ED25519 keypair 在启动时生成，不新增文件。  
+如果网络连 TLS 也阻断，下一步是 WebSocket+TLS（ALPN `http/1.1`），而不是继续调整 Noise。
+
 ## relay 容量
 
 relay server 的 `max_circuit_bytes` 自动设置为：

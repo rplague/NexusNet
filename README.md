@@ -294,6 +294,21 @@ u32_be(len) || cbor(message)      # len <= 16 MiB
 
 完整流程与失效语义见 [docs/nat-relay.md](./docs/nat-relay.md)。
 
+## 传输层 TLS 优先
+
+新版本在 TCP 和 relay 客户端上同时提供 TLS 与 Noise：
+
+- 双方都支持时优先协商 TLS；
+- 对端只支持 Noise 时自动回退，旧节点仍可连接；
+- PeerId、服务协议、Kademlia、relay 和 PQ 均不受影响；
+- 不需要修改端口、配置或 multiaddr；
+- TLS 证书由现有 ED25519 keypair 在启动时生成，不新增密钥文件。
+
+TLS 流量对 DPI/防火墙表现为标准 TLS（类似 HTTPS），适合只放行 HTTP/TLS/SSH 的网络。  
+如果网络连 TLS 也识别/阻断，需要后续增加 WebSocket+TLS 传输，见 [docs/nat-relay.md](./docs/nat-relay.md)。
+
+注意：TLS 优先不会在连接失败后自动降级到 Noise；如果某条网络封锁 TLS，旧 Noise-only 节点仍可用 Noise。
+
 ## DHT 读缓存
 
 应用层 DHT 读缓存只做 read-through + 每 key 单飞刷新：
