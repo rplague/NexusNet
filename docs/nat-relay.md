@@ -14,7 +14,8 @@ bootstrap/relay。
 ```
 
 - B 必须双栈。双栈节点会自动启用 relay server。
-- E 把 B 写入 `services.kademlia.bootstrap_nodes`。
+- E 把 B 的 WebSocket 地址写入 `services.kademlia.bootstrap_nodes`，
+  例如 `/ip6/.../tcp/5000/ws/p2p/<PeerId>`。
 - E 可以单栈，也可以双栈但在 NAT 后面；它不需要公网地址。
 
 ## E 获得 relay 前不宣告服务
@@ -77,15 +78,20 @@ Identify/peer lookup 提供。
 
 ## 传输层
 
-TCP 和 relay 客户端优先协商 TLS，旧节点可回退 Noise：
+本版本只使用 WebSocket over HTTP：
 
-- 双方都支持时使用 TLS；
-- 只支持 Noise 的旧节点仍可连接；
-- 不需要修改 relay 预约或 provider 发现流程；
-- relay server 对两种安全协议都透明支持。
+```text
+TCP → HTTP WebSocket → multistream-select → TLS/Noise → Yamux
+```
 
-TLS 证书由 ED25519 keypair 在启动时生成，不新增文件。  
-如果网络连 TLS 也阻断，下一步是 WebSocket+TLS（ALPN `http/1.1`），而不是继续调整 Noise。
+- `network.port` 是 WebSocket 的 TCP 端口，默认 `5000`；
+- bootstrap 必须使用 `/ws` 地址，例如
+  `/ip6/.../tcp/5000/ws/p2p/<PeerId>`；
+- relay 预约和调用都经 WebSocket；
+- 内层仍优先 TLS，Noise 作为兼容回退；
+- 旧版 raw TCP 节点不兼容，所有节点必须升级。
+
+如果网络连明文 WebSocket 也阻断，需要 WSS（443 反代 + 证书），当前版本不包含。
 
 ## relay 容量
 
