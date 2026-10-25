@@ -22,7 +22,7 @@ use crate::network::NetworkError;
 use crate::network::addr::to_multiaddr;
 use crate::network::behaviour::NetBehaviour;
 use crate::{LogLevel, LogStruct};
-use libp2p::{Multiaddr, Swarm, SwarmBuilder, identity, noise, tcp, tls, yamux};
+use libp2p::{Multiaddr, Swarm, SwarmBuilder, identity, noise, tls, yamux};
 use std::net::IpAddr;
 use std::time::Duration;
 
@@ -30,7 +30,7 @@ use std::time::Duration;
 ///
 /// Used both at first start and for `reload()` rebuilds, so it holds no
 /// long-lived state.
-pub fn build_swarm(
+pub async fn build_swarm(
     config: &ConfigHandle,
     keypair: &identity::Keypair,
 ) -> Result<Swarm<NetBehaviour>, NetworkError> {
@@ -44,33 +44,39 @@ pub fn build_swarm(
                 .network
                 .ipv4_address
                 .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
-            addrs.push(to_multiaddr(ip, cfg.network.port as u16));
+            let mut addr = to_multiaddr(ip, cfg.network.port as u16);
+            addr.push(libp2p::multiaddr::Protocol::Ws("/".into()));
+            addrs.push(addr);
         }
         if cfg.network.ipv6_enabled {
             let ip = cfg
                 .network
                 .ipv6_address
                 .unwrap_or(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED));
-            addrs.push(to_multiaddr(ip, cfg.network.port as u16));
+            let mut addr = to_multiaddr(ip, cfg.network.port as u16);
+            addr.push(libp2p::multiaddr::Protocol::Ws("/".into()));
+            addrs.push(addr);
         }
         addrs
     };
 
-    // Prefer TLS (recognizable to DPI/firewalls) and fall back to Noise for
-    // older peers that only advertise /noise.
+    // WebSocket-only transport: the outer HTTP/WS handshake keeps libp2p's
+    // plaintext multistream-select inside WebSocket frames, which is required
+    // on networks that only allow HTTP/TLS/SSH. TLS remains the preferred
+    // inner security upgrade, with Noise retained for compatibility.
     let mut swarm = SwarmBuilder::with_existing_identity(keypair.clone())
         .with_tokio()
-        .with_tcp(
-            tcp::Config::default(),
+        .with_websocket(
             (tls::Config::new, noise::Config::new),
             yamux::Config::default,
         )
-        .map_err(|e| NetworkError::Build(e.to_string()))?
+        .await
+        .map_err(|e| NetworkError::Build(format!("{e:?}")))?
         .with_relay_client(
             (tls::Config::new, noise::Config::new),
             yamux::Config::default,
         )
-        .map_err(|e| NetworkError::Build(e.to_string()))?
+        .map_err(|e| NetworkError::Build(format!("{e:?}")))?
         .with_behaviour(|keypair, relay_client| {
             NetBehaviour::new(&config_clone, keypair, relay_client)
         })

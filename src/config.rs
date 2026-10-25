@@ -817,8 +817,8 @@ impl ConfigHandle {
         self.read().services.kademlia.bootstrap_nodes.clone()
     }
 
-    /// External addresses (`<ip>/tcp/<port>/p2p/<peer_id>`) derived from the
-    /// configured IPv4/IPv6 addresses.
+    /// External WebSocket addresses (`<ip>/tcp/<port>/ws/p2p/<peer_id>`)
+    /// derived from the configured IPv4/IPv6 addresses.
     pub fn dialable_addrs(&self, peer_id: PeerId) -> Vec<Multiaddr> {
         let cfg = self.read();
         let port = cfg.network.port as u16;
@@ -832,6 +832,7 @@ impl ConfigHandle {
                     IpAddr::V6(v6) => a.push(Protocol::Ip6(v6)),
                 }
                 a.push(Protocol::Tcp(port));
+                a.push(Protocol::Ws("/".into()));
                 a.push(Protocol::P2p(peer_id));
                 a
             })
@@ -934,11 +935,11 @@ mod tests {
         assert_eq!(addrs.len(), 2);
         assert_eq!(
             addrs[0].to_string(),
-            format!("/ip4/1.2.3.4/tcp/5000/p2p/{pid}")
+            format!("/ip4/1.2.3.4/tcp/5000/ws/p2p/{pid}")
         );
         assert_eq!(
             addrs[1].to_string(),
-            format!("/ip6/2001:db8::1/tcp/5000/p2p/{pid}")
+            format!("/ip6/2001:db8::1/tcp/5000/ws/p2p/{pid}")
         );
     }
 

@@ -94,11 +94,11 @@ pub struct Network;
 
 impl Network {
     /// Build the Swarm and start the actor.
-    pub fn start(
+    pub async fn start(
         config: ConfigHandle,
         keypair: libp2p::identity::Keypair,
         pq_keys: Option<pq::PqKeys>,
     ) -> Result<NetworkStart, NetworkError> {
-        actor::spawn(config, keypair, pq_keys)
+        actor::spawn(config, keypair, pq_keys).await
     }
 }
