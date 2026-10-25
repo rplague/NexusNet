@@ -79,10 +79,13 @@ chmod 0644 "${STAGE}/lib/systemd/system/${UNIT_NAME}.service" \
            "${STAGE}/usr/lib/tmpfiles.d/${PKG}.conf"
 
 # 维护脚本
-render "${PROJECT_DIR}/deb/postinst" > "${STAGE}/DEBIAN/postinst"
-render "${PROJECT_DIR}/deb/prerm"    > "${STAGE}/DEBIAN/prerm"
-render "${PROJECT_DIR}/deb/postrm"   > "${STAGE}/DEBIAN/postrm"
-chmod 0755 "${STAGE}/DEBIAN/postinst" "${STAGE}/DEBIAN/prerm" "${STAGE}/DEBIAN/postrm"
+render "${PROJECT_DIR}/deb/postinst"  > "${STAGE}/DEBIAN/postinst"
+render "${PROJECT_DIR}/deb/prerm"     > "${STAGE}/DEBIAN/prerm"
+render "${PROJECT_DIR}/deb/postrm"    > "${STAGE}/DEBIAN/postrm"
+render "${PROJECT_DIR}/deb/config"    > "${STAGE}/DEBIAN/config"
+render "${PROJECT_DIR}/deb/templates" > "${STAGE}/DEBIAN/templates"
+chmod 0755 "${STAGE}/DEBIAN/postinst" "${STAGE}/DEBIAN/prerm" "${STAGE}/DEBIAN/postrm" "${STAGE}/DEBIAN/config"
+chmod 0644 "${STAGE}/DEBIAN/templates"
 
 # 计算 Installed-Size（以 KB 计）
 INSTALLED_SIZE="$(du -sk --exclude=DEBIAN "${STAGE}" | cut -f1)"
@@ -95,7 +98,7 @@ Section: net
 Priority: optional
 Architecture: ${ARCH}
 Maintainer: OAHD
-Depends: libc6 (>= 2.31)
+Depends: libc6 (>= 2.31), debconf (>= 0.5) | debconf-2.0
 Installed-Size: ${INSTALLED_SIZE}
 Description: ${NAME} - OAHD 计划的核心网络层
   基于 libp2p 的去中心化 P2P 节点网络。通过 Kademlia DHT 实现节点自动发现与服务注册查询；

@@ -1,0 +1,231 @@
+Template: @PKG@/setup_mode
+Type: select
+Choices: wizard, keep, skip
+Default: wizard
+Priority: high
+Description: 配置方式 / Configuration mode:
+ wizard: 使用安装向导 / guided setup
+ keep: 保留现有配置 / keep existing config
+ skip: 跳过向导，使用默认配置并手动启动 / skip and use defaults
+
+Template: @PKG@/node_name
+Type: string
+Default: NexusNet
+Priority: high
+Description: 节点名称 / Node name:
+
+Template: @PKG@/node_description
+Type: string
+Default: NexusNet P2P node
+Priority: high
+Description: 节点描述 / Node description:
+
+Template: @PKG@/role
+Type: select
+Choices: nat, direct, custom
+Default: nat
+Priority: high
+Description: 节点角色 / Node role:
+ nat: NAT/客户端，不监听，使用 relay / client behind NAT
+ direct: 公网/直连，监听 IPv4/IPv6 / public or direct node
+ custom: 手动选择监听地址族 / custom listen families
+
+Template: @PKG@/ipv4_enabled
+Type: boolean
+Default: false
+Priority: high
+Description: 是否监听 IPv4 / Listen on IPv4:
+
+Template: @PKG@/ipv6_enabled
+Type: boolean
+Default: false
+Priority: high
+Description: 是否监听 IPv6 / Listen on IPv6:
+
+Template: @PKG@/port
+Type: string
+Default: 5000
+Priority: high
+Description: WebSocket TCP 端口 / WebSocket TCP port:
+
+Template: @PKG@/bootstrap
+Type: string
+Priority: high
+Description: bootstrap 节点 / Bootstrap nodes:
+ 逗号分隔，必须包含 /ws 和 /p2p/<PeerId>，例如
+ /ip4/1.2.3.4/tcp/5000/ws/p2p/12D3KooW...
+ Comma-separated multiaddrs; /ws and /p2p/<PeerId> are required.
+
+Template: @PKG@/local_services
+Type: string
+Priority: high
+Description: 本地服务 / Local services:
+ 逗号分隔，格式 name:port 或 name:port:auth，例如 ocr:5014
+ Comma-separated name:port[:auth].
+
+Template: @PKG@/pq_transport
+Type: boolean
+Default: false
+Priority: high
+Description: 启用 PQ 传输 / Enable PQ transport:
+
+Template: @PKG@/pq_identity
+Type: boolean
+Default: false
+Priority: high
+Description: 启用 PQ 身份 / Enable PQ identity:
+
+Template: @PKG@/pq_required
+Type: boolean
+Default: false
+Priority: high
+Description: 要求对端必须支持 PQ / Require PQ peers:
+
+Template: @PKG@/auth_network
+Type: string
+Default: none
+Priority: high
+Description: 鉴权网络 / Authentication network:
+ 填 none 表示关闭；向导只支持一个网络 / none disables auth; one network only.
+
+Template: @PKG@/auth_authority
+Type: string
+Priority: high
+Description: 鉴权网络 Authority 公钥 / Authority public key:
+ base64 Ed25519 公钥；auth_network 为 none 时留空 / base64 Ed25519 key, empty when auth is none.
+
+Template: @PKG@/allow_bootstrap
+Type: boolean
+Default: true
+Priority: low
+Description: 允许作为 bootstrap / Allow bootstrap role:
+
+Template: @PKG@/accept_bootstrap_providers
+Type: boolean
+Default: false
+Priority: low
+Description: 接受 Identify 发现的 bootstrap provider / Accept bootstrap providers:
+
+Template: @PKG@/ping_enabled
+Type: boolean
+Default: true
+Priority: low
+Description: 启用 Ping / Enable Ping:
+
+Template: @PKG@/ping_interval
+Type: string
+Default: 15
+Priority: low
+Description: Ping 间隔秒数 / Ping interval seconds:
+
+Template: @PKG@/ping_timeout
+Type: string
+Default: 10
+Priority: low
+Description: Ping 超时秒数 / Ping timeout seconds:
+
+Template: @PKG@/ping_failures
+Type: string
+Default: 2
+Priority: low
+Description: Ping 连续失败数 / Ping max failures:
+
+Template: @PKG@/kademlia_enabled
+Type: boolean
+Default: true
+Priority: low
+Description: 启用 Kademlia / Enable Kademlia:
+
+Template: @PKG@/kademlia_ttl
+Type: string
+Default: 3600
+Priority: low
+Description: Kademlia 记录 TTL 秒数 / Kademlia record TTL seconds:
+
+Template: @PKG@/kademlia_replication
+Type: string
+Default: 20
+Priority: low
+Description: Kademlia 复制因子 / Kademlia replication factor:
+
+Template: @PKG@/kademlia_query_timeout
+Type: string
+Default: 60
+Priority: low
+Description: Kademlia 查询超时秒数 / Kademlia query timeout seconds:
+
+Template: @PKG@/dispatcher_enabled
+Type: boolean
+Default: true
+Priority: low
+Description: 启用 Dispatcher / Enable Dispatcher:
+
+Template: @PKG@/dispatcher_query_timeout
+Type: string
+Default: 60
+Priority: low
+Description: Dispatcher 查询超时秒数 / Dispatcher query timeout seconds:
+
+Template: @PKG@/types_sync
+Type: string
+Default: 300
+Priority: low
+Description: 类型索引同步秒数 / Service-type sync seconds:
+
+Template: @PKG@/dispatcher_inflight
+Type: string
+Default: 4
+Priority: low
+Description: Dispatcher DHT 并发上限 / Dispatcher max inflight DHT:
+
+Template: @PKG@/request_mib
+Type: string
+Default: 16
+Priority: low
+Description: 请求大小上限 MiB / Max request MiB:
+
+Template: @PKG@/response_mib
+Type: string
+Default: 16
+Priority: low
+Description: 响应大小上限 MiB / Max response MiB:
+
+Template: @PKG@/registry_inflight
+Type: string
+Default: 4
+Priority: low
+Description: Registry DHT 并发上限 / Registry max inflight DHT:
+
+Template: @PKG@/relay_retry
+Type: string
+Default: 60
+Priority: low
+Description: Relay 重试间隔秒数 / Relay retry seconds:
+
+Template: @PKG@/relay_failures
+Type: string
+Default: 3
+Priority: low
+Description: Relay 最大连续失败次数 / Relay max failures:
+
+Template: @PKG@/compat_max
+Type: string
+Default: 14336
+Priority: low
+Description: Compat 单条记录上限 / Compat max record bytes:
+
+Template: @PKG@/skip_note
+Type: note
+Priority: high
+Description: 已跳过 NexusNet 配置向导 / NexusNet setup skipped
+ 默认配置已生成，服务未启动。编辑 /etc/@PKG@/config.toml 后执行：
+ systemctl enable --now @PKG@
+ Default config was generated and the service was not started.
+
+Template: @PKG@/legacy_note
+Type: note
+Priority: high
+Description: NexusNet 配置需要更新 / NexusNet config needs attention
+ ${ERROR}
+ 服务已停止并禁用。请运行 dpkg-reconfigure @PKG@ 或手动修改 /etc/@PKG@/config.toml。
+ The service has been stopped and disabled.

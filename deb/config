@@ -1,0 +1,105 @@
+#!/bin/sh
+set -e
+
+. /usr/share/debconf/confmodule
+
+PKG="@PKG@"
+CONFIG="/etc/${PKG}/config.toml"
+
+db_version 2.0 || true
+
+db_fget "${PKG}/setup_mode" seen || true
+if [ "${RET:-false}" = "true" ] && [ "${DEBCONF_RECONFIGURE:-}" != "1" ]; then
+    exit 0
+fi
+
+if [ -f "${CONFIG}" ] && [ "${DEBCONF_RECONFIGURE:-}" != "1" ]; then
+    db_set "${PKG}/setup_mode" keep || true
+    db_fset "${PKG}/setup_mode" seen true || true
+    exit 0
+fi
+if [ -f "${CONFIG}" ]; then
+    db_set "${PKG}/setup_mode" keep || true
+elif [ "${DEBIAN_FRONTEND:-}" = "noninteractive" ]; then
+    db_set "${PKG}/setup_mode" skip || true
+    db_fset "${PKG}/setup_mode" seen true || true
+    exit 0
+fi
+
+db_input high "${PKG}/setup_mode" || true
+db_go || true
+
+db_get "${PKG}/setup_mode" || true
+MODE="${RET:-wizard}"
+case "${MODE}" in
+    skip|keep) exit 0 ;;
+esac
+
+db_input high "${PKG}/node_name" || true
+db_input high "${PKG}/node_description" || true
+db_input high "${PKG}/role" || true
+db_go || true
+
+db_get "${PKG}/role" || true
+ROLE="${RET:-nat}"
+
+db_fget "${PKG}/ipv4_enabled" seen || true
+if [ "${RET:-false}" != "true" ]; then
+    case "${ROLE}" in
+        direct) db_set "${PKG}/ipv4_enabled" true || true ;;
+        nat) db_set "${PKG}/ipv4_enabled" false || true ;;
+    esac
+fi
+db_fget "${PKG}/ipv6_enabled" seen || true
+if [ "${RET:-false}" != "true" ]; then
+    case "${ROLE}" in
+        direct) db_set "${PKG}/ipv6_enabled" true || true ;;
+        nat) db_set "${PKG}/ipv6_enabled" false || true ;;
+    esac
+fi
+
+db_input high "${PKG}/ipv4_enabled" || true
+db_input high "${PKG}/ipv6_enabled" || true
+db_input high "${PKG}/port" || true
+db_input high "${PKG}/bootstrap" || true
+db_input high "${PKG}/local_services" || true
+db_input high "${PKG}/pq_transport" || true
+db_input high "${PKG}/pq_identity" || true
+db_input high "${PKG}/pq_required" || true
+db_input high "${PKG}/auth_network" || true
+db_input high "${PKG}/auth_authority" || true
+db_go || true
+
+db_get "${PKG}/pq_required" || true
+if [ "${RET:-false}" = "true" ]; then
+    db_set "${PKG}/pq_transport" true || true
+fi
+
+db_get "${PKG}/auth_network" || true
+if [ "${RET:-none}" = "none" ]; then
+    db_set "${PKG}/auth_authority" "" || true
+fi
+
+db_input low "${PKG}/allow_bootstrap" || true
+db_input low "${PKG}/accept_bootstrap_providers" || true
+db_input low "${PKG}/ping_enabled" || true
+db_input low "${PKG}/ping_interval" || true
+db_input low "${PKG}/ping_timeout" || true
+db_input low "${PKG}/ping_failures" || true
+db_input low "${PKG}/kademlia_enabled" || true
+db_input low "${PKG}/kademlia_ttl" || true
+db_input low "${PKG}/kademlia_replication" || true
+db_input low "${PKG}/kademlia_query_timeout" || true
+db_input low "${PKG}/dispatcher_enabled" || true
+db_input low "${PKG}/dispatcher_query_timeout" || true
+db_input low "${PKG}/types_sync" || true
+db_input low "${PKG}/dispatcher_inflight" || true
+db_input low "${PKG}/request_mib" || true
+db_input low "${PKG}/response_mib" || true
+db_input low "${PKG}/registry_inflight" || true
+db_input low "${PKG}/relay_retry" || true
+db_input low "${PKG}/relay_failures" || true
+db_input low "${PKG}/compat_max" || true
+db_go || true
+
+exit 0

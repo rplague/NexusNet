@@ -1,14 +1,13 @@
 #!/bin/sh
-# @BIN@ deb 包 postinst
-# 参数:
-#   $1=configure     安装 或 升级
-#   $2=旧版本号       首次安装为空，升级时为被替换的版本
-#
-# 运行账号固定为 NexusNet 的专用用户 `nexusnet` 账号缺失时创建
 set -e
+
+. /usr/share/debconf/confmodule
 
 USER_NAME="@USER@"
 UNIT_NAME="@PKG@"
+BIN_NAME="@BIN@"
+PKG="@PKG@"
+CONFIG="/etc/${PKG}/config.toml"
 
 create_system_user() {
     if id "${USER_NAME}" >/dev/null 2>&1; then
@@ -21,11 +20,11 @@ create_system_user() {
 
 create_dirs() {
     if command -v systemd-tmpfiles >/dev/null 2>&1; then
-        systemd-tmpfiles --create /usr/lib/tmpfiles.d/@PKG@.conf >/dev/null 2>&1 || true
+        systemd-tmpfiles --create /usr/lib/tmpfiles.d/"${PKG}".conf >/dev/null 2>&1 || true
     else
-        mkdir -p /etc/@PKG@ /var/lib/@PKG@
-        chown "${USER_NAME}:${USER_NAME}" /etc/@PKG@ /var/lib/@PKG@ || true
-        chmod 0755 /etc/@PKG@; chmod 0700 /var/lib/@PKG@
+        mkdir -p /etc/"${PKG}" /var/lib/"${PKG}"
+        chown "${USER_NAME}:${USER_NAME}" /etc/"${PKG}" /var/lib/"${PKG}" || true
+        chmod 0755 /etc/"${PKG}"; chmod 0700 /var/lib/"${PKG}"
     fi
 }
 
@@ -38,23 +37,297 @@ ensure_persistent_journal() {
     fi
 }
 
-case "$1" in
-    configure)
-        create_system_user
-        create_dirs
-        ensure_persistent_journal
-        systemctl daemon-reload >/dev/null 2>&1 || true
-        systemctl enable "${UNIT_NAME}" >/dev/null 2>&1 || true
-        if [ -n "${2:-}" ] && systemctl is-active --quiet "${UNIT_NAME}" 2>/dev/null; then
-            # 升级/重配置且服务原本在运行：平滑重启
-            systemctl try-restart "${UNIT_NAME}" >/dev/null 2>&1 || true
-        else
-            systemctl restart "${UNIT_NAME}" >/dev/null 2>&1 || true
+json_escape() {
+    printf '%s' "$1" | tr '\n\r' '  ' | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/	/\\t/g'
+}
+
+json_bool() {
+    case "$1" in
+        true|TRUE|1|yes|on) printf 'true' ;;
+        *) printf 'false' ;;
+    esac
+}
+
+json_num() {
+    case "$1" in
+        ''|*[!0-9]*) printf '%s' "$2" ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+
+json_csv() {
+    _in="$1"
+    _out=""
+    _first=1
+    _oldifs="$IFS"
+    IFS=','
+    for _item in $_in; do
+        _item=$(printf '%s' "$_item" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        [ -z "$_item" ] && continue
+        _esc=$(json_escape "$_item")
+        [ "$_first" -eq 0 ] && _out="${_out},"
+        _out="${_out}\"${_esc}\""
+        _first=0
+    done
+    IFS="$_oldifs"
+    printf '[%s]' "$_out"
+}
+
+json_services() {
+    _in="$1"
+    _out=""
+    _first=1
+    _oldifs="$IFS"
+    IFS=','
+    for _item in $_in; do
+        _item=$(printf '%s' "$_item" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        [ -z "$_item" ] && continue
+        _name="${_item%%:*}"
+        _rest="${_item#*:}"
+        _port="${_rest%%:*}"
+        _auth=""
+        if [ "$_rest" != "$_port" ]; then
+            _auth="${_rest#*:}"
         fi
-        ;;
-    abort-upgrade)
+        _port=$(json_num "$_port" 0)
+        _req=false
+        case "$_auth" in
+            1|true|TRUE|yes|on) _req=true ;;
+        esac
+        _name=$(json_escape "$_name")
+        _auth=$(json_escape "$_auth")
+        [ "$_first" -eq 0 ] && _out="${_out},"
+        _out="${_out}{\"name\":\"${_name}\",\"port\":${_port},\"require_auth\":${_req}}"
+        _first=0
+    done
+    IFS="$_oldifs"
+    printf '[%s]' "$_out"
+}
+
+db_get_mode() {
+    db_get "${PKG}/setup_mode" || true
+    MODE="${RET:-keep}"
+}
+
+db_get_value() {
+    db_get "${PKG}/$1" || true
+    printf '%s' "${RET:-$2}"
+}
+
+case "${1:-configure}" in
+    configure) ;;
+    abort-upgrade|abort-remove|abort-deconfigure)
         systemctl daemon-reload >/dev/null 2>&1 || true
+        exit 0
+        ;;
+    *)
+        exit 0
         ;;
 esac
+
+create_system_user
+create_dirs
+ensure_persistent_journal
+
+WAS_ENABLED="$(systemctl is-enabled "${UNIT_NAME}" 2>/dev/null || true)"
+CONFIG_EXISTS=0
+if [ -f "${CONFIG}" ]; then
+    CONFIG_EXISTS=1
+fi
+
+db_get_mode
+if [ "${CONFIG_EXISTS}" -eq 0 ] && [ "${MODE}" = "keep" ]; then
+    MODE="skip"
+fi
+
+CHECK_FAILED=0
+CHECK_OUTPUT=""
+
+if [ "${MODE}" = "wizard" ]; then
+    NODE_NAME="$(db_get_value node_name NexusNet)"
+    NODE_DESCRIPTION="$(db_get_value node_description 'NexusNet P2P node')"
+    ROLE="$(db_get_value role nat)"
+    IPV4="$(json_bool "$(db_get_value ipv4_enabled false)")"
+    IPV6="$(json_bool "$(db_get_value ipv6_enabled false)")"
+    PORT="$(json_num "$(db_get_value port 5000)" 5000)"
+    BOOTSTRAP="$(db_get_value bootstrap '')"
+    LOCAL_SERVICES="$(db_get_value local_services '')"
+    ALLOW_BOOTSTRAP="$(json_bool "$(db_get_value allow_bootstrap true)")"
+    ACCEPT_PROVIDERS="$(json_bool "$(db_get_value accept_bootstrap_providers false)")"
+    PQ_TRANSPORT="$(json_bool "$(db_get_value pq_transport false)")"
+    PQ_IDENTITY="$(json_bool "$(db_get_value pq_identity false)")"
+    PQ_REQUIRED="$(json_bool "$(db_get_value pq_required false)")"
+    AUTH_NETWORK="$(db_get_value auth_network none)"
+    AUTH_AUTHORITY="$(db_get_value auth_authority '')"
+    PING_ENABLED="$(json_bool "$(db_get_value ping_enabled true)")"
+    PING_INTERVAL="$(json_num "$(db_get_value ping_interval 15)" 15)"
+    PING_TIMEOUT="$(json_num "$(db_get_value ping_timeout 10)" 10)"
+    PING_FAILURES="$(json_num "$(db_get_value ping_failures 2)" 2)"
+    KADEMLIA_ENABLED="$(json_bool "$(db_get_value kademlia_enabled true)")"
+    KADEMLIA_TTL="$(json_num "$(db_get_value kademlia_ttl 3600)" 3600)"
+    KADEMLIA_REPLICATION="$(json_num "$(db_get_value kademlia_replication 20)" 20)"
+    KADEMLIA_TIMEOUT="$(json_num "$(db_get_value kademlia_query_timeout 60)" 60)"
+    DISPATCHER_ENABLED="$(json_bool "$(db_get_value dispatcher_enabled true)")"
+    DISPATCHER_TIMEOUT="$(json_num "$(db_get_value dispatcher_query_timeout 60)" 60)"
+    TYPES_SYNC="$(json_num "$(db_get_value types_sync 300)" 300)"
+    DISPATCHER_INFLIGHT="$(json_num "$(db_get_value dispatcher_inflight 4)" 4)"
+    REQUEST_MIB="$(json_num "$(db_get_value request_mib 16)" 16)"
+    RESPONSE_MIB="$(json_num "$(db_get_value response_mib 16)" 16)"
+    REGISTRY_INFLIGHT="$(json_num "$(db_get_value registry_inflight 4)" 4)"
+    RELAY_RETRY="$(json_num "$(db_get_value relay_retry 60)" 60)"
+    RELAY_FAILURES="$(json_num "$(db_get_value relay_failures 3)" 3)"
+    COMPAT_MAX="$(json_num "$(db_get_value compat_max 14336)" 14336)"
+
+    if [ -z "${AUTH_NETWORK}" ] || [ "${AUTH_NETWORK}" = "none" ]; then
+        AUTH_NETWORK="none"
+        AUTH_AUTHORITY=""
+    fi
+    if [ "${PQ_REQUIRED}" = "true" ]; then
+        PQ_TRANSPORT="true"
+    fi
+
+    if [ "${IPV4}" = "false" ] && [ "${IPV6}" = "false" ] && [ -z "${BOOTSTRAP}" ]; then
+        echo "NexusNet: 未启用监听且未配置 bootstrap，节点无法联网。请重新运行 dpkg-reconfigure ${PKG}。" >&2
+        systemctl disable --now "${UNIT_NAME}" >/dev/null 2>&1 || true
+        db_stop || true
+        exit 1
+    fi
+
+    TMPDIR="$(mktemp -d)"
+    trap 'rm -rf "${TMPDIR}"' EXIT
+
+    NODE_NAME_ESC="$(json_escape "${NODE_NAME}")"
+    NODE_DESC_ESC="$(json_escape "${NODE_DESCRIPTION}")"
+    BOOTSTRAP_JSON="$(json_csv "${BOOTSTRAP}")"
+    SERVICES_JSON="$(json_services "${LOCAL_SERVICES}")"
+    AUTH_NETWORK_ESC="$(json_escape "${AUTH_NETWORK}")"
+    AUTH_AUTHORITY_ESC="$(json_escape "${AUTH_AUTHORITY}")"
+    if [ "${AUTH_NETWORK}" = "none" ]; then
+        AUTH_NETWORKS="{}"
+    else
+        AUTH_NETWORKS="{\"${AUTH_NETWORK_ESC}\":{\"authority\":\"${AUTH_AUTHORITY_ESC}\"}}"
+    fi
+    REQUEST_BYTES=$((REQUEST_MIB * 1048576))
+    RESPONSE_BYTES=$((RESPONSE_MIB * 1048576))
+
+    cat > "${TMPDIR}/basic.json" <<EOF
+{
+  "node": {
+    "name": "${NODE_NAME_ESC}",
+    "description": "${NODE_DESC_ESC}",
+    "allow_bootstrap": ${ALLOW_BOOTSTRAP},
+    "accept_bootstrap_providers": ${ACCEPT_PROVIDERS}
+  },
+  "network": {
+    "ipv4_enabled": ${IPV4},
+    "ipv6_enabled": ${IPV6},
+    "port": ${PORT}
+  },
+  "services": {
+    "kademlia": { "bootstrap_nodes": ${BOOTSTRAP_JSON} },
+    "dispatcher": { "local_services": ${SERVICES_JSON} }
+  },
+  "crypto": {
+    "pq_transport_enabled": ${PQ_TRANSPORT},
+    "pq_identity_enabled": ${PQ_IDENTITY},
+    "pq_required": ${PQ_REQUIRED}
+  },
+  "auth": {
+    "network": "${AUTH_NETWORK_ESC}",
+    "networks": ${AUTH_NETWORKS}
+  }
+}
+EOF
+    cat > "${TMPDIR}/advanced.json" <<EOF
+{
+  "services": {
+    "ping": {
+      "enabled": ${PING_ENABLED},
+      "interval_secs": ${PING_INTERVAL},
+      "with_timeout": ${PING_TIMEOUT},
+      "max_failures": ${PING_FAILURES}
+    },
+    "kademlia": {
+      "enabled": ${KADEMLIA_ENABLED},
+      "record_ttl_seconds": ${KADEMLIA_TTL},
+      "replication_factor": ${KADEMLIA_REPLICATION},
+      "query_timeout_seconds": ${KADEMLIA_TIMEOUT}
+    },
+    "dispatcher": {
+      "enabled": ${DISPATCHER_ENABLED},
+      "query_timeout_secs": ${DISPATCHER_TIMEOUT},
+      "types_sync_secs": ${TYPES_SYNC},
+      "max_inflight_dht": ${DISPATCHER_INFLIGHT},
+      "max_request_bytes": ${REQUEST_BYTES},
+      "max_response_bytes": ${RESPONSE_BYTES}
+    },
+    "registry": {
+      "max_inflight_dht": ${REGISTRY_INFLIGHT}
+    },
+    "relay": {
+      "retry_interval_secs": ${RELAY_RETRY},
+      "max_failures": ${RELAY_FAILURES}
+    }
+  },
+  "compat": {
+    "max_record_bytes": ${COMPAT_MAX}
+  }
+}
+EOF
+
+    if ! /usr/bin/"${BIN_NAME}" --setup "${TMPDIR}/basic.json" --advanced "${TMPDIR}/advanced.json" --config-dir /etc/"${PKG}" --backup; then
+        systemctl disable --now "${UNIT_NAME}" >/dev/null 2>&1 || true
+        db_stop || true
+        exit 1
+    fi
+elif [ "${MODE}" = "skip" ]; then
+    if [ "${CONFIG_EXISTS}" -eq 0 ]; then
+        if ! /usr/bin/"${BIN_NAME}" --defaults --config-dir /etc/"${PKG}"; then
+            systemctl disable --now "${UNIT_NAME}" >/dev/null 2>&1 || true
+            db_stop || true
+            exit 1
+        fi
+    fi
+else
+    if [ "${CONFIG_EXISTS}" -eq 0 ]; then
+        if ! /usr/bin/"${BIN_NAME}" --defaults --config-dir /etc/"${PKG}"; then
+            db_stop || true
+            exit 1
+        fi
+    elif ! CHECK_OUTPUT="$(/usr/bin/"${BIN_NAME}" --check-config --config-dir /etc/"${PKG}" 2>&1)"; then
+        CHECK_FAILED=1
+    fi
+fi
+
+if [ -f "${CONFIG}" ]; then
+    chown "${USER_NAME}":"${USER_NAME}" "${CONFIG}" 2>/dev/null || chown "${USER_NAME}" "${CONFIG}" 2>/dev/null || true
+    chmod 0644 "${CONFIG}" 2>/dev/null || true
+fi
+
+systemctl daemon-reload >/dev/null 2>&1 || true
+
+if [ "${CHECK_FAILED}" -eq 1 ]; then
+    systemctl disable --now "${UNIT_NAME}" >/dev/null 2>&1 || true
+    db_subst "${PKG}/legacy_note" ERROR "${CHECK_OUTPUT}" || true
+    db_input critical "${PKG}/legacy_note" || true
+    db_go || true
+elif [ "${MODE}" = "wizard" ]; then
+    systemctl enable "${UNIT_NAME}" >/dev/null 2>&1 || true
+    systemctl restart "${UNIT_NAME}" >/dev/null 2>&1 || true
+elif [ "${MODE}" = "keep" ] && [ "${WAS_ENABLED}" = "enabled" ]; then
+    systemctl enable "${UNIT_NAME}" >/dev/null 2>&1 || true
+    systemctl restart "${UNIT_NAME}" >/dev/null 2>&1 || true
+else
+    systemctl disable --now "${UNIT_NAME}" >/dev/null 2>&1 || true
+    if [ "${MODE}" = "skip" ] || { [ "${MODE}" = "keep" ] && [ "${CONFIG_EXISTS}" -eq 0 ]; }; then
+        db_input high "${PKG}/skip_note" || true
+        db_go || true
+    fi
+fi
+
+db_set "${PKG}/setup_mode" keep || true
+db_fset "${PKG}/setup_mode" seen true || true
+db_go || true
+db_stop || true
 
 exit 0

@@ -12,6 +12,11 @@ jobs:
     env:
       RUST_BACKTRACE: "1"
     steps:
+      - name: 检查安装脚本语法 | Check installer shell syntax
+        run: |
+          for f in deb/config deb/postinst deb/prerm deb/postrm; do
+            sh -n "$f"
+          done
       - name: 运行测试 | Run tests
         run: cargo test --verbose
 
