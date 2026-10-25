@@ -1,0 +1,32 @@
+{
+  "node": {
+    "name": "Windows-Node",
+    "description": "NexusNet Windows node",
+    "allow_bootstrap": true,
+    "accept_bootstrap_providers": false
+  },
+  "network": {
+    "ipv4_enabled": false,
+    "ipv6_enabled": false,
+    "port": 5000
+  },
+  "services": {
+    "kademlia": {
+      "bootstrap_nodes": [
+        "/ip4/167.99.153.118/tcp/5000/ws/p2p/12D3KooWGxp7radf7fBFk7E7J5yyu3xc7yNoS1AutJfH1K5dUm4F"
+      ]
+    },
+    "dispatcher": {
+      "local_services": []
+    }
+  },
+  "crypto": {
+    "pq_transport_enabled": false,
+    "pq_identity_enabled": false,
+    "pq_required": false
+  },
+  "auth": {
+    "network": "none",
+    "networks": {}
+  }
+}

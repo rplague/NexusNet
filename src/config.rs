@@ -114,7 +114,7 @@ pub struct NodeConfig {
 }
 
 impl NodeConfig {
-    fn validate(&self) -> Result<(), String> {
+    pub(crate) fn validate(&self) -> Result<(), String> {
         if self.network.port > u16::MAX as u32 {
             return Err(format!(
                 "network.port 超出范围: {} (最大 {})",

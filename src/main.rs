@@ -26,6 +26,7 @@ mod network;
 mod paths;
 mod service_dispatcher;
 mod service_protocol;
+mod setup;
 mod sidecar_protocol;
 
 use crate::config::ConfigHandle;
@@ -46,6 +47,10 @@ use crate::sidecar_protocol::Message;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    if let Some(code) = setup::run_from_args() {
+        std::process::exit(code);
+    }
+
     let config_handle = ConfigHandle::load_or_create_default();
     let mut key_manager = KeyManager::load_or_create(paths::fail_path_gener(
         paths::FailType::Keypair,
