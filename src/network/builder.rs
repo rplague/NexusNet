@@ -22,7 +22,7 @@ use crate::network::NetworkError;
 use crate::network::addr::to_multiaddr;
 use crate::network::behaviour::NetBehaviour;
 use crate::{LogLevel, LogStruct};
-use libp2p::{Multiaddr, Swarm, SwarmBuilder, identity, noise, tcp, yamux};
+use libp2p::{Multiaddr, Swarm, SwarmBuilder, identity, noise, tcp, tls, yamux};
 use std::net::IpAddr;
 use std::time::Duration;
 
@@ -56,15 +56,20 @@ pub fn build_swarm(
         addrs
     };
 
+    // Prefer TLS (recognizable to DPI/firewalls) and fall back to Noise for
+    // older peers that only advertise /noise.
     let mut swarm = SwarmBuilder::with_existing_identity(keypair.clone())
         .with_tokio()
         .with_tcp(
             tcp::Config::default(),
-            noise::Config::new,
+            (tls::Config::new, noise::Config::new),
             yamux::Config::default,
         )
         .map_err(|e| NetworkError::Build(e.to_string()))?
-        .with_relay_client(noise::Config::new, yamux::Config::default)
+        .with_relay_client(
+            (tls::Config::new, noise::Config::new),
+            yamux::Config::default,
+        )
         .map_err(|e| NetworkError::Build(e.to_string()))?
         .with_behaviour(|keypair, relay_client| {
             NetBehaviour::new(&config_clone, keypair, relay_client)
