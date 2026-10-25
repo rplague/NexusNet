@@ -731,6 +731,7 @@ impl SwarmActor {
                 .emit();
             }
             SwarmEvent::IncomingConnectionError {
+                local_addr,
                 send_back_addr,
                 error,
                 ..
@@ -738,7 +739,7 @@ impl SwarmActor {
                 LogStruct::new(
                     LogLevel::Error,
                     "入站连接失败",
-                    format!("{send_back_addr}: {error}"),
+                    format!("local={local_addr} remote={send_back_addr} error={error:?}"),
                 )
                 .emit();
             }
