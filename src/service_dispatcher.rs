@@ -132,6 +132,8 @@ fn route_local(ready: &HashSet<String>, my_peer_id: PeerId, msg: &Message) -> Lo
 pub struct ServiceDispatcher {
     inbound_rx: mpsc::Receiver<InboundRequest>,
     event_rx: mpsc::Receiver<BackendEvent>,
+    /// Keeps the backend event channel open even when there are no backends.
+    _event_tx: mpsc::Sender<BackendEvent>,
     to_controller_tx: mpsc::Sender<ToController>,
     /// Service name -> command sender for its backend task.
     backends: HashMap<String, mpsc::Sender<BackendCmd>>,
@@ -205,6 +207,7 @@ impl ServiceDispatcher {
             Self {
                 inbound_rx,
                 event_rx,
+                _event_tx: event_tx,
                 to_controller_tx,
                 backends,
                 my_peer_id,
