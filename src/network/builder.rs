@@ -80,8 +80,8 @@ pub fn build_swarm(
 
     for addr in listen_addrs {
         swarm
-            .listen_on(addr)
-            .map_err(|e| NetworkError::Build(e.to_string()))?;
+            .listen_on(addr.clone())
+            .map_err(|e| NetworkError::Build(format!("listen_on {addr}: {e:?}")))?;
     }
 
     // Confirm externally reachable addresses: broadcast by Identify and used
