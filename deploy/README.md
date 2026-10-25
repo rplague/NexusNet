@@ -17,7 +17,7 @@ NexusNet 以原生的 Debian 打包（`.deb`）分发，由 `dpkg`/`apt` 管理�
 
 | 文件 | 路径 | 属主/权限 | 说明 |
 |---|---|---|---|
-| 配置 | `/etc/<pkg>/config.toml` | `nexusnet:nexusnet 0755` | **首启由程序自动生成**（不随包分发） |
+| 配置 | `/etc/<pkg>/config.toml` | `nexusnet:nexusnet 0755` | debconf 向导生成；跳过向导时生成默认配置 |
 | 数据 | `/var/lib/<pkg>/keypair.bin` | `nexusnet:nexusnet 0700` | 节点身份，不可丢失 |
 | 日志 | journald | — | 由 systemd 采集/轮转/压缩/保留 |
 | 二进制 | `/usr/bin/<bin>` | `root:root 0755` | 主程序 |
@@ -40,7 +40,7 @@ NexusNet 以原生的 Debian 打包（`.deb`）分发，由 `dpkg`/`apt` 管理�
 - 本版本只使用 WebSocket over HTTP；`network.port` 是 WebSocket TCP 端口。
 - bootstrap 地址必须带 `/ws`，例如
   `/ip6/.../tcp/5000/ws/p2p/<PeerId>`。
-- 旧版 raw TCP 节点不兼容，所有节点必须升级到 0.6.0。
+- 旧版 raw TCP 节点不兼容，所有节点必须使用 0.6.x；当前发布版本 0.6.1。
 
 ## 安装
 
@@ -51,7 +51,61 @@ apt install -y ./<pkg>_<version>_amd64.deb
 ```
 
 安装过程（postinst）自动：确保专用用户 `nexusnet` 存在、创建数据目录、确保 journald 持久化
-（创建 `/var/log/journal`）、`daemon-reload`、`enable` 并启动。
+（创建 `/var/log/journal`），然后读取 debconf 向导结果写入配置并处理服务状态。
+
+### 配置向导（debconf）
+
+首次安装会通过 debconf 询问常用配置：
+
+- 配置方式：向导 / 保留现有配置 / 跳过
+- 节点名、描述、角色
+- IPv4/IPv6 监听、端口
+- bootstrap（逗号分隔，必须带 `/ws`）
+- 本地服务（逗号分隔，`name:port[:auth]`）
+- PQ 开关、单个鉴权网络
+
+DHT、Ping、Dispatcher、Registry、Relay、Compat 等高级项使用 `low` 优先级，
+默认不显示；需要时执行：
+
+```bash
+sudo dpkg-reconfigure -plow <pkg>
+```
+
+重新配置会备份旧 `config.toml`，服务原本启用则重启。
+
+非交互安装：
+
+```bash
+DEBIAN_FRONTEND=noninteractive apt install -y ./<pkg>_<version>_amd64.deb
+```
+
+无 preseed 时按“跳过向导”处理：生成默认配置并 `systemctl disable --now <pkg>`，
+不会自动启动。需要无人值守配置时使用 preseed：
+
+```text
+<pkg> <pkg>/setup_mode select wizard
+<pkg> <pkg>/setup_mode seen true
+<pkg> <pkg>/node_name string node-01
+<pkg> <pkg>/bootstrap string /ip4/1.2.3.4/tcp/5000/ws/p2p/12D3KooW...
+```
+
+（`seen true` 用于让非交互安装确认该问题已预置；其余问题的值会被 postinst 直接读取。）
+
+跳过向导后手动启用：
+
+```bash
+sudo nano /etc/<pkg>/config.toml
+sudo systemctl enable --now <pkg>
+```
+
+### 服务状态
+
+- 向导完成：`systemctl enable` 并启动。
+- 跳过向导：生成默认配置，`systemctl disable --now`；用户配置后手动 `enable --now`。
+- 升级：保持原有 enabled 状态；enabled 才启动，disabled 不启动。
+- 旧版 raw TCP bootstrap：`--check-config` 检测到后停止并禁用服务，提示重新运行
+  `dpkg-reconfigure <pkg>` 或手动修改配置。
+- Debian 包不管理防火墙；直连节点需要自行放行 TCP 5000（或向导中配置的端口）。
 
 ```bash
 systemctl status <pkg>        # active (running)
@@ -66,7 +120,8 @@ journalctl -u <pkg> -f        # 查看运行日志（单行、带日志级别，
 apt install -y ./<pkg>_<新版本>.deb
 ```
 
-升级时 prerm 停止服务、postinst 重新启动，**保留** `keypair.bin` 身份。
+升级时 prerm 停止服务；postinst 保留 `keypair.bin` 和现有 `config.toml`，并根据服务原有
+enabled 状态决定是否启动。0.6.x 检测到旧版 raw TCP bootstrap 时会禁用服务并提示重新配置。
 
 ## 卸载
 
@@ -97,9 +152,31 @@ apt purge <pkg>              # 彻底清除包配置
 | `service.service` | systemd 单元（打包素材，含 `@PKG@`/`@BIN@`/`@USER@` 占位符） |
 | `service.tmpfiles.conf` | 预建目录与属主（打包素材） |
 | `../deb/{postinst,prerm,postrm}` | Debian 维护脚本（打包素材） |
+| `../deb/{config,templates}` | debconf 配置向导（打包素材） |
 | `build-win.sh` | 交叉编译产物 + NSIS 组装 Windows 安装器与便携 zip，自动派生命名 |
 | `win/service.nsi` | NSIS 安装脚本（含 `@PKG@`/`@BIN@`/`@VERSION@` 等占位符） |
+| `win/common.nsh` / `win/wizard.nsh` | NSIS 向导页面、JSON 生成与校验 |
+| `win/setup.example.json` | 静默安装 `/SETUPFILE` 示例 |
 | `publish-release.sh` | 幂等发布：把指定目录内的文件上传到 Gitea Release（手动发布或旧 Gitea CI 使用；WebGit CI 仅构建，不上传产物） |
+
+## 安装器内部配置模式
+
+Windows 和 Debian 安装器共用同一个配置写入器：
+
+```bash
+NexusNet --setup <basic.json> [--advanced <advanced.json>] --config-dir <dir> [--backup]
+NexusNet --defaults --config-dir <dir>
+NexusNet --check-config --config-dir <dir>
+```
+
+- `--setup`：JSON 可只包含需要覆盖的字段，缺失字段使用 Rust 默认值；`--backup`
+  会把旧 `config.toml` 备份为 `config.toml.bak.<timestamp>`。
+- `--defaults`：仅在配置不存在时生成默认配置；已存在时保持不动。
+- `--check-config`：只读检查；退出码 `0` 有效、`2` 配置非法、`3` 旧版 raw TCP
+  bootstrap、`4` IO 错误。
+- Windows NSIS 写入 UTF-16LE JSON；Debian postinst 写入 UTF-8 JSON；两者都支持中文。
+
+正常服务启动不会解析这些参数。
 
 ## 手动构建 deb
 
@@ -148,21 +225,60 @@ NSSM 由脚本按固定版本（2.24）+ SHA256 下载缓存到 `target/nssm-cac
 |---|---|---|
 | 二进制 | `%ProgramFiles%\<pkg>\<bin>.exe` | 主程序 |
 | 包装器 | `%ProgramFiles%\<pkg>\nssm.exe` | NSSM，服务 ImagePath |
-| 配置 | `%ProgramData%\<pkg>\config.toml` | 首启自动生成 |
+| 配置 | `%ProgramData%\<pkg>\config.toml` | 向导生成；跳过时生成默认配置 |
 | 数据/日志 | `%ProgramData%\<pkg>` | 身份/日志文件 `log` 与轮转 `.gz` 同目录 |
 
 路径经 `NEXUSNET_CONFIG_PATH` / `NEXUSNET_KEYPAIR_PATH` / `NEXUSNET_LOG_PATH` 与
 `NEXUSNET_LOG_MODE=nssm` 锚定，由安装器以 NSSM `AppEnvironmentExtra` 注入，与 systemd
 单元同一契约。
 
+### 配置向导
+
+安装器包含完整向导，页面覆盖：
+
+- 配置方式（首次安装：向导 / 跳过；升级：保留 / 重新配置）
+- 节点名、描述、角色、bootstrap 权限
+- WebSocket 端口、IPv4/IPv6 监听、Windows 防火墙
+- bootstrap 地址（一行一个，必须包含 `/ws` 和 `/p2p/`）
+- 本地服务（一行一个 `name:port[:auth]`）
+- Ping/Kademlia、Dispatcher/Registry、Relay/Compat 高级页
+- PQ 与单个鉴权网络
+- 摘要确认
+
+首次安装可以跳过向导：安装器生成默认 `config.toml`，服务设为
+`SERVICE_DEMAND_START` 且不启动。完成提示会给出：
+
+```powershell
+notepad "$env:ProgramData\<pkg>\config.toml"
+sc.exe start <pkg>
+sc.exe config <pkg> start= auto
+```
+
+升级默认保留现有配置；选择“重新配置”时旧配置备份为
+`config.toml.bak.<timestamp>`，向导从默认值开始，不反向解析旧 TOML。0.6.x 检测到旧版 raw TCP bootstrap 时会阻断安装，
+提示重新配置。
+
+静默安装：
+
+```bat
+setup.exe /S /SETUPFILE=C:\deploy\nexusnet-setup.json
+```
+
+示例见 `deploy/win/setup.example.json`（其中的 PeerId 为占位，请替换）。没有 `/SETUPFILE` 时：已有配置保留，无配置则
+使用默认配置并保持手动启动。
+
+向导在监听启用且勾选防火墙时添加 `NexusNet (<pkg>)` 的 TCP 入站规则；卸载时删除。
+配置写入失败、端口非法或旧版 bootstrap 会在服务安装前中止。
+
 ### 安装 / 升级 / 卸载
 
-以管理员运行 `setup.exe`。安装过程：停删旧服务（升级场景）→ 释放文件 → 建数据目录并对
-`NT SERVICE\<pkg>` 授予写权限 → `nssm install` 并配置（自动启动、失败重启、Ctrl+C 优雅停止 15s）
-→ `sc.exe config obj= "NT SERVICE\<pkg>"` → 启动服务并写卸载项。
+以管理员运行 `setup.exe`。安装过程：停删旧服务（升级场景）→ 释放文件 → 建数据目录 →
+按向导写入配置并对 `NT SERVICE\<pkg>` 授予写权限 → 按模式配置 NSSM 服务
+（向导：自动启动并启动；跳过：手动启动）→ 写卸载项。
 
 - 服务账号：虚拟账号 `NT SERVICE\<pkg>`（无需密码），配置/日志目录已 ACL 放行。
-- 升级：运行新版本 `setup.exe`，`%ProgramData%\<pkg>` 保留。
+- 升级：运行新版本 `setup.exe`，`%ProgramData%\<pkg>` 保留；原有服务启动方式（自动/手动）保持。
+- 重新配置：旧配置备份，写入新配置，服务恢复自动启动并启动。
 - 卸载：应用和功能或 `uninstall.exe`；停删服务、删除 `%ProgramFiles%\<pkg>`，**保留** `%ProgramData%\<pkg>`。
 
 ```powershell

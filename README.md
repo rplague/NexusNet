@@ -55,7 +55,8 @@ cargo run
 
 ### 配置
 
-监听端口、bootstrap 节点等均通过 `config.toml` 配置；程序不解析命令行参数。
+监听端口、bootstrap 节点等均通过 `config.toml` 配置。正常服务不解析命令行参数；
+安装器使用内部的 `--setup` / `--defaults` / `--check-config` 模式生成和检查配置。
 
 ## 部署（systemd / deb）
 
@@ -65,18 +66,19 @@ cargo run
 apt install -y ./nexusnet_<version>_amd64.deb
 ```
 
-安装后服务自动启用（`postinst` 创建专用用户 `nexusnet`、目录并 `enable`），
+安装时通过 debconf 向导配置节点；安装后服务按向导结果启用。
+`postinst` 创建专用用户 `nexusnet`、目录并写入 `/etc/nexusnet/config.toml`。
 配置与数据落位到标准目录：
 
 | 文件 | 路径 | 说明 |
 |---|---|---|
-| 配置 | `/etc/nexusnet/config.toml` | 首启自动生成 |
+| 配置 | `/etc/nexusnet/config.toml` | debconf 向导生成；跳过向导时生成默认配置 |
 | 节点身份 | `/var/lib/nexusnet/keypair.bin` | 不可丢失，升级/卸载保留 |
 | 日志 | journald | systemd 采集/轮转/压缩/保留 |
 
 查看运行状态：`systemctl status nexusnet`；日志：`journalctl -u nexusnet -f`。
 
-Windows 侧提供交叉编译产出的 NSIS 安装器与便携 zip（NSSM 托管为系统服务，
+Windows 侧提供带配置向导的 NSIS 安装器与便携 zip（NSSM 托管为系统服务，
 以虚拟账号 `NT SERVICE\nexusnet` 运行），构建与安装见 [deploy/README.md](./deploy/README.md)。
 
 构建、升级、卸载等详见 [deploy/README.md](./deploy/README.md)。
@@ -389,7 +391,7 @@ TCP → HTTP WebSocket → multistream-select → TLS/Noise → Yamux → 应用
 
 ## 开发状态
 
-当前版本：**0.6.0** — 完成度 **6/10**
+当前版本：**0.6.1** — 完成度 **6/10**
 
 ## 许可
 
