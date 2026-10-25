@@ -62,6 +62,27 @@ render() {
         -e "s/@USER@/${SERVICE_USER}/g" "$1"
 }
 
+check_debconf_templates() {
+    awk '
+        /^[[:space:]]/ { next }
+        /^[[:space:]]*$/ { next }
+        /^#/ { next }
+        {
+            field = $1
+            sub(/:.*/, "", field)
+            if (field == "Template" || field == "Type" || field == "Choices" || field == "Default" ||
+                field == "Description" || field == "Extended-Description" ||
+                field == "Extended_description" ||
+                field ~ /^Choices-/ || field ~ /^Description-/) {
+                next
+            }
+            printf "invalid debconf template field: %s (line %d)\n", field, NR > "/dev/stderr"
+            bad = 1
+        }
+        END { exit bad }
+    ' "$1"
+}
+
 # 清理并准备暂存目录
 rm -rf "${STAGE}"
 mkdir -p "${STAGE}/DEBIAN" \
@@ -79,6 +100,7 @@ chmod 0644 "${STAGE}/lib/systemd/system/${UNIT_NAME}.service" \
            "${STAGE}/usr/lib/tmpfiles.d/${PKG}.conf"
 
 # 维护脚本
+check_debconf_templates "${PROJECT_DIR}/deb/templates"
 render "${PROJECT_DIR}/deb/postinst"  > "${STAGE}/DEBIAN/postinst"
 render "${PROJECT_DIR}/deb/prerm"     > "${STAGE}/DEBIAN/prerm"
 render "${PROJECT_DIR}/deb/postrm"    > "${STAGE}/DEBIAN/postrm"
