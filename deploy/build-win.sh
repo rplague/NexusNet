@@ -80,6 +80,8 @@ if [ ! -f "${NSSM_EXE}" ]; then
 fi
 
 # 渲染安装器脚本
+cp "${SCRIPT_DIR}/win/common.nsh" "${STAGE}/common.nsh"
+cp "${SCRIPT_DIR}/win/wizard.nsh" "${STAGE}/wizard.nsh"
 sed -e "s|@PKG@|${PKG}|g" \
     -e "s|@BIN@|${BIN}|g" \
     -e "s|@VERSION@|${VERSION}|g" \
