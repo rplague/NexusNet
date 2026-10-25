@@ -60,6 +60,11 @@ pub enum SwarmCommand {
         key: kad::RecordKey,
         resp: oneshot::Sender<Result<Vec<PeerId>, NetworkError>>,
     },
+    /// Resolve the addresses of one peer through a Kademlia query.
+    KadGetClosestPeers {
+        peer: PeerId,
+        resp: oneshot::Sender<Result<Vec<kad::PeerInfo>, NetworkError>>,
+    },
     KadPutRecord {
         key: kad::RecordKey,
         value: Vec<u8>,
@@ -87,6 +92,7 @@ pub enum SwarmCommand {
     ServiceSendRequest {
         peer: PeerId,
         request: service_protocol::Request,
+        addresses: Vec<Multiaddr>,
         resp: oneshot::Sender<Result<service_protocol::Response, NetworkError>>,
     },
     ServiceSendResponse {
@@ -132,6 +138,10 @@ pub enum NetworkEvent {
     /// address.
     ListenerClosed {
         addresses: Vec<Multiaddr>,
+    },
+    /// A relay circuit listener became available.
+    RelayCircuitReady {
+        addr: Multiaddr,
     },
 }
 
@@ -200,6 +210,20 @@ impl NetworkHandle {
     pub async fn get_providers(&self, key: kad::RecordKey) -> Result<Vec<PeerId>, NetworkError> {
         match self
             .request(|resp| SwarmCommand::KadGetProviders { key, resp })
+            .await
+        {
+            Ok(inner) => inner,
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Resolve a peer's addresses through the DHT.
+    pub async fn get_closest_peers(
+        &self,
+        peer: PeerId,
+    ) -> Result<Vec<kad::PeerInfo>, NetworkError> {
+        match self
+            .request(|resp| SwarmCommand::KadGetClosestPeers { peer, resp })
             .await
         {
             Ok(inner) => inner,
@@ -277,10 +301,23 @@ impl NetworkHandle {
         peer: &PeerId,
         request: service_protocol::Request,
     ) -> Result<service_protocol::Response, NetworkError> {
+        self.send_request_with_addresses(peer, request, Vec::new())
+            .await
+    }
+
+    /// Send a service request using explicit dial addresses when no connection
+    /// to the peer exists yet.
+    pub async fn send_request_with_addresses(
+        &self,
+        peer: &PeerId,
+        request: service_protocol::Request,
+        addresses: Vec<Multiaddr>,
+    ) -> Result<service_protocol::Response, NetworkError> {
         match self
             .request(|resp| SwarmCommand::ServiceSendRequest {
                 peer: *peer,
                 request,
+                addresses,
                 resp,
             })
             .await
@@ -347,6 +384,9 @@ enum KadPending {
         /// accumulated until the query finalizes.
         providers: HashSet<PeerId>,
     },
+    GetClosestPeers {
+        resp: oneshot::Sender<Result<Vec<kad::PeerInfo>, NetworkError>>,
+    },
     PutRecord {
         key: kad::RecordKey,
         resp: oneshot::Sender<Result<(), NetworkError>>,
@@ -362,6 +402,9 @@ impl KadPending {
                 let _ = resp.send(Err(err));
             }
             KadPending::GetProviders { resp, .. } => {
+                let _ = resp.send(Err(err));
+            }
+            KadPending::GetClosestPeers { resp } => {
                 let _ = resp.send(Err(err));
             }
             KadPending::PutRecord { resp, .. } => {
@@ -664,6 +707,16 @@ impl SwarmActor {
                         .retain(|_, pending_peer| *pending_peer != peer_id);
                 }
             }
+            SwarmEvent::NewListenAddr { address, .. } => {
+                if address
+                    .iter()
+                    .any(|p| matches!(p, libp2p::multiaddr::Protocol::P2pCircuit))
+                {
+                    let _ = self.event_tx.send(NetworkEvent::RelayCircuitReady {
+                        addr: address.clone(),
+                    });
+                }
+            }
             SwarmEvent::ListenerClosed { addresses, .. } => {
                 let _ = self
                     .event_tx
@@ -678,6 +731,7 @@ impl SwarmActor {
                 .emit();
             }
             SwarmEvent::IncomingConnectionError {
+                local_addr,
                 send_back_addr,
                 error,
                 ..
@@ -685,7 +739,7 @@ impl SwarmActor {
                 LogStruct::new(
                     LogLevel::Error,
                     "入站连接失败",
-                    format!("{send_back_addr}: {error}"),
+                    format!("local={local_addr} remote={send_back_addr} error={error:?}"),
                 )
                 .emit();
             }
@@ -819,6 +873,14 @@ impl SwarmActor {
                 {
                     // Query not finalized yet; put it back to keep accumulating.
                     self.pending_kad.insert(id, pending);
+                }
+            }
+            kad::QueryResult::GetClosestPeers(result) => {
+                if let Some(KadPending::GetClosestPeers { resp }) = self.pending_kad.remove(&id) {
+                    let result = result
+                        .map(|ok| ok.peers)
+                        .map_err(|e| NetworkError::Kad(format!("{e:?}")));
+                    let _ = resp.send(result);
                 }
             }
             kad::QueryResult::PutRecord(result) => {
@@ -1211,6 +1273,17 @@ impl SwarmActor {
                     },
                 );
             }
+            SwarmCommand::KadGetClosestPeers { peer, resp } => {
+                let query_id = match self.kad() {
+                    Ok(kad) => kad.get_closest_peers(peer),
+                    Err(e) => {
+                        let _ = resp.send(Err(e));
+                        return true;
+                    }
+                };
+                self.pending_kad
+                    .insert(query_id, KadPending::GetClosestPeers { resp });
+            }
             SwarmCommand::KadPutRecord {
                 key,
                 value,
@@ -1292,6 +1365,7 @@ impl SwarmActor {
             SwarmCommand::ServiceSendRequest {
                 peer,
                 request,
+                addresses,
                 resp,
             } => {
                 let pq_protocol = StreamProtocol::new(pq::SERVICE_REQ_PQ_PROTOCOL);
@@ -1385,7 +1459,11 @@ impl SwarmActor {
                                 return true;
                             }
                             if let Some(b) = self.swarm.behaviour_mut().service_req_pq.as_mut() {
-                                let id = b.send_request(&peer, out.request.clone());
+                                let id = b.send_request_with_addresses(
+                                    &peer,
+                                    out.request.clone(),
+                                    addresses,
+                                );
                                 self.pending_outbound_pq.insert(
                                     id,
                                     PqOutboundPending {
@@ -1409,7 +1487,7 @@ impl SwarmActor {
                         .swarm
                         .behaviour_mut()
                         .service_req
-                        .send_request(&peer, request);
+                        .send_request_with_addresses(&peer, request, addresses);
                     self.pending_outbound.insert(
                         request_id,
                         PendingOutbound {
@@ -1864,6 +1942,13 @@ mod tests {
         };
         assert!(apply_get_providers(pending, Err(err)).is_none());
         assert!(rx.try_recv().unwrap().is_err());
+    }
+
+    #[test]
+    fn get_closest_peers_fail_returns_error() {
+        let (tx, mut rx) = oneshot::channel();
+        KadPending::GetClosestPeers { resp: tx }.fail(NetworkError::Reloaded);
+        assert!(rx.try_recv().expect("should reply").is_err());
     }
 
     #[test]

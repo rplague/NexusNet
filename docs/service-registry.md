@@ -42,6 +42,7 @@ registry actor 订阅该 watch，用完整集合差分处理就绪/断开，不�
 | `Reannounce` | 控制命令 | 后台重新调度 |
 | `RefreshTypes` | `list_services` | 后台刷新类型索引 |
 | `Reset` | reload | generation +1，清空临时状态，保留 known_types |
+| `RelayStateChanged` | controller | relay 就绪/失效；控制 announce 门控与撤销 |
 
 ## 状态机
 
@@ -51,14 +52,24 @@ registry actor 订阅该 watch，用完整集合差分处理就绪/断开，不�
 
 调度优先级：
 
-1. 到期撤销
+1. 到期撤销（含 relay 丢失后的强制撤销）
 2. 到期 announce 重试
 3. 新 announce
 4. types reconcile
 
+### relay 门控
+
+- `need_relay = true` 且 `active_relays == 0` 时，不调度任何新 announce。
+- 第一个 relay 就绪：清空 `announced`，重新 `start_providing`。
+- relay 数量变化但仍大于 0：不重新宣告。
+- 最后一个 relay 失效：把已宣告/正在宣告的服务加入强制撤销集合，
+  逐个 `stop_providing`；在 relay 恢复前不再宣告。
+- `need_relay = false` 的公网双栈节点不受影响。
+
 ### announce
 
 - 成功且后端仍 ready：记入 `announced`。
+- 成功但 relay 已不可用：记入 `announced`，并加入强制撤销集合。
 - 成功但后端已 down：记入 `announced` 并立即调度撤销。
 - 失败且仍 ready：指数退避重试（5s → 60s）。
 - 失败且已 down：不再重试。

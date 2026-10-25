@@ -396,6 +396,11 @@ pub struct NetworkConfig {
     pub ipv6_address: Option<IpAddr>,
     #[serde(default = "default_port")]
     pub port: u32,
+    /// Whether a public address was detected on a local interface at startup.
+    ///
+    /// Runtime only: never read from or written to `config.toml`.
+    #[serde(skip)]
+    pub has_public_address: bool,
 }
 
 impl Default for NetworkConfig {
@@ -406,6 +411,7 @@ impl Default for NetworkConfig {
             ipv6_enabled: bool_false(),
             ipv6_address: None,
             port: default_port(),
+            has_public_address: bool_false(),
         }
     }
 }
@@ -840,7 +846,22 @@ impl ConfigHandle {
         self.read().network.ipv4_enabled
     }
 
+    /// Whether a public address was detected on a local interface at startup.
+    pub fn has_public_address(&self) -> bool {
+        self.read().network.has_public_address
+    }
+
+    /// A relay is needed unless this node is dual-stack and has a public address.
+    pub fn needs_relay(&self) -> bool {
+        let cfg = self.read();
+        !(cfg.network.ipv4_enabled && cfg.network.ipv6_enabled) || !cfg.network.has_public_address
+    }
+
     // ========== Convenience setters ==========
+    pub fn set_has_public_address(&self, present: bool) {
+        self.write().network.has_public_address = present;
+    }
+
     pub fn set_ping_enabled(&self, enabled: bool) {
         self.write().services.ping.enabled = enabled;
     }
@@ -931,6 +952,41 @@ mod tests {
         let addrs = handle.dialable_addrs(pid);
         assert_eq!(addrs.len(), 1);
         assert!(addrs[0].to_string().ends_with(&format!("/p2p/{pid}")));
+    }
+
+    #[test]
+    fn public_address_flag_defaults_to_false_and_is_not_serialized() {
+        let config = NodeConfig::default();
+        assert!(!config.network.has_public_address);
+
+        let handle = ConfigHandle::new(config);
+        handle.set_has_public_address(true);
+        assert!(handle.has_public_address());
+
+        let toml = toml::to_string_pretty(&handle.snapshot()).unwrap();
+        assert!(!toml.contains("has_public_address"));
+    }
+
+    #[test]
+    fn needs_relay_requires_dual_stack_and_public_address() {
+        let mut dual = NodeConfig::default();
+        dual.network.ipv4_enabled = true;
+        dual.network.ipv6_enabled = true;
+
+        let handle = ConfigHandle::new(dual.clone());
+        handle.set_has_public_address(false);
+        assert!(handle.needs_relay());
+
+        handle.set_has_public_address(true);
+        assert!(!handle.needs_relay());
+
+        dual.network.ipv6_enabled = false;
+        let single = ConfigHandle::new(dual);
+        single.set_has_public_address(true);
+        assert!(single.needs_relay());
+
+        single.set_has_public_address(false);
+        assert!(single.needs_relay());
     }
 
     #[test]

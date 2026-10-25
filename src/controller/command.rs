@@ -18,7 +18,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use libp2p::{PeerId, kad};
+use libp2p::{Multiaddr, PeerId, kad};
 
 use crate::auth;
 use crate::controller::service_registry::ServiceCommand;
@@ -166,6 +166,56 @@ async fn fetch_record(
         .map_err(|e| e.to_string())
 }
 
+fn provider_addresses(peers: Vec<kad::PeerInfo>, peer: PeerId) -> Vec<Multiaddr> {
+    peers
+        .into_iter()
+        .find(|info| info.peer_id == peer)
+        .map(|info| info.addrs)
+        .unwrap_or_default()
+}
+
+fn reachability_label(has_public_address: bool, active_relays: usize) -> &'static str {
+    if has_public_address {
+        "public"
+    } else if active_relays > 0 {
+        "relay"
+    } else {
+        "none"
+    }
+}
+
+/// Send a service request, resolving the provider's addresses through the DHT
+/// when a direct dial has no known address.
+async fn send_request_resolved(
+    swarm: &NetworkHandle,
+    peer: PeerId,
+    request: &service_protocol::Request,
+) -> Result<service_protocol::Response, String> {
+    match swarm.send_request(&peer, request.clone()).await {
+        Ok(response) => Ok(response),
+        Err(first) => {
+            let addrs = swarm
+                .get_closest_peers(peer)
+                .await
+                .map(|peers| provider_addresses(peers, peer))
+                .unwrap_or_default();
+            if addrs.is_empty() {
+                return Err(first.to_string());
+            }
+            LogStruct::new(
+                LogLevel::Debug,
+                "服务地址解析",
+                format!("{}: {} 个地址", peer, addrs.len()),
+            )
+            .emit();
+            swarm
+                .send_request_with_addresses(&peer, request.clone(), addrs)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    }
+}
+
 async fn request_service(
     swarm: &NetworkHandle,
     peers: &PeerTracker,
@@ -203,10 +253,10 @@ async fn request_service(
             service: service.clone(),
             payload: payload.clone(),
         };
-        match swarm.send_request(&best, request).await {
+        match send_request_resolved(swarm, best, &request).await {
             Ok(response) => return response_payload(response),
             Err(error) => {
-                last_error = Some(error.to_string());
+                last_error = Some(error);
                 if attempt == 0 {
                     provider_cache.invalidate(&key);
                 }
@@ -275,10 +325,12 @@ async fn run_dht_command(
             let peer_id = peer
                 .parse::<PeerId>()
                 .map_err(|e| format!("invalid peer id: {e}"))?;
-            let response = swarm
-                .send_request(&peer_id, service_protocol::Request { service, payload })
-                .await
-                .map_err(|e| e.to_string())?;
+            let response = send_request_resolved(
+                swarm,
+                peer_id,
+                &service_protocol::Request { service, payload },
+            )
+            .await?;
             response_payload(response)
         }
         Message::AddKey {
@@ -491,6 +543,12 @@ impl NodeController {
             "target": RELAY_TARGET,
             "active": self.relay.active(),
             "pending": self.relay.pending(),
+            "reachability": reachability_label(
+                self.config.has_public_address(),
+                self.relay.active().len(),
+            ),
+            "active_relays": self.relay.active(),
+            "pending_relays": self.relay.pending(),
         });
         Ok(to_cbor(&result))
     }
@@ -784,5 +842,39 @@ mod tests {
         assert!(!is_writable_key("/oahd/bootstrap"));
         assert!(!is_writable_key("/oahd/other"));
         assert!(!is_writable_key("/custom/key"));
+    }
+
+    #[test]
+    fn provider_addresses_selects_the_requested_peer() {
+        let wanted = PeerId::random();
+        let other = PeerId::random();
+        let addr: Multiaddr = "/ip4/127.0.0.1/tcp/5000".parse().unwrap();
+        let peers = vec![
+            kad::PeerInfo {
+                peer_id: other,
+                addrs: vec!["/ip4/127.0.0.2/tcp/5000".parse().unwrap()],
+            },
+            kad::PeerInfo {
+                peer_id: wanted,
+                addrs: vec![addr.clone()],
+            },
+        ];
+        assert_eq!(provider_addresses(peers, wanted), vec![addr]);
+    }
+
+    #[test]
+    fn provider_addresses_empty_when_peer_is_absent() {
+        let peers = vec![kad::PeerInfo {
+            peer_id: PeerId::random(),
+            addrs: vec!["/ip4/127.0.0.1/tcp/5000".parse().unwrap()],
+        }];
+        assert!(provider_addresses(peers, PeerId::random()).is_empty());
+    }
+
+    #[test]
+    fn reachability_prefers_public_then_relay_then_none() {
+        assert_eq!(reachability_label(true, 2), "public");
+        assert_eq!(reachability_label(false, 2), "relay");
+        assert_eq!(reachability_label(false, 0), "none");
     }
 }

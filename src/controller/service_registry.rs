@@ -74,6 +74,11 @@ pub enum ServiceCommand {
     Reannounce,
     RefreshTypes,
     Reset,
+    /// Relay availability changed; service announcements are gated on this.
+    RelayStateChanged {
+        need_relay: bool,
+        active: usize,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -129,9 +134,13 @@ enum ReconcileState {
 struct RegistryState {
     config: ConfigHandle,
     bootstrapped: bool,
+    need_relay: bool,
+    active_relays: usize,
     backend_ready: HashSet<String>,
     announced: HashSet<String>,
     withdraw_deadline: HashMap<String, Instant>,
+    relay_withdraw: HashSet<String>,
+    relay_withdraw_retry_at: HashMap<String, Instant>,
     announce_inflight: HashSet<String>,
     withdraw_inflight: HashSet<String>,
     announce_failures: HashMap<String, u32>,
@@ -149,9 +158,13 @@ impl RegistryState {
         Self {
             config,
             bootstrapped: false,
+            need_relay: false,
+            active_relays: 0,
             backend_ready: HashSet::new(),
             announced: HashSet::new(),
             withdraw_deadline: HashMap::new(),
+            relay_withdraw: HashSet::new(),
+            relay_withdraw_retry_at: HashMap::new(),
             announce_inflight: HashSet::new(),
             withdraw_inflight: HashSet::new(),
             announce_failures: HashMap::new(),
@@ -167,6 +180,10 @@ impl RegistryState {
 
     fn sync_interval(&self) -> Duration {
         Duration::from_secs(self.config.dispatcher_types_sync_interval() as u64)
+    }
+
+    fn relay_ready(&self) -> bool {
+        !self.need_relay || self.active_relays > 0
     }
 
     fn retry_delay(failures: u32) -> Duration {
@@ -230,11 +247,38 @@ impl RegistryState {
             ServiceCommand::RefreshTypes => {
                 self.mark_types_dirty(now);
             }
+            ServiceCommand::RelayStateChanged { need_relay, active } => {
+                let was_ready = self.relay_ready();
+                self.need_relay = need_relay;
+                self.active_relays = active;
+                let now_ready = self.relay_ready();
+                if was_ready == now_ready {
+                    return;
+                }
+                if now_ready {
+                    // Force a fresh announcement so new relay addresses are
+                    // reflected by the peer lookup path.
+                    self.announced.clear();
+                    self.announce_failures.clear();
+                    self.announce_retry_at.clear();
+                    self.relay_withdraw.clear();
+                    self.relay_withdraw_retry_at.clear();
+                } else {
+                    // Stop announcing everything until a relay is available.
+                    for service in self.announced.iter().chain(self.announce_inflight.iter()) {
+                        self.relay_withdraw.insert(service.clone());
+                    }
+                    self.announce_retry_at.clear();
+                }
+            }
             ServiceCommand::Reset => {
                 self.generation = self.generation.wrapping_add(1);
                 self.bootstrapped = false;
+                self.active_relays = 0;
                 self.announced.clear();
                 self.withdraw_deadline.clear();
+                self.relay_withdraw.clear();
+                self.relay_withdraw_retry_at.clear();
                 self.announce_inflight.clear();
                 self.withdraw_inflight.clear();
                 self.announce_failures.clear();
@@ -259,7 +303,18 @@ impl RegistryState {
             })
             .map(|(service, _)| service.clone())
             .collect();
+        due.extend(
+            self.relay_withdraw
+                .iter()
+                .filter(|service| {
+                    self.relay_withdraw_retry_at
+                        .get(*service)
+                        .is_none_or(|at| *at <= now)
+                })
+                .cloned(),
+        );
         due.sort();
+        due.dedup();
         for service in due {
             if slots == 0 {
                 break;
@@ -270,6 +325,7 @@ impl RegistryState {
                 continue;
             }
             self.withdraw_deadline.remove(&service);
+            self.relay_withdraw_retry_at.remove(&service);
             self.withdraw_inflight.insert(service.clone());
             jobs.push(JobSpec::Withdraw {
                 generation: self.generation,
@@ -283,9 +339,11 @@ impl RegistryState {
             .announce_retry_at
             .iter()
             .filter(|(service, at)| {
-                **at <= now
+                self.relay_ready()
+                    && **at <= now
                     && self.backend_ready.contains(*service)
                     && !self.announced.contains(*service)
+                    && !self.relay_withdraw.contains(*service)
             })
             .map(|(service, _)| service.clone())
             .collect();
@@ -309,7 +367,7 @@ impl RegistryState {
             slots -= 1;
         }
 
-        if self.bootstrapped && slots > 0 {
+        if self.bootstrapped && self.relay_ready() && slots > 0 {
             let local: Vec<String> = self
                 .config
                 .read()
@@ -398,7 +456,15 @@ impl RegistryState {
                         self.announce_retry_at.remove(&service);
                         self.announced.insert(service.clone());
                         self.mark_types_dirty(now);
-                        if self.backend_ready.contains(&service) && self.bootstrapped {
+                        if !self.relay_ready() {
+                            self.relay_withdraw.insert(service.clone());
+                            LogStruct::new(
+                                LogLevel::Warning,
+                                "无可用中继",
+                                format!("撤销服务宣告: {service}"),
+                            )
+                            .emit();
+                        } else if self.backend_ready.contains(&service) && self.bootstrapped {
                             LogStruct::new(
                                 LogLevel::Preset,
                                 format!("已注册服务: {}", service),
@@ -448,13 +514,15 @@ impl RegistryState {
                 match result {
                     Ok(()) => {
                         self.announced.remove(&service);
+                        self.relay_withdraw.remove(&service);
+                        self.relay_withdraw_retry_at.remove(&service);
                         LogStruct::new(
                             LogLevel::Preset,
                             format!("已撤销服务宣告: {}", service),
                             "",
                         )
                         .emit();
-                        if self.backend_ready.contains(&service) {
+                        if self.backend_ready.contains(&service) && self.relay_ready() {
                             self.announce_retry_at.insert(service, now);
                         }
                     }
@@ -465,7 +533,10 @@ impl RegistryState {
                             format!("{service}: {error}"),
                         )
                         .emit();
-                        if self.backend_ready.contains(&service) {
+                        if self.relay_withdraw.contains(&service) {
+                            self.relay_withdraw_retry_at
+                                .insert(service.clone(), now + ANNOUNCE_RETRY_INITIAL);
+                        } else if self.backend_ready.contains(&service) {
                             self.announce_retry_at.insert(service.clone(), now);
                         } else {
                             self.withdraw_deadline
@@ -954,6 +1025,128 @@ mod tests {
             .collect();
         assert!(
             matches!(announces.as_slice(), [JobSpec::Announce { service, .. }] if service == "cmd")
+        );
+    }
+
+    #[test]
+    fn waits_for_relay_before_announcing_when_needed() {
+        let mut state = RegistryState::new(config_with_services(&["cmd"]));
+        let now = Instant::now();
+        state.set_backend_ready("cmd", true, now);
+        state.handle(
+            ServiceCommand::RelayStateChanged {
+                need_relay: true,
+                active: 0,
+            },
+            now,
+        );
+        state.handle(ServiceCommand::BootstrapCompleted, now);
+        assert!(
+            !state
+                .plan(now, 4)
+                .iter()
+                .any(|job| matches!(job, JobSpec::Announce { .. }))
+        );
+
+        state.handle(
+            ServiceCommand::RelayStateChanged {
+                need_relay: true,
+                active: 1,
+            },
+            now,
+        );
+        let jobs = state.plan(now, 4);
+        assert!(matches!(jobs.as_slice(), [JobSpec::Announce { service, .. }] if service == "cmd"));
+    }
+
+    #[test]
+    fn withdraws_when_the_last_relay_is_lost() {
+        let mut state = RegistryState::new(config_with_services(&["cmd"]));
+        let now = Instant::now();
+        state.set_backend_ready("cmd", true, now);
+        state.handle(
+            ServiceCommand::RelayStateChanged {
+                need_relay: true,
+                active: 1,
+            },
+            now,
+        );
+        state.handle(ServiceCommand::BootstrapCompleted, now);
+
+        let jobs = state.plan(now, 4);
+        let JobSpec::Announce {
+            generation,
+            service,
+            ..
+        } = jobs.into_iter().next().expect("expected announce")
+        else {
+            panic!("expected announce");
+        };
+        state.apply(
+            JobResult::Announced {
+                generation,
+                service,
+                result: Ok(()),
+            },
+            now,
+        );
+        assert!(state.announced.contains("cmd"));
+
+        state.handle(
+            ServiceCommand::RelayStateChanged {
+                need_relay: true,
+                active: 0,
+            },
+            now,
+        );
+        let jobs = state.plan(now, 4);
+        assert!(matches!(jobs.as_slice(), [JobSpec::Withdraw { service, .. }] if service == "cmd"));
+    }
+
+    #[test]
+    fn relay_count_changes_do_not_reannounce() {
+        let mut state = RegistryState::new(config_with_services(&["cmd"]));
+        let now = Instant::now();
+        state.set_backend_ready("cmd", true, now);
+        state.handle(
+            ServiceCommand::RelayStateChanged {
+                need_relay: true,
+                active: 1,
+            },
+            now,
+        );
+        state.handle(ServiceCommand::BootstrapCompleted, now);
+
+        let jobs = state.plan(now, 4);
+        let JobSpec::Announce {
+            generation,
+            service,
+            ..
+        } = jobs.into_iter().next().expect("expected announce")
+        else {
+            panic!("expected announce");
+        };
+        state.apply(
+            JobResult::Announced {
+                generation,
+                service,
+                result: Ok(()),
+            },
+            now,
+        );
+
+        state.handle(
+            ServiceCommand::RelayStateChanged {
+                need_relay: true,
+                active: 2,
+            },
+            now,
+        );
+        let jobs = state.plan(now, 4);
+        assert!(
+            !jobs
+                .iter()
+                .any(|job| matches!(job, JobSpec::Announce { .. } | JobSpec::Withdraw { .. }))
         );
     }
 

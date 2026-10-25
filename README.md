@@ -242,6 +242,7 @@ u32_be(len) || cbor(message)      # len <= 16 MiB
   → discover_providers(service) → DHT get_providers
   → RTT 排序选最优点
   → send_request_to_peer(peer, service, payload)
+  → 无已知地址时 get_closest_peers(peer) 解析 relay 地址后重试
   → CBOR Request-Response (libp2p)
   → 远程 NodeController → InboundServiceRequest(to_dispatcher_tx)
   → 远程 ServiceDispatcher → backend_task
@@ -268,7 +269,45 @@ u32_be(len) || cbor(message)      # len <= 16 MiB
 - `add_key` 的 `providing=true` 由 NodeController 直接调用 `start_providing`；ServiceRegistry 仍独立维护自动宣告状态
 - 本地调用优先：`service_request` 命中已就绪的本地服务时直接走 `ServiceDispatcher`，不查 DHT、不使用 PQ、不经过 AuthGate；`service_request_to(self, service)` 同样走本地。本地未就绪时，`service_request` 回退远端，`service_request_to(self)` 返回 `backend_not_ready`
 - `discover_providers` → DHT get_providers 获取提供者列表
-- `service_request` → 本地就绪优先；否则查询 provider，RTT 排序选优，P2P 调用
+- `service_request` → 本地就绪优先；否则查询 provider，RTT 排序选优；直连失败时通过 `get_closest_peers(peer)` 获取 provider 的 relay 地址后重试
+
+## 无公网 IP 接入（中继）
+
+单栈或没有公网地址的节点仍可加入网络并提供服务，但必须有至少一台**双栈公网节点**作为 bootstrap/relay。
+
+- 公网 bootstrap 必须是双栈节点；双栈节点会自动开启 relay server（最多 16 个预约）。
+- NAT 节点把该 bootstrap 写入 `services.kademlia.bootstrap_nodes`，无需公网 IP，也不需要手工公告地址。
+- NAT 节点在获得第一个 relay circuit 前**不会宣告服务**；第一个 relay 就绪后才 `start_providing`。
+- 后续 relay 增加/失效只更新本地地址状态；只要还有 active relay，服务保持宣告。
+- `active_relays` 降到 0 时，NAT 节点执行 `stop_providing`，等新 relay 就绪后重新宣告。
+- 调用方通过 `get_providers` 取得 provider 的 PeerId，再用 `get_closest_peers(peer)` 取得 `PeerInfo.addrs`（包含 `<relay>/p2p-circuit`），随后经中继调用。
+- relay server 的 `max_circuit_bytes` 自动等于本节点 `max_request_bytes + max_response_bytes`；bootstrap 的这两个上限应不小于客户端，否则大报文仍会被中继拒绝。
+
+`relay_status` 返回：
+
+| 字段 | 含义 |
+|---|---|
+| `need_relay` | 单栈或无公网地址时为 true |
+| `reachability` | `public` / `relay` / `none` |
+| `active_relays` | 已就绪的 relay PeerId |
+| `pending_relays` | 预约中的 relay PeerId |
+
+完整流程与失效语义见 [docs/nat-relay.md](./docs/nat-relay.md)。
+
+## 传输层 TLS 优先
+
+新版本在 TCP 和 relay 客户端上同时提供 TLS 与 Noise：
+
+- 双方都支持时优先协商 TLS；
+- 对端只支持 Noise 时自动回退，旧节点仍可连接；
+- PeerId、服务协议、Kademlia、relay 和 PQ 均不受影响；
+- 不需要修改端口、配置或 multiaddr；
+- TLS 证书由现有 ED25519 keypair 在启动时生成，不新增密钥文件。
+
+TLS 流量对 DPI/防火墙表现为标准 TLS（类似 HTTPS），适合只放行 HTTP/TLS/SSH 的网络。  
+如果网络连 TLS 也识别/阻断，需要后续增加 WebSocket+TLS 传输，见 [docs/nat-relay.md](./docs/nat-relay.md)。
+
+注意：TLS 优先不会在连接失败后自动降级到 Noise；如果某条网络封锁 TLS，旧 Noise-only 节点仍可用 Noise。
 
 ## DHT 读缓存
 
@@ -344,7 +383,7 @@ u32_be(len) || cbor(message)      # len <= 16 MiB
 
 ## 开发状态
 
-当前版本：**0.5.2** — 完成度 **6/10**
+当前版本：**0.5.2-1025** — 完成度 **6/10**
 
 ## 许可
 

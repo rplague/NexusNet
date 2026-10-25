@@ -90,8 +90,9 @@ enum BackendEvent {
 
 fn command_timeout(msg: &Message, base: Duration, kad: Duration) -> Duration {
     let required = match msg {
-        Message::ServiceRequest { .. } => kad.saturating_add(service_protocol::REQUEST_TIMEOUT),
-        Message::ServiceRequestTo { .. } => service_protocol::REQUEST_TIMEOUT,
+        Message::ServiceRequest { .. } | Message::ServiceRequestTo { .. } => {
+            kad.saturating_add(service_protocol::REQUEST_TIMEOUT.saturating_mul(2))
+        }
         Message::QueryKey { .. } => kad.saturating_add(kad),
         Message::ListServices { .. }
         | Message::DiscoverProviders { .. }
@@ -131,6 +132,8 @@ fn route_local(ready: &HashSet<String>, my_peer_id: PeerId, msg: &Message) -> Lo
 pub struct ServiceDispatcher {
     inbound_rx: mpsc::Receiver<InboundRequest>,
     event_rx: mpsc::Receiver<BackendEvent>,
+    /// Keeps the backend event channel open even when there are no backends.
+    _event_tx: mpsc::Sender<BackendEvent>,
     to_controller_tx: mpsc::Sender<ToController>,
     /// Service name -> command sender for its backend task.
     backends: HashMap<String, mpsc::Sender<BackendCmd>>,
@@ -204,6 +207,7 @@ impl ServiceDispatcher {
             Self {
                 inbound_rx,
                 event_rx,
+                _event_tx: event_tx,
                 to_controller_tx,
                 backends,
                 my_peer_id,
@@ -689,7 +693,21 @@ mod tests {
             payload: vec![],
         };
         let expected = KAD
-            .saturating_add(service_protocol::REQUEST_TIMEOUT)
+            .saturating_add(service_protocol::REQUEST_TIMEOUT.saturating_mul(2))
+            .saturating_add(MARGIN);
+        assert_eq!(command_timeout(&msg, BASE, KAD), expected);
+    }
+
+    #[test]
+    fn service_request_to_budget_covers_lookup_and_relay_retry() {
+        let msg = Message::ServiceRequestTo {
+            id: id(),
+            service: "cmd".into(),
+            peer: PeerId::random().to_string(),
+            payload: vec![],
+        };
+        let expected = KAD
+            .saturating_add(service_protocol::REQUEST_TIMEOUT.saturating_mul(2))
             .saturating_add(MARGIN);
         assert_eq!(command_timeout(&msg, BASE, KAD), expected);
     }

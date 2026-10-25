@@ -121,6 +121,13 @@ fn request_response_config() -> request_response::Config {
     request_response::Config::default().with_request_timeout(service_protocol::REQUEST_TIMEOUT)
 }
 
+/// Relay circuits must fit one maximum request plus one maximum response.
+fn relay_circuit_bytes(config: &ConfigHandle) -> u64 {
+    config
+        .dispatcher_max_request_bytes()
+        .saturating_add(config.dispatcher_max_response_bytes())
+}
+
 impl NetBehaviour {
     pub fn new(
         config: &ConfigHandle,
@@ -224,7 +231,10 @@ impl NetBehaviour {
             let cfg = config.read();
             cfg.network.ipv4_enabled && cfg.network.ipv6_enabled
         };
-        let mut relay_cfg = relay::Config::default();
+        let mut relay_cfg = relay::Config {
+            max_circuit_bytes: relay_circuit_bytes(config),
+            ..relay::Config::default()
+        };
         if is_dual_stack {
             relay_cfg.max_reservations = 16;
             LogStruct::new(
@@ -249,5 +259,20 @@ impl NetBehaviour {
             relay_server,
             relay_client,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::NodeConfig;
+
+    #[test]
+    fn relay_circuit_bytes_covers_request_and_response() {
+        let mut config = NodeConfig::default();
+        config.services.dispatcher.max_request_bytes = 3 << 20;
+        config.services.dispatcher.max_response_bytes = 5 << 20;
+        let handle = ConfigHandle::new(config);
+        assert_eq!(relay_circuit_bytes(&handle), 8 << 20);
     }
 }

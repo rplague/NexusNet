@@ -67,6 +67,16 @@ pub fn to_multiaddr(ip: IpAddr, port: u16) -> Multiaddr {
     addr
 }
 
+/// Clear configured public addresses while preserving the listen-family flags.
+fn clear_stale_public_addresses(network: &mut crate::config::NetworkConfig) -> bool {
+    if network.ipv4_address.is_none() && network.ipv6_address.is_none() {
+        return false;
+    }
+    network.ipv4_address = None;
+    network.ipv6_address = None;
+    true
+}
+
 /// Probe public IPs and write them back to the config.
 pub fn update_config_with_public_ip(
     config: &ConfigHandle,
@@ -83,8 +93,27 @@ pub fn update_config_with_public_ip(
         .copied()
         .collect();
 
+    config.set_has_public_address(!public_ips.is_empty());
+
     if ipv4_addrs.is_empty() && ipv6_addrs.is_empty() {
-        LogStruct::new(LogLevel::Warning, "未发现公网IP", "无法自动更新网络配置").emit();
+        // Do not keep stale public addresses: binding them at startup fails
+        // with AddrNotAvailable. Keep the enabled flags so the swarm can fall
+        // back to a wildcard listener.
+        let cleared = {
+            let mut cfg = config.write();
+            clear_stale_public_addresses(&mut cfg.network)
+        };
+        if cleared {
+            config.save_to_default();
+            LogStruct::new(
+                LogLevel::Warning,
+                "未发现公网IP",
+                "已清空旧公网地址，将监听通配地址",
+            )
+            .emit();
+        } else {
+            LogStruct::new(LogLevel::Warning, "未发现公网IP", "无法自动更新网络配置").emit();
+        }
         return Ok(());
     }
 
@@ -124,4 +153,28 @@ pub fn update_config_with_public_ip(
     )
     .emit();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::NetworkConfig;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn clear_stale_public_addresses_keeps_listen_flags() {
+        let mut network = NetworkConfig {
+            ipv4_enabled: true,
+            ipv6_enabled: true,
+            ipv4_address: Some(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))),
+            ipv6_address: Some(IpAddr::V6(Ipv6Addr::LOCALHOST)),
+            ..Default::default()
+        };
+        assert!(clear_stale_public_addresses(&mut network));
+        assert!(network.ipv4_enabled);
+        assert!(network.ipv6_enabled);
+        assert!(network.ipv4_address.is_none());
+        assert!(network.ipv6_address.is_none());
+        assert!(!clear_stale_public_addresses(&mut network));
+    }
 }

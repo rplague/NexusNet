@@ -63,10 +63,9 @@ impl RelayManager {
         self.backoff.clear();
     }
 
-    /// Whether this node needs relay reservations (not dual-stack).
+    /// Whether this node needs relay reservations (single-stack or no public address).
     pub fn need_relay(&self) -> bool {
-        let cfg = self.config.read();
-        !(cfg.network.ipv4_enabled && cfg.network.ipv6_enabled)
+        self.config.needs_relay()
     }
 
     pub fn active(&self) -> Vec<String> {
@@ -92,6 +91,25 @@ impl RelayManager {
             )
             .emit();
         }
+    }
+
+    /// Track a newly available relay circuit listener.
+    ///
+    /// The reservation-accepted event and the circuit listener can arrive in
+    /// either order; this keeps the active set correct and provides the signal
+    /// used to gate service announcements.
+    pub fn on_circuit_ready(&mut self, addr: &Multiaddr) -> bool {
+        let Some(peer_id) = extract_peer_id_from_multiaddr(addr) else {
+            return false;
+        };
+        if peer_id == self.my_peer_id {
+            return false;
+        }
+        let newly_active = self.active.insert(peer_id);
+        self.pending.remove(&peer_id);
+        self.failures.remove(&peer_id);
+        self.backoff.remove(&peer_id);
+        newly_active
     }
 
     /// Relay client (outbound) events: track reservation successes.
