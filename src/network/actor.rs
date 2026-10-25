@@ -583,12 +583,12 @@ fn peer_id_from_multiaddr(addr: &Multiaddr) -> Option<PeerId> {
 }
 
 /// Build the Swarm and start the actor task.
-pub fn spawn(
+pub async fn spawn(
     config: ConfigHandle,
     keypair: identity::Keypair,
     pq_keys: Option<PqKeys>,
 ) -> Result<NetworkStart, NetworkError> {
-    let swarm = build_swarm(&config, &keypair)?;
+    let swarm = build_swarm(&config, &keypair).await?;
 
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let (event_tx, event_rx) = mpsc::unbounded_channel();
@@ -1675,7 +1675,7 @@ impl SwarmActor {
     /// Rebuild the Swarm from the current config. The new Swarm is built first,
     /// so a build failure leaves the old one untouched.
     async fn reload(&mut self) -> Result<(), NetworkError> {
-        let new_swarm = build_swarm(&self.config, &self.keypair)?;
+        let new_swarm = build_swarm(&self.config, &self.keypair).await?;
 
         let inbound: Vec<PendingInbound> = self
             .pending_inbound

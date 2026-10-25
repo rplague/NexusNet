@@ -75,7 +75,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // Build the network and start the Swarm actor.
     let keypair = key_manager.keypair().clone();
     let pq_keys = key_manager.take_pq_keys();
-    let network = Network::start(config_handle.clone(), keypair, pq_keys)?;
+    let network = Network::start(config_handle.clone(), keypair, pq_keys).await?;
 
     // Dial the configured bootstrap nodes.
     for addr in config_handle.bootstrap_nodes() {

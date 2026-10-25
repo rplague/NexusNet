@@ -37,8 +37,10 @@ NexusNet 以原生的 Debian 打包（`.deb`）分发，由 `dpkg`/`apt` 管理�
   这两个值应不小于客户端。
 - 调用方通过 `get_closest_peers` 解析 provider 的 relay 地址，详见
   [../docs/nat-relay.md](../docs/nat-relay.md)。
-- 传输层优先协商 TLS，旧节点可回退 Noise；如果网络只放行 HTTP/TLS/SSH，
-  优先保持 TLS 可用。
+- 本版本只使用 WebSocket over HTTP；`network.port` 是 WebSocket TCP 端口。
+- bootstrap 地址必须带 `/ws`，例如
+  `/ip6/.../tcp/5000/ws/p2p/<PeerId>`。
+- 旧版 raw TCP 节点不兼容，所有节点必须升级到 0.6.0。
 
 ## 安装
 
