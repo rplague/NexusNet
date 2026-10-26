@@ -79,6 +79,17 @@ registry actor 订阅该 watch，用完整集合差分处理就绪/断开，不�
 - 成功：从 `announced` 移除；若后端已恢复，重新调度 announce。
 - 失败：重新设置重试 deadline。
 
+### provider 记录生命周期
+
+- provider 记录由 libp2p Kademlia 的周期性 provider job 维护，TTL 与重发间隔
+  来自 `services.kademlia.provider_record_ttl_seconds`（默认 3600s）和
+  `services.kademlia.provider_publication_interval_seconds`（默认 1800s）。
+- 活跃 provider 在 TTL 前按发布间隔重发，不会因记录过期而从
+  `discover_providers` 闪断。
+- 停止或崩溃的 provider 不再重发，其记录最迟约一个 TTL 后从 DHT 发现中
+  消失；本机制不按消费者活跃度回收，也不主动探测 provider。
+- 这两个配置必须大于 0，且 TTL 不能小于 2 倍发布间隔。
+
 ### bootstrap / reannounce
 
 `BootstrapCompleted` 与 `Reannounce` 都会清空 `announced` 和
@@ -90,14 +101,35 @@ registry actor 订阅该 watch，用完整集合差分处理就绪/断开，不�
 
 ```text
 Idle --(due / RefreshTypes)--> Reading
-Reading --(merge known_types)--> Idle | ReadyToWrite
+Reading --(merge + renew leases)--> Idle | ReadyToWrite
 ReadyToWrite --(plan)--> Writing
 Writing --(result)--> Idle
 ```
 
 - single-flight；`reconcile_dirty` 在当前链结束后触发立即重跑。
 - 失败后 30s 重试。
-- `known_types` 保持单调并集，上限 `MAX_TYPES`。
+- `known_types` 为 `BTreeMap<String, u64>`（服务名 -> `expires_at`），上限
+  `MAX_TYPES`。
+- DHT 值是无版本 tuple 数组：`[["ocr",1700003600], ...]`；单条
+  `/oahd/service/types`，不分片、不加版本字段。
+- reconcile 读取后合并未过期条目并取 `max(expires_at)`，丢弃
+  `expires_at <= now` 的条目，写回时不再包含过期条目。
+- 本地 `announced` 服务在每次 reconcile 写入新的
+  `now + services.registry.type_ttl_secs`；没有本地 provider 的条目只保留
+  远端 expiry，不会被续期。
+- `Announced` 成功后立即写入本地 expiry 并标记 dirty。
+- `stop_providing` 后不再续期，但不会立即删除；最后一个 provider 停止刷新
+  后由租约自然过期。
+- 不主动探测 provider，不扫描 `get_providers`。
+
+### types 迁移
+
+`parse_types` 同时接受旧 `["ocr","cmd"]` 与新 tuple 数组。旧字符串条目获得
+一次迁移期 expiry（`now + services.registry.type_ttl_secs`），之后必须由本地
+provider 续期。新节点一律写回 tuple 格式。
+
+这是无版本格式变更，**不做旧节点滚动兼容**：升级前应停止旧节点写入，再升级
+全部节点。
 
 ## 并发与背压
 
@@ -111,13 +143,14 @@ Writing --(result)--> Idle
 
 `ServiceSnapshot` 包含：
 
-- `types`：`known_types ∪ announced`
+- `types`：未过期的 `known_types` 名字 ∪ `announced`
 - `announced`
 - `backend_ready`
 - `bootstrapped`
 
 `list_services` 读取 `types` 并触发后台 `RefreshTypes`。该命令是最终一致的：
-如果 DHT 中刚出现新类型，下一次调用或后台刷新后可见。
+如果 DHT 中刚出现新类型，下一次调用或后台刷新后可见；过期类型不会出现在
+快照中。
 
 ## 测试
 

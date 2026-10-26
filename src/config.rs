@@ -53,11 +53,14 @@ default_u32_fn!(default_interval, 15);
 default_u32_fn!(default_timeout, 10);
 default_u32_fn!(default_max_failures, 2);
 default_u32_fn!(default_record_ttl_seconds, hours(1));
+default_u32_fn!(default_provider_record_ttl_seconds, hours(1));
+default_u32_fn!(default_provider_publication_interval_seconds, 30 * 60);
 default_u32_fn!(default_replication_factor, 20);
 default_u32_fn!(default_query_timeout_seconds, 60);
 default_u32_fn!(default_relay_retry_interval, 60);
 default_u32_fn!(default_relay_max_failures, 3);
 default_u32_fn!(default_types_sync_seconds, 300);
+default_u32_fn!(default_type_ttl_seconds, 1800);
 default_u32_fn!(default_max_inflight_dht, 4);
 
 /// Default P2P service request/response size limit (16 MiB), aligned with
@@ -138,6 +141,22 @@ impl NodeConfig {
                 return Err("services.kademlia.query_timeout_seconds 必须大于 0".to_string());
             }
         }
+        if self.services.kademlia.provider_record_ttl_seconds == 0 {
+            return Err("services.kademlia.provider_record_ttl_seconds 必须大于 0".to_string());
+        }
+        if self.services.kademlia.provider_publication_interval_seconds == 0 {
+            return Err(
+                "services.kademlia.provider_publication_interval_seconds 必须大于 0".to_string(),
+            );
+        }
+        let provider_ttl = self.services.kademlia.provider_record_ttl_seconds;
+        let provider_republish =
+            2u32.saturating_mul(self.services.kademlia.provider_publication_interval_seconds);
+        if provider_ttl < provider_republish {
+            return Err(format!(
+                "services.kademlia.provider_record_ttl_seconds 必须不小于 2 * provider_publication_interval_seconds ({provider_ttl} < {provider_republish})"
+            ));
+        }
         if self.services.dispatcher.enabled {
             if self.services.dispatcher.query_timeout_secs == 0 {
                 return Err("services.dispatcher.query_timeout_secs 必须大于 0".to_string());
@@ -148,6 +167,18 @@ impl NodeConfig {
         }
         if !(1..=16).contains(&self.services.registry.max_inflight_dht) {
             return Err("services.registry.max_inflight_dht 必须在 1..=16".to_string());
+        }
+        if self.services.registry.type_ttl_secs == 0 {
+            return Err("services.registry.type_ttl_secs 必须大于 0".to_string());
+        }
+        if self.services.registry.type_ttl_secs
+            <= 2u32.saturating_mul(self.services.dispatcher.types_sync_secs)
+        {
+            return Err(format!(
+                "services.registry.type_ttl_secs 必须大于 2 * services.dispatcher.types_sync_secs ({} <= {})",
+                self.services.registry.type_ttl_secs,
+                2u32.saturating_mul(self.services.dispatcher.types_sync_secs)
+            ));
         }
         if self.compat.max_record_bytes == 0
             || self.compat.max_record_bytes > DHT_MAX_RECORD_BYTES as u64
@@ -434,12 +465,17 @@ pub struct ServicesConfig {
 pub struct RegistryService {
     #[serde(default = "default_max_inflight_dht")]
     pub max_inflight_dht: u32,
+    /// How long a service type remains in the DHT index without a provider
+    /// renewing it. Must exceed two dispatcher sync intervals.
+    #[serde(default = "default_type_ttl_seconds")]
+    pub type_ttl_secs: u32,
 }
 
 impl Default for RegistryService {
     fn default() -> Self {
         RegistryService {
             max_inflight_dht: default_max_inflight_dht(),
+            type_ttl_secs: default_type_ttl_seconds(),
         }
     }
 }
@@ -473,6 +509,12 @@ pub struct KademliaService {
     pub enabled: bool,
     #[serde(default = "default_record_ttl_seconds")]
     pub record_ttl_seconds: u32,
+    /// How long a provider record stays discoverable without being renewed.
+    #[serde(default = "default_provider_record_ttl_seconds")]
+    pub provider_record_ttl_seconds: u32,
+    /// How often an active provider republishes its provider record.
+    #[serde(default = "default_provider_publication_interval_seconds")]
+    pub provider_publication_interval_seconds: u32,
     #[serde(default = "default_replication_factor")]
     pub replication_factor: u32,
     #[serde(default = "default_query_timeout_seconds")]
@@ -486,6 +528,8 @@ impl Default for KademliaService {
         KademliaService {
             enabled: bool_true(),
             record_ttl_seconds: default_record_ttl_seconds(),
+            provider_record_ttl_seconds: default_provider_record_ttl_seconds(),
+            provider_publication_interval_seconds: default_provider_publication_interval_seconds(),
             replication_factor: default_replication_factor(),
             query_timeout_seconds: default_query_timeout_seconds(),
             bootstrap_nodes: default_announce_addresses(),
@@ -601,19 +645,11 @@ impl Default for AuthConfig {
 }
 
 /// Trust anchor of a single authentication network.
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
 pub struct AuthNetworkConfig {
     /// Authority ed25519 public key (base64), parsed by the `auth` module.
     #[serde(default)]
     pub authority: String,
-}
-
-impl Default for AuthNetworkConfig {
-    fn default() -> Self {
-        AuthNetworkConfig {
-            authority: String::new(),
-        }
-    }
 }
 
 #[derive(Clone)]
@@ -627,6 +663,7 @@ fn config_filepath() -> &'static Path {
     PATH.get_or_init(|| paths::fail_path_gener(paths::FailType::Config, "config.toml"))
 }
 
+#[allow(dead_code)]
 impl ConfigHandle {
     pub fn new(config: NodeConfig) -> Self {
         Self {
@@ -730,6 +767,11 @@ impl ConfigHandle {
         self.read().services.registry.max_inflight_dht as usize
     }
 
+    /// Lifetime, in seconds, of one service-type lease.
+    pub fn registry_type_ttl_secs(&self) -> u64 {
+        self.read().services.registry.type_ttl_secs as u64
+    }
+
     /// Maximum DHT record size this node writes.
     pub fn compat_max_record_bytes(&self) -> u64 {
         self.read().compat.max_record_bytes
@@ -803,6 +845,17 @@ impl ConfigHandle {
 
     pub fn kademlia_record_ttl(&self) -> u32 {
         self.read().services.kademlia.record_ttl_seconds
+    }
+
+    pub fn kademlia_provider_record_ttl(&self) -> u32 {
+        self.read().services.kademlia.provider_record_ttl_seconds
+    }
+
+    pub fn kademlia_provider_publication_interval(&self) -> u32 {
+        self.read()
+            .services
+            .kademlia
+            .provider_publication_interval_seconds
     }
 
     pub fn kademlia_replication_factor(&self) -> u32 {
@@ -1066,6 +1119,94 @@ mod tests {
     }
 
     #[test]
+    fn provider_record_ttl_defaults() {
+        let config = NodeConfig::default();
+        assert_eq!(config.services.kademlia.provider_record_ttl_seconds, 3600);
+        assert_eq!(
+            config
+                .services
+                .kademlia
+                .provider_publication_interval_seconds,
+            1800
+        );
+        assert!(config.validate().is_ok());
+
+        let handle = ConfigHandle::new(config);
+        assert_eq!(handle.kademlia_provider_record_ttl(), 3600);
+        assert_eq!(handle.kademlia_provider_publication_interval(), 1800);
+    }
+
+    #[test]
+    fn rejects_zero_provider_record_ttl() {
+        let mut config = NodeConfig::default();
+        config.services.kademlia.provider_record_ttl_seconds = 0;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_zero_provider_publication_interval() {
+        let mut config = NodeConfig::default();
+        config
+            .services
+            .kademlia
+            .provider_publication_interval_seconds = 0;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_provider_ttl_not_above_twice_publication() {
+        let mut config = NodeConfig::default();
+        config
+            .services
+            .kademlia
+            .provider_publication_interval_seconds = 1800;
+        config.services.kademlia.provider_record_ttl_seconds = 1800;
+        assert!(config.validate().is_err());
+
+        config.services.kademlia.provider_record_ttl_seconds = 3599;
+        assert!(config.validate().is_err());
+
+        config.services.kademlia.provider_record_ttl_seconds = 3600;
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn provider_record_ttl_config_round_trip() {
+        let toml = r#"
+            [services.kademlia]
+            provider_record_ttl_seconds = 7200
+            provider_publication_interval_seconds = 1800
+        "#;
+        let node: NodeConfig = toml::from_str(toml).unwrap();
+        assert_eq!(node.services.kademlia.provider_record_ttl_seconds, 7200);
+        assert_eq!(
+            node.services.kademlia.provider_publication_interval_seconds,
+            1800
+        );
+
+        let serialized = toml::to_string_pretty(&node).unwrap();
+        let back: NodeConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(back.services.kademlia.provider_record_ttl_seconds, 7200);
+        assert_eq!(
+            back.services.kademlia.provider_publication_interval_seconds,
+            1800
+        );
+    }
+
+    #[test]
+    fn provider_lifecycle_defaults_when_absent_from_config() {
+        let node: NodeConfig = toml::from_str("[node]\nname = \"old\"\n").unwrap();
+        assert_eq!(
+            node.services.kademlia.provider_record_ttl_seconds,
+            default_provider_record_ttl_seconds()
+        );
+        assert_eq!(
+            node.services.kademlia.provider_publication_interval_seconds,
+            default_provider_publication_interval_seconds()
+        );
+    }
+
+    #[test]
     fn rejects_duplicate_or_zero_port_local_services() {
         let mut config = NodeConfig::default();
         config.services.dispatcher.local_services = vec![
@@ -1091,6 +1232,7 @@ mod tests {
     fn registry_max_inflight_dht_defaults_and_validates() {
         let config = NodeConfig::default();
         assert_eq!(config.services.registry.max_inflight_dht, 4);
+        assert_eq!(config.services.registry.type_ttl_secs, 1800);
         assert!(config.validate().is_ok());
         assert_eq!(
             ConfigHandle::new(config.clone()).registry_max_inflight_dht(),
@@ -1118,6 +1260,20 @@ mod tests {
         assert!(config.validate().is_err());
         config.services.dispatcher.max_inflight_dht = 16;
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn registry_type_ttl_must_exceed_two_sync_intervals() {
+        let mut config = NodeConfig::default();
+        config.services.dispatcher.types_sync_secs = 900;
+        config.services.registry.type_ttl_secs = 1800;
+        assert!(config.validate().is_err());
+
+        config.services.registry.type_ttl_secs = 1801;
+        assert!(config.validate().is_ok());
+
+        config.services.registry.type_ttl_secs = 0;
+        assert!(config.validate().is_err());
     }
 
     #[test]

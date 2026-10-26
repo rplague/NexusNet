@@ -108,6 +108,8 @@ max_failures = 2
 [services.kademlia]
 enabled = true
 record_ttl_seconds = 3600
+provider_record_ttl_seconds = 3600       # provider 记录 TTL；必须 >= 2 * 发布间隔
+provider_publication_interval_seconds = 1800  # 活跃 provider 重发间隔
 replication_factor = 20
 query_timeout_seconds = 60
 bootstrap_nodes = []
@@ -127,6 +129,7 @@ require_auth = false
 
 [services.registry]
 max_inflight_dht = 4             # 1..=16，registry DHT job 并发上限
+type_ttl_secs = 1800             # 服务类型租约；必须 > 2 * types_sync_secs
 
 [services.relay]
 retry_interval_secs = 60
@@ -230,7 +233,7 @@ u32_be(len) || cbor(message)      # len <= 16 MiB
 
 - 关联 id 为 UUID；`reply.result` 是该 op 自定的 **CBOR** 字节。
 - `add_key` 的 `value` 为 `bstr`，二进制安全（无需 base64）。
-- `remove_key`：撤销 provider 宣告 / 删除本地记录，`{ key, ? providing=true, ? record=false }`。两项均为**本地操作**——远端 provider 记录需待对端 provider TTL 过期才消失，远端 value 副本按 `services.kademlia.record_ttl_seconds` 过期；撤销只影响发现，不阻止直接 `service_request_to` 调用。
+- `remove_key`：撤销 provider 宣告 / 删除本地记录，`{ key, ? providing=true, ? record=false }`。两项均为**本地操作**——远端 provider 记录需待对端 provider TTL（`services.kademlia.provider_record_ttl_seconds`，默认 3600s）过期才消失，远端 value 副本按 `services.kademlia.record_ttl_seconds` 过期；撤销只影响发现，不阻止直接 `service_request_to` 调用。
 - `add_key` / `remove_key` 仅允许 `/oahd/service/<name>` 与 `/oahd/auth/...`；`/oahd/service/types` 和 `/oahd/bootstrap` 由节点自身维护，后端不可写。
 - `refresh_cache`：清空应用层 DHT 缓存，并删除 Kademlia 本地 store 中非本节点发布的副本；本节点自己发布的记录保留。
 - 默认超时 30 秒，超时以 `error{code:"timeout"}` 应答。
@@ -260,9 +263,11 @@ u32_be(len) || cbor(message)      # len <= 16 MiB
 - 仅当 DHT bootstrap 完成**且**对应后端 TCP 握手（`hello`）成功后，才自动调用 `start_providing`，key 为 `/oahd/service/<name>`——避免提前宣告尚不可用的服务
 - 后端连接断开后进入 3 秒宽限期（由 1 秒 tick 检查，实际撤销窗口约 3–4 秒）：期间重连则不撤销；超时仍未恢复则 `stop_providing` 撤销宣告
 - 撤销为本地行为，远端 provider 记录需待 provider TTL 过期才会消失
+- provider 记录 TTL 由 `services.kademlia.provider_record_ttl_seconds`（默认 3600s）控制，活跃 provider 按 `services.kademlia.provider_publication_interval_seconds`（默认 1800s）周期重发；停止或崩溃的 provider 最迟约一个 TTL 后从 `discover_providers` 中消失。两者必须大于 0，且 TTL 不能小于 2 倍发布间隔
 - 双栈节点在 `allow_bootstrap = true` 时声明为 `/oahd/bootstrap` provider；其他节点仅在 `accept_bootstrap_providers = true` 时才会把 Identify 发现的 provider 自动写入 bootstrap 列表
 - Kademlia 成员准入：启动时把配置 bootstrap 地址中的 PeerId 直接视为已识别；其他 peer 只有 Identify 的 `agent_version` 以 `/nexusnet` 开头才加入路由表。进入路由表的未识别 PeerId 会被移除；Kademlia 查询仍可能短暂拨号，但不会保留。
-- 同步 `/oahd/service/types` 全局服务类型记录（仅新增、不清理）：本地维护一个**单调并集**，并周期（`services.dispatcher.types_sync_secs`，默认 300s）从 DHT 对端读取（绕过本地 store 副本与缓存，避免自我遮蔽）后重新发布，使各节点即使遭遇并发覆盖也能收敛到完整列表；读取/写入由 registry actor 异步完成，单飞并带 dirty 重跑
+- 同步 `/oahd/service/types` 全局服务类型记录（**带租约、会清理**）：DHT 值为无版本 tuple 数组 `[["ocr",1700003600], ...]`。本地按 `name -> expires_at` 维护，周期（`services.dispatcher.types_sync_secs`，默认 300s）从 DHT 对端读取（绕过本地 store 副本与缓存，避免自我遮蔽）后合并未过期条目并取 `max(expires_at)`，删除已过期条目并写回；本地 `announced` 服务每次 reconcile 续期为 `now + services.registry.type_ttl_secs`（默认 1800s），没有本地 provider 的节点不能延长远端过期时间。读取/写入由 registry actor 异步完成，单飞并带 dirty 重跑
+- `/oahd/service/types` 采用**无版本格式变更**：旧节点写入的 `["ocr","cmd"]` 仍可被新节点读取，旧字符串条目获得一次迁移期过期时间（`now + type_ttl_secs`），随后必须由本地 provider 续期。新节点一律写回 tuple 格式；本版本**不做旧节点滚动兼容**，升级时应先停止旧节点写入，再升级全部节点
 - `compat.max_record_bytes` 默认 14 KiB，确保旧版 Kademlia 16 KiB 包能承载 DHT 写入；超过上限的 auth/service 写入直接拒绝。全量升级后再调大。
 - `BootstrapCompleted` / `reannounce_services` 会清空本地 `announced` 状态并重新宣告，避免 DHT 重建后停留在旧状态。
 - `list_services` → 立即返回本地快照，并在后台触发一次类型索引刷新（最终一致）
@@ -327,7 +332,7 @@ TCP → HTTP WebSocket → multistream-select → TLS/Noise → Yamux → 应用
 - 后台刷新失败时保留旧结果，只记录错误；下一次查询会再次触发刷新。
 - 没有 fresh/stale 窗口、全局 permit、缓存层 timeout 或失败退避。
 - auth 缓存仍由 `AuthGate` 检查 `expires_at` 与 `version`；文档过期或 rollback 仍然拒绝。
-- `/oahd/service/types` 使用旧版 registry 并集，不进入这个缓存。
+- `/oahd/service/types` 由服务类型租约逻辑直接读写，不进入这个缓存。
 
 `refresh_cache` 清空上述应用缓存，并删除 Kademlia 本地 store 中非本节点发布的副本。
 
