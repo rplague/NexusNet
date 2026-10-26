@@ -80,6 +80,7 @@ pub enum AuthError {
     /// Whitelist hash/length does not match the index record (mix-and-match protection).
     HashMismatch,
     /// Service not in the index (non-fatal: the caller warns and allows).
+    #[allow(dead_code)]
     NotInIndex,
     /// Record or entry count exceeds the limit.
     TooLarge,

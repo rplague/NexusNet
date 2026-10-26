@@ -15,11 +15,11 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use libp2p::kad;
 use tokio::sync::{mpsc, watch};
@@ -47,15 +47,30 @@ fn service_key(name: &str) -> kad::RecordKey {
     kad::RecordKey::new(&format!("/oahd/service/{name}"))
 }
 
-fn merge_type_set(known: &mut BTreeSet<String>, incoming: impl IntoIterator<Item = String>) {
-    for name in incoming {
-        if known.len() >= MAX_TYPES {
-            break;
-        }
-        if auth::is_valid_service_name(&name) {
-            known.insert(name);
-        }
+fn current_unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default()
+}
+
+fn merge_type_lease(known: &mut BTreeMap<String, u64>, name: String, expires_at: u64) {
+    if !auth::is_valid_service_name(&name) {
+        return;
     }
+    if let Some(existing) = known.get_mut(&name) {
+        *existing = (*existing).max(expires_at);
+        return;
+    }
+    if known.len() < MAX_TYPES {
+        known.insert(name, expires_at);
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ParsedTypes {
+    leases: BTreeMap<String, u64>,
+    legacy: bool,
 }
 
 #[allow(dead_code)]
@@ -115,7 +130,7 @@ enum JobResult {
     },
     TypesRead {
         generation: u64,
-        result: Result<Vec<String>, String>,
+        result: Result<ParsedTypes, String>,
     },
     TypesWritten {
         generation: u64,
@@ -145,7 +160,7 @@ struct RegistryState {
     withdraw_inflight: HashSet<String>,
     announce_failures: HashMap<String, u32>,
     announce_retry_at: HashMap<String, Instant>,
-    known_types: BTreeSet<String>,
+    known_types: BTreeMap<String, u64>,
     reconcile: ReconcileState,
     reconcile_dirty: bool,
     next_types_sync: Option<Instant>,
@@ -169,7 +184,7 @@ impl RegistryState {
             withdraw_inflight: HashSet::new(),
             announce_failures: HashMap::new(),
             announce_retry_at: HashMap::new(),
-            known_types: BTreeSet::new(),
+            known_types: BTreeMap::new(),
             reconcile: ReconcileState::Idle,
             reconcile_dirty: false,
             next_types_sync: None,
@@ -180,6 +195,36 @@ impl RegistryState {
 
     fn sync_interval(&self) -> Duration {
         Duration::from_secs(self.config.dispatcher_types_sync_interval() as u64)
+    }
+
+    fn insert_lease(&mut self, name: &str, expires_at: u64) {
+        if !auth::is_valid_service_name(name) {
+            return;
+        }
+        if self.known_types.len() >= MAX_TYPES && !self.known_types.contains_key(name) {
+            return;
+        }
+        self.known_types.insert(name.to_string(), expires_at);
+    }
+
+    fn merge_leases(&mut self, remote: &BTreeMap<String, u64>, now: u64) {
+        for (name, expires_at) in remote {
+            if *expires_at > now {
+                merge_type_lease(&mut self.known_types, name.clone(), *expires_at);
+            }
+        }
+    }
+
+    fn prune_expired(&mut self, now: u64) {
+        self.known_types.retain(|_, expires_at| *expires_at > now);
+    }
+
+    fn live_names(&self, now: u64) -> BTreeSet<String> {
+        self.known_types
+            .iter()
+            .filter(|(_, expires_at)| **expires_at > now)
+            .map(|(name, _)| name.clone())
+            .collect()
     }
 
     fn relay_ready(&self) -> bool {
@@ -455,6 +500,11 @@ impl RegistryState {
                         self.announce_failures.remove(&service);
                         self.announce_retry_at.remove(&service);
                         self.announced.insert(service.clone());
+                        self.insert_lease(
+                            &service,
+                            current_unix_secs()
+                                .saturating_add(self.config.registry_type_ttl_secs()),
+                        );
                         self.mark_types_dirty(now);
                         if !self.relay_ready() {
                             self.relay_withdraw.insert(service.clone());
@@ -550,12 +600,21 @@ impl RegistryState {
                     return;
                 }
                 match result {
-                    Ok(network_types) => {
-                        let network_set: BTreeSet<String> = network_types.iter().cloned().collect();
-                        merge_type_set(&mut self.known_types, network_types);
-                        let announced: Vec<String> = self.announced.iter().cloned().collect();
-                        merge_type_set(&mut self.known_types, announced);
-                        if self.known_types.is_empty() || self.known_types == network_set {
+                    Ok(parsed) => {
+                        let now_secs = current_unix_secs();
+                        let ttl = self.config.registry_type_ttl_secs();
+                        self.prune_expired(now_secs);
+
+                        let remote_leases = parsed.leases;
+                        self.merge_leases(&remote_leases, now_secs);
+                        let announced: BTreeSet<String> = self.announced.iter().cloned().collect();
+                        for service in announced {
+                            self.insert_lease(&service, now_secs.saturating_add(ttl));
+                        }
+                        self.prune_expired(now_secs);
+                        let unchanged = !parsed.legacy && self.known_types == remote_leases;
+
+                        if unchanged {
                             self.reconcile = ReconcileState::Idle;
                             self.pending_types_write = None;
                             self.next_types_sync = Some(now + self.sync_interval());
@@ -564,7 +623,11 @@ impl RegistryState {
                                 self.next_types_sync = Some(now);
                             }
                         } else {
-                            let list: Vec<String> = self.known_types.iter().cloned().collect();
+                            let list: Vec<(String, u64)> = self
+                                .known_types
+                                .iter()
+                                .map(|(name, expires_at)| (name.clone(), *expires_at))
+                                .collect();
                             let max_bytes = self.config.compat_max_record_bytes() as usize;
                             match encode_types_limited(&list, max_bytes) {
                                 Ok((value, included)) => {
@@ -635,7 +698,8 @@ impl RegistryState {
     }
 
     fn snapshot(&self) -> ServiceSnapshot {
-        let mut types = self.known_types.clone();
+        let now_secs = current_unix_secs();
+        let mut types = self.live_names(now_secs);
         types.extend(self.announced.iter().cloned());
         let announced: Vec<String> = self
             .announced
@@ -773,12 +837,15 @@ impl ServiceRegistryActor {
                 });
             }
             JobSpec::ReadTypes { generation } => {
+                let legacy_expires_at =
+                    current_unix_secs().saturating_add(self.config.registry_type_ttl_secs());
                 self.jobs.spawn(async move {
                     let result = match dht.get_record_network(types_key()).await {
                         Ok(kad::GetRecordOk::FoundRecord(record)) => {
-                            parse_types(&record.record.value).map_err(|e| e.to_string())
+                            parse_types(&record.record.value, legacy_expires_at)
+                                .map_err(|e| e.to_string())
                         }
-                        Ok(_) => Ok(Vec::new()),
+                        Ok(_) => Ok(ParsedTypes::default()),
                         Err(error) => Err(error),
                     };
                     JobResult::TypesRead { generation, result }
@@ -854,7 +921,7 @@ impl ServiceRegistryActor {
 }
 
 fn encode_types_limited(
-    list: &[String],
+    list: &[(String, u64)],
     max_bytes: usize,
 ) -> Result<(Vec<u8>, usize), serde_json::Error> {
     let full = serde_json::to_vec(list)?;
@@ -875,13 +942,37 @@ fn encode_types_limited(
     Ok((serde_json::to_vec(&list[..low])?, low))
 }
 
-fn parse_types(value: &[u8]) -> Result<Vec<String>, serde_json::Error> {
-    let types: Vec<String> = serde_json::from_slice(value)?;
-    Ok(types
-        .into_iter()
-        .filter(|name| auth::is_valid_service_name(name))
-        .take(MAX_TYPES)
-        .collect())
+fn parse_types(value: &[u8], legacy_expires_at: u64) -> Result<ParsedTypes, serde_json::Error> {
+    let entries: Vec<serde_json::Value> = serde_json::from_slice(value)?;
+    let mut parsed = ParsedTypes::default();
+    for entry in entries {
+        let (name, expires_at, legacy) = if let Some(name) = entry.as_str() {
+            (name, legacy_expires_at, true)
+        } else if let Some(pair) = entry.as_array() {
+            if pair.len() != 2 {
+                continue;
+            }
+            let (Some(name), Some(expires_at)) = (pair[0].as_str(), pair[1].as_u64()) else {
+                continue;
+            };
+            (name, expires_at, false)
+        } else {
+            continue;
+        };
+        if !auth::is_valid_service_name(name) {
+            continue;
+        }
+        if parsed.leases.len() >= MAX_TYPES && !parsed.leases.contains_key(name) {
+            continue;
+        }
+        parsed.legacy |= legacy;
+        parsed
+            .leases
+            .entry(name.to_string())
+            .and_modify(|existing| *existing = (*existing).max(expires_at))
+            .or_insert(expires_at);
+    }
+    Ok(parsed)
 }
 
 pub fn spawn(
@@ -931,7 +1022,7 @@ fn spawn_with_dht(
 struct MockDht {
     start_delay: Duration,
     fail_start: std::sync::atomic::AtomicBool,
-    types: std::sync::Mutex<Vec<String>>,
+    types: std::sync::Mutex<Vec<(String, u64)>>,
 }
 
 #[cfg(test)]
@@ -967,7 +1058,8 @@ impl MockDht {
     }
 
     fn put_record(&self, value: Vec<u8>) -> Result<(), String> {
-        let types: Vec<String> = serde_json::from_slice(&value).map_err(|e| e.to_string())?;
+        let types: Vec<(String, u64)> =
+            serde_json::from_slice(&value).map_err(|e| e.to_string())?;
         *self.types.lock().expect("mock types poisoned") = types;
         Ok(())
     }
@@ -1001,13 +1093,236 @@ mod tests {
         state.plan(now, 8)
     }
 
+    fn future_secs() -> u64 {
+        current_unix_secs() + 10_000
+    }
+
+    fn parsed_types(entries: &[(&str, u64)]) -> ParsedTypes {
+        ParsedTypes {
+            leases: entries
+                .iter()
+                .map(|(name, expires_at)| ((*name).to_string(), *expires_at))
+                .collect(),
+            legacy: false,
+        }
+    }
+
     #[test]
     fn type_index_encoder_caps_to_limit() {
-        let list: Vec<String> = (0..100).map(|i| format!("svc{i:03}")).collect();
+        let list: Vec<(String, u64)> = (0..100)
+            .map(|i| (format!("svc{i:03}"), 1_700_000_000))
+            .collect();
         let (value, included) = encode_types_limited(&list, 64).unwrap();
         assert!(value.len() <= 64);
         assert!(included > 0 && included < list.len());
-        assert_eq!(parse_types(&value).unwrap().len(), included);
+        assert_eq!(parse_types(&value, 0).unwrap().leases.len(), included);
+    }
+
+    #[test]
+    fn parse_types_migrates_legacy_strings_once() {
+        let legacy_expires_at = 1_700_001_800;
+        let parsed = parse_types(br#"["ocr","cmd"]"#, legacy_expires_at).unwrap();
+        assert!(parsed.legacy);
+        assert_eq!(parsed.leases.get("ocr"), Some(&legacy_expires_at));
+        assert_eq!(parsed.leases.get("cmd"), Some(&legacy_expires_at));
+    }
+
+    #[test]
+    fn parse_types_accepts_tuple_leases() {
+        let parsed = parse_types(br#"[["ocr",1700003600],["cmd",1700003700]]"#, 1).unwrap();
+        assert!(!parsed.legacy);
+        assert_eq!(parsed.leases.get("ocr"), Some(&1_700_003_600));
+        assert_eq!(parsed.leases.get("cmd"), Some(&1_700_003_700));
+    }
+
+    #[test]
+    fn encode_types_uses_compact_tuples() {
+        let list = vec![
+            ("cmd".to_string(), 1_700_003_600),
+            ("ocr".to_string(), 1_700_003_700),
+        ];
+        let (value, included) = encode_types_limited(&list, 1024).unwrap();
+        assert_eq!(included, 2);
+        assert_eq!(
+            std::str::from_utf8(&value).unwrap(),
+            r#"[["cmd",1700003600],["ocr",1700003700]]"#
+        );
+    }
+
+    #[test]
+    fn parse_types_caps_at_max_types() {
+        let names: Vec<String> = (0..MAX_TYPES + 10)
+            .map(|index| format!("svc{index:04}"))
+            .collect();
+        let value = serde_json::to_vec(&names).unwrap();
+        let parsed = parse_types(&value, future_secs()).unwrap();
+        assert_eq!(parsed.leases.len(), MAX_TYPES);
+    }
+
+    #[test]
+    fn announce_success_sets_local_type_expiry() {
+        let mut state = RegistryState::new(config_with_services(&["cmd"]));
+        let now = Instant::now();
+        let jobs = announce_services(&mut state, &["cmd"], now);
+        let JobSpec::Announce {
+            generation,
+            service,
+            ..
+        } = jobs.into_iter().next().unwrap()
+        else {
+            panic!("expected announce");
+        };
+        let before = current_unix_secs();
+        state.apply(
+            JobResult::Announced {
+                generation,
+                service,
+                result: Ok(()),
+            },
+            now,
+        );
+        let expires_at = *state.known_types.get("cmd").unwrap();
+        assert!(expires_at >= before + state.config.registry_type_ttl_secs());
+        assert!(state.snapshot().types.contains(&"cmd".to_string()));
+    }
+
+    #[test]
+    fn reconcile_renews_local_announced_types() {
+        let mut state = RegistryState::new(config_with_services(&["cmd"]));
+        let now = Instant::now();
+        state.announced.insert("cmd".to_string());
+        state
+            .known_types
+            .insert("cmd".to_string(), current_unix_secs() + 1);
+        state.reconcile = ReconcileState::Reading;
+
+        state.apply(
+            JobResult::TypesRead {
+                generation: state.generation,
+                result: Ok(ParsedTypes::default()),
+            },
+            now,
+        );
+
+        let expires_at = *state.known_types.get("cmd").unwrap();
+        assert!(expires_at >= current_unix_secs() + state.config.registry_type_ttl_secs());
+    }
+
+    #[test]
+    fn reconcile_drops_expired_without_local_provider() {
+        let mut state = RegistryState::new(config_with_services(&[]));
+        let now = Instant::now();
+        let expired = current_unix_secs().saturating_sub(10);
+        state.known_types.insert("old".to_string(), expired);
+        state.reconcile = ReconcileState::Reading;
+
+        state.apply(
+            JobResult::TypesRead {
+                generation: state.generation,
+                result: Ok(parsed_types(&[("old", expired)])),
+            },
+            now,
+        );
+
+        assert!(!state.known_types.contains_key("old"));
+        assert!(state.snapshot().types.is_empty());
+        let jobs = state.plan(now, 4);
+        let JobSpec::WriteTypes { value, .. } = jobs
+            .into_iter()
+            .find(|job| matches!(job, JobSpec::WriteTypes { .. }))
+            .unwrap()
+        else {
+            panic!("expected write");
+        };
+        assert!(parse_types(&value, 0).unwrap().leases.is_empty());
+    }
+
+    #[test]
+    fn reconcile_keeps_max_remote_expiry() {
+        let mut state = RegistryState::new(config_with_services(&[]));
+        let now = Instant::now();
+        let base = future_secs();
+        state.known_types.insert("ocr".to_string(), base);
+        state.reconcile = ReconcileState::Reading;
+
+        state.apply(
+            JobResult::TypesRead {
+                generation: state.generation,
+                result: Ok(parsed_types(&[("ocr", base - 100), ("cmd", base + 50)])),
+            },
+            now,
+        );
+
+        assert_eq!(state.known_types.get("ocr"), Some(&base));
+        assert_eq!(state.known_types.get("cmd"), Some(&(base + 50)));
+    }
+
+    #[test]
+    fn without_local_provider_remote_expiry_is_not_extended() {
+        let mut state = RegistryState::new(config_with_services(&[]));
+        let now = Instant::now();
+        let remote_expiry = future_secs();
+        state.reconcile = ReconcileState::Reading;
+        state.apply(
+            JobResult::TypesRead {
+                generation: state.generation,
+                result: Ok(parsed_types(&[("ocr", remote_expiry)])),
+            },
+            now,
+        );
+        assert_eq!(state.known_types.get("ocr"), Some(&remote_expiry));
+
+        state.reconcile = ReconcileState::Reading;
+        state.apply(
+            JobResult::TypesRead {
+                generation: state.generation,
+                result: Ok(parsed_types(&[("ocr", remote_expiry)])),
+            },
+            now + Duration::from_secs(30),
+        );
+        assert_eq!(state.known_types.get("ocr"), Some(&remote_expiry));
+    }
+
+    #[test]
+    fn provider_recovery_restores_expired_service() {
+        let mut state = RegistryState::new(config_with_services(&["cmd"]));
+        let now = Instant::now();
+        state
+            .known_types
+            .insert("cmd".to_string(), current_unix_secs().saturating_sub(1));
+        assert!(!state.snapshot().types.contains(&"cmd".to_string()));
+
+        let jobs = announce_services(&mut state, &["cmd"], now);
+        let JobSpec::Announce {
+            generation,
+            service,
+            ..
+        } = jobs.into_iter().next().unwrap()
+        else {
+            panic!("expected announce");
+        };
+        state.apply(
+            JobResult::Announced {
+                generation,
+                service,
+                result: Ok(()),
+            },
+            now,
+        );
+
+        assert!(state.snapshot().types.contains(&"cmd".to_string()));
+    }
+
+    #[test]
+    fn snapshot_filters_expired_types() {
+        let mut state = RegistryState::new(config_with_services(&[]));
+        let now = current_unix_secs();
+        state.known_types.insert("live".to_string(), now + 60);
+        state
+            .known_types
+            .insert("dead".to_string(), now.saturating_sub(1));
+
+        assert_eq!(state.snapshot().types, vec!["live".to_string()]);
     }
 
     #[test]
@@ -1260,7 +1575,7 @@ mod tests {
         state.apply(
             JobResult::TypesRead {
                 generation,
-                result: Ok(Vec::new()),
+                result: Ok(ParsedTypes::default()),
             },
             now,
         );
@@ -1309,7 +1624,7 @@ mod tests {
         state.apply(
             JobResult::TypesRead {
                 generation,
-                result: Ok(Vec::new()),
+                result: Ok(ParsedTypes::default()),
             },
             now,
         );
@@ -1322,7 +1637,14 @@ mod tests {
         else {
             panic!("expected write");
         };
-        assert_eq!(parse_types(&value).unwrap(), vec!["cmd".to_string()]);
+        assert_eq!(
+            parse_types(&value, 0)
+                .unwrap()
+                .leases
+                .keys()
+                .collect::<Vec<_>>(),
+            vec!["cmd"]
+        );
     }
 
     #[test]
@@ -1380,7 +1702,7 @@ mod tests {
     fn reconcile_dirty_reruns_after_write() {
         let mut state = RegistryState::new(config_with_services(&["cmd"]));
         let now = Instant::now();
-        state.known_types.insert("ocr".to_string());
+        state.known_types.insert("ocr".to_string(), future_secs());
         state.handle(ServiceCommand::BootstrapCompleted, now);
         let jobs = state.plan(now, 4);
         let JobSpec::ReadTypes { generation } = jobs
@@ -1393,7 +1715,7 @@ mod tests {
         state.apply(
             JobResult::TypesRead {
                 generation,
-                result: Ok(vec!["cmd".to_string()]),
+                result: Ok(parsed_types(&[("cmd", future_secs())])),
             },
             now,
         );
@@ -1480,7 +1802,7 @@ mod tests {
     fn reconcile_is_single_flight_and_publishes_types() {
         let mut state = RegistryState::new(config_with_services(&["cmd"]));
         let now = Instant::now();
-        state.known_types.insert("ocr".to_string());
+        state.known_types.insert("ocr".to_string(), future_secs());
         state.handle(ServiceCommand::BootstrapCompleted, now);
         let jobs = state.plan(now, 4);
         let JobSpec::ReadTypes { generation } = jobs
@@ -1501,7 +1823,7 @@ mod tests {
         state.apply(
             JobResult::TypesRead {
                 generation,
-                result: Ok(vec!["cmd".to_string()]),
+                result: Ok(parsed_types(&[("cmd", future_secs())])),
             },
             now,
         );

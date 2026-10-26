@@ -167,8 +167,12 @@ impl NetBehaviour {
         // Republish well before expiry so remote copies never lapse.
         kad_config.set_publication_interval(Some(record_ttl / 2));
         // Provider records are renewed by libp2p's periodic provider job.
-        kad_config.set_provider_record_ttl(Some(Duration::from_secs(48 * 60 * 60)));
-        kad_config.set_provider_publication_interval(Some(Duration::from_secs(60 * 60)));
+        kad_config.set_provider_record_ttl(Some(Duration::from_secs(
+            config.kademlia_provider_record_ttl().into(),
+        )));
+        kad_config.set_provider_publication_interval(Some(Duration::from_secs(
+            config.kademlia_provider_publication_interval().into(),
+        )));
         kad_config.set_query_timeout(Duration::from_secs(config.kademlia_query_timeout().into()));
         if let Some(rf) = NonZeroUsize::new(config.kademlia_replication_factor() as usize) {
             kad_config.set_replication_factor(rf);
