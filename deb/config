@@ -320,6 +320,7 @@ WIZ_INPUT_H=11
 
 LS_FILE="${WIZ_TMP}/local_services"
 : > "${LS_FILE}"
+BS_FILE="${WIZ_TMP}/bootstrap_nodes"
 
 wt() {
     WT_OUT="${WIZ_TMP}/whiptail.out"
@@ -376,64 +377,147 @@ wt_yesno_defaultno() {
         --yesno "$1" "${_h}" "${_w}"
 }
 
-wt_editbox() {
-    _file="$1"
-    _title="${2:-NexusNet}"
-    _h=18
-    _w=82
-    [ "${_h}" -gt "${WIZ_H}" ] && _h="${WIZ_H}"
-    [ "${_w}" -gt "${WIZ_W}" ] && _w="${WIZ_W}"
-    set +e
-    whiptail --backtitle "NexusNet 安装向导" --title "${_title}" \
-        --ok-button "确定" --cancel-button "返回" \
-        --editbox "${_file}" "${_h}" "${_w}" < /dev/tty > /dev/tty 2>&1
-    _status=$?
-    set -e
-    return "${_status}"
-}
-
 # --- bootstrap --------------------------------------------------------------
 
-bootstrap_to_lines() {
-    _out="$1"
-    : > "${_out}"
+bs_init() {
+    : > "${BS_FILE}"
     printf '%s\n' "${BOOTSTRAP}" | tr ',' '\n' | while IFS= read -r _line; do
         _line="$(printf '%s' "${_line}" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
         if [ -n "${_line}" ]; then
-            printf '%s\n' "${_line}" >> "${_out}"
+            printf '%s\n' "${_line}" >> "${BS_FILE}"
         fi
     done
     return 0
 }
 
-validate_bootstrap_file() {
-    _file="$1"
-    BOOTSTRAP_RESULT=""
-    BOOTSTRAP_ERROR=""
+bs_count() {
+    _count="$(wc -l < "${BS_FILE}" 2>/dev/null || printf '0')"
+    printf '%s' "${_count}" | tr -d '[:space:]'
+}
+
+bs_to_csv() {
+    _first=1
     while IFS= read -r _line; do
-        _line="$(printf '%s' "${_line}" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
         [ -n "${_line}" ] || continue
-        case "${_line}" in
-            *"/ws"*) ;;
-            *)
-                BOOTSTRAP_ERROR="bootstrap 必须包含 /ws：${_line}"
-                return 1
-                ;;
-        esac
-        case "${_line}" in
-            *"/p2p/"*) ;;
-            *)
-                BOOTSTRAP_ERROR="bootstrap 必须包含 /p2p/<PeerId>：${_line}"
-                return 1
-                ;;
-        esac
-        if [ -n "${BOOTSTRAP_RESULT}" ]; then
-            BOOTSTRAP_RESULT="${BOOTSTRAP_RESULT},${_line}"
+        if [ "${_first}" -eq 1 ]; then
+            printf '%s' "${_line}"
+            _first=0
         else
-            BOOTSTRAP_RESULT="${_line}"
+            printf ',%s' "${_line}"
         fi
-    done < "${_file}"
+    done < "${BS_FILE}"
+}
+
+bs_has_value() {
+    _want="$1"
+    _skip="${2:-}"
+    _idx=0
+    while IFS= read -r _line; do
+        if [ "${_idx}" != "${_skip}" ] && [ "${_line}" = "${_want}" ]; then
+            return 0
+        fi
+        _idx=$((_idx + 1))
+    done < "${BS_FILE}"
+    return 1
+}
+
+bs_get_index() {
+    _want="$1"
+    _idx=0
+    BS_VALUE=""
+    while IFS= read -r _line; do
+        if [ "${_idx}" = "${_want}" ]; then
+            BS_VALUE="${_line}"
+            return 0
+        fi
+        _idx=$((_idx + 1))
+    done < "${BS_FILE}"
+    return 1
+}
+
+bs_add() {
+    printf '%s\n' "$1" >> "${BS_FILE}"
+}
+
+bs_replace_index() {
+    _want="$1"
+    _new="$2"
+    _tmp="${BS_FILE}.tmp"
+    : > "${_tmp}"
+    _idx=0
+    while IFS= read -r _line; do
+        if [ "${_idx}" = "${_want}" ]; then
+            printf '%s\n' "${_new}" >> "${_tmp}"
+        else
+            printf '%s\n' "${_line}" >> "${_tmp}"
+        fi
+        _idx=$((_idx + 1))
+    done < "${BS_FILE}"
+    mv "${_tmp}" "${BS_FILE}"
+}
+
+bs_remove_index() {
+    _want="$1"
+    _tmp="${BS_FILE}.tmp"
+    : > "${_tmp}"
+    _idx=0
+    while IFS= read -r _line; do
+        if [ "${_idx}" != "${_want}" ]; then
+            printf '%s\n' "${_line}" >> "${_tmp}"
+        fi
+        _idx=$((_idx + 1))
+    done < "${BS_FILE}"
+    mv "${_tmp}" "${BS_FILE}"
+}
+
+validate_bootstrap_addr() {
+    _value="$1"
+    BS_ADDR_RESULT=""
+    BOOTSTRAP_ERROR=""
+    _value="$(printf '%s' "${_value}" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    if [ -z "${_value}" ]; then
+        BOOTSTRAP_ERROR="Bootstrap 地址不能为空。"
+        return 1
+    fi
+    case "${_value}" in
+        *","*|*" "*)
+            BOOTSTRAP_ERROR="单条 Bootstrap 地址不能包含逗号或空格：${_value}"
+            return 1
+            ;;
+    esac
+    case "${_value}" in
+        *"/ws"*) ;;
+        *)
+            BOOTSTRAP_ERROR="Bootstrap 必须包含 /ws：${_value}"
+            return 1
+            ;;
+    esac
+    case "${_value}" in
+        *"/p2p/"*) ;;
+        *)
+            BOOTSTRAP_ERROR="Bootstrap 必须包含 /p2p/<PeerId>：${_value}"
+            return 1
+            ;;
+    esac
+    BS_ADDR_RESULT="${_value}"
     return 0
+}
+
+bs_prompt() {
+    _value="$1"
+    _title="$2"
+    while :; do
+        if ! wt_input "Bootstrap multiaddr（必须包含 /ws 和 /p2p/<PeerId>）" \
+            "${_value}" "${_title}"; then
+            return 1
+        fi
+        _value="${WT_RESULT}"
+        if validate_bootstrap_addr "${_value}"; then
+            BS_PROMPT_RESULT="${BS_ADDR_RESULT}"
+            return 0
+        fi
+        wt_msg "${BOOTSTRAP_ERROR}" 10 78
+    done
 }
 
 # --- local service list -----------------------------------------------------
@@ -906,20 +990,74 @@ page_network() {
 }
 
 page_bootstrap() {
-    _file="${WIZ_TMP}/bootstrap"
-    bootstrap_to_lines "${_file}"
+    bs_init
 
     while :; do
-        if ! wt_editbox "${_file}" "NexusNet - Bootstrap"; then
+        _count="$(bs_count)"
+        _list_h=$((_count + 2))
+        [ "${_list_h}" -lt 3 ] && _list_h=3
+        [ "${_list_h}" -gt "${WIZ_LIST_H}" ] && _list_h="${WIZ_LIST_H}"
+        _menu_h=$((_list_h + 6))
+        [ "${_menu_h}" -gt "${WIZ_H}" ] && _menu_h="${WIZ_H}"
+        _menu_text="Bootstrap 节点（每项必须包含 /ws 和 /p2p/<PeerId>）
+当前 ${_count} 个；保存后写入逗号分隔列表"
+
+        set -- --menu "${_menu_text}" "${_menu_h}" "${WIZ_W}" "${_list_h}"
+        _idx=0
+        while IFS= read -r _line; do
+            [ -n "${_line}" ] || continue
+            set -- "$@" "bs:${_idx}" "$((_idx + 1)). ${_line}"
+            _idx=$((_idx + 1))
+        done < "${BS_FILE}"
+        set -- "$@" "__add__" "添加 Bootstrap" "__save__" "保存并返回"
+
+        if ! wt_menu --title "NexusNet - Bootstrap" --cancel-button "取消" "$@"; then
             PAGE_NEXT="network"
             return 0
         fi
-        if validate_bootstrap_file "${_file}"; then
-            BOOTSTRAP="${BOOTSTRAP_RESULT}"
-            PAGE_NEXT="summary"
-            return 0
-        fi
-        wt_msg "${BOOTSTRAP_ERROR}" 10 78
+
+        case "${WT_RESULT}" in
+            __save__)
+                BOOTSTRAP="$(bs_to_csv)"
+                PAGE_NEXT="summary"
+                return 0
+                ;;
+            __add__)
+                if bs_prompt "" "NexusNet - Bootstrap"; then
+                    if bs_has_value "${BS_PROMPT_RESULT}"; then
+                        wt_msg "该 Bootstrap 已存在。" 9 74
+                    else
+                        bs_add "${BS_PROMPT_RESULT}"
+                    fi
+                fi
+                ;;
+            bs:*)
+                _index="${WT_RESULT#bs:}"
+                if bs_get_index "${_index}"; then
+                    _selected="${BS_VALUE}"
+                    if wt_menu --title "Bootstrap - $((_index + 1))" --cancel-button "返回列表" --menu \
+                        "选择操作" 12 "${WIZ_W}" 3 \
+                        edit "编辑此地址" delete "删除此地址"; then
+                        case "${WT_RESULT}" in
+                            edit)
+                                if bs_prompt "${_selected}" "NexusNet - Bootstrap"; then
+                                    if bs_has_value "${BS_PROMPT_RESULT}" "${_index}"; then
+                                        wt_msg "该 Bootstrap 已存在。" 9 74
+                                    else
+                                        bs_replace_index "${_index}" "${BS_PROMPT_RESULT}"
+                                    fi
+                                fi
+                                ;;
+                            delete)
+                                if wt_yesno_defaultno "确定删除 Bootstrap ${_selected}？" 10 78; then
+                                    bs_remove_index "${_index}"
+                                fi
+                                ;;
+                        esac
+                    fi
+                fi
+                ;;
+        esac
     done
 }
 

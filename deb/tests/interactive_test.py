@@ -50,7 +50,7 @@ import sys
 
 args = sys.argv[1:]
 kind = None
-for option in ("--menu", "--inputbox", "--yesno", "--msgbox", "--checklist", "--editbox"):
+for option in ("--menu", "--inputbox", "--yesno", "--msgbox", "--checklist"):
     if option in args:
         kind = option[2:]
         break
@@ -78,10 +78,6 @@ if response["kind"] != kind:
     sys.stderr.write(f"expected {response['kind']} got {kind} at {index}\n")
     sys.exit(91)
 
-if kind == "editbox":
-    path = args[args.index("--editbox") + 1]
-    open(path, "w", encoding="utf-8").write(response.get("write", ""))
-    sys.exit(0)
 if kind in ("msgbox", "yesno"):
     sys.exit(int(response.get("status", 0)))
 
@@ -137,7 +133,7 @@ class InteractiveTest(unittest.TestCase):
             encoding="utf-8",
         )
 
-    def run_config(self):
+    def run_config(self, config_path=None):
         env = os.environ.copy()
         env.update(
             {
@@ -145,7 +141,7 @@ class InteractiveTest(unittest.TestCase):
                 "DEBCONF_RECONFIGURE": "",
                 "PATH": str(self.bin) + ":" + env.get("PATH", ""),
                 "TEST_DB_STORE": str(self.db),
-                "TEST_CONFIG": str(self.dir / "config.toml"),
+                "TEST_CONFIG": str(config_path or (self.dir / "config.toml")),
                 "FAKE_WT_RESPONSES": str(self.responses),
                 "FAKE_WT_COUNTER": str(self.counter),
                 "FAKE_WT_LOG": str(self.dir / "calls.jsonl"),
@@ -212,17 +208,19 @@ class InteractiveTest(unittest.TestCase):
                 {"kind": "menu", "value": "svc:ocr"},
                 {"kind": "menu", "value": "__save__"},
                 {"kind": "menu", "value": "next"},
+                {"kind": "menu", "value": "__add__"},
                 {
-                    "kind": "editbox",
-                    "write": "/ip4/1.2.3.4/tcp/5000/ws/p2p/12D3KooWExample\n",
+                    "kind": "inputbox",
+                    "value": "/ip4/1.2.3.4/tcp/5000/ws/p2p/12D3KooWExample",
                 },
+                {"kind": "menu", "value": "__save__"},
                 {"kind": "yesno", "status": 0},
             ]
         )
 
         status, output = self.run_config()
         self.assertEqual(status, 0, output)
-        self.assertEqual(self.calls(), 16)
+        self.assertEqual(self.calls(), 18)
         self.assertEqual(self.value("setup_mode"), "wizard")
         self.assertEqual(self.value("node_name"), "node-a")
         self.assertEqual(self.value("node_description"), "desc")
@@ -250,9 +248,35 @@ class InteractiveTest(unittest.TestCase):
 
         status, output = self.run_config()
         self.assertEqual(status, 0, output)
-        self.assertEqual(self.calls(), 16)
+        self.assertEqual(self.calls(), 18)
         self.assertEqual(self.value("node_name"), "node-a")
         self.assertEqual(self.value("local_services"), "ocr:7000:1")
+
+    def test_existing_bootstrap_is_loaded_and_edited(self):
+        self.set_responses(
+            [
+                {"kind": "menu", "value": "wizard"},
+                {"kind": "inputbox", "value": "edge-01"},
+                {"kind": "inputbox", "value": "Edge node"},
+                {"kind": "menu", "value": "next"},
+                {"kind": "menu", "value": "bs:0"},
+                {"kind": "menu", "value": "edit"},
+                {
+                    "kind": "inputbox",
+                    "value": "/ip4/5.5.5.5/tcp/5000/ws/p2p/PeerEEE",
+                },
+                {"kind": "menu", "value": "__save__"},
+                {"kind": "yesno", "status": 0},
+            ]
+        )
+
+        status, output = self.run_config(FIXTURES / "existing.toml")
+        self.assertEqual(status, 0, output)
+        self.assertEqual(self.calls(), 9)
+        self.assertEqual(
+            self.value("bootstrap"),
+            "/ip4/5.5.5.5/tcp/5000/ws/p2p/PeerEEE",
+        )
 
     def test_auth_toggle_discard_restores_flags(self):
         self.set_responses(
@@ -274,7 +298,50 @@ class InteractiveTest(unittest.TestCase):
                 {"kind": "menu", "value": "svc:ocr"},
                 {"kind": "menu", "status": 1},
                 {"kind": "menu", "value": "next"},
-                {"kind": "editbox", "write": ""},
+                {"kind": "menu", "value": "__add__"},
+                {
+                    "kind": "inputbox",
+                    "value": "/ip4/1.2.3.4/tcp/5000/ws/p2p/12D3KooWExample",
+                },
+                {"kind": "menu", "value": "__save__"},
+                {"kind": "yesno", "status": 0},
+            ]
+        )
+
+        status, output = self.run_config()
+        self.assertEqual(status, 0, output)
+        self.assertEqual(self.calls(), 18)
+        self.assertEqual(self.value("local_services_enabled"), "true")
+        self.assertEqual(self.value("local_services"), "ocr:7000")
+        self.assertEqual(self.value("auth_enabled"), "false")
+
+    def test_bootstrap_add_edit_delete(self):
+        self.set_responses(
+            [
+                {"kind": "menu", "value": "wizard"},
+                {"kind": "inputbox", "value": "node-d"},
+                {"kind": "inputbox", "value": "desc"},
+                {"kind": "menu", "value": "next"},
+                {"kind": "menu", "value": "__add__"},
+                {
+                    "kind": "inputbox",
+                    "value": "/ip4/1.1.1.1/tcp/5000/ws/p2p/PeerAAA",
+                },
+                {"kind": "menu", "value": "__add__"},
+                {
+                    "kind": "inputbox",
+                    "value": "/ip4/2.2.2.2/tcp/5000/ws/p2p/PeerBBB",
+                },
+                {"kind": "menu", "value": "bs:0"},
+                {"kind": "menu", "value": "edit"},
+                {
+                    "kind": "inputbox",
+                    "value": "/ip4/3.3.3.3/tcp/5000/ws/p2p/PeerCCC",
+                },
+                {"kind": "menu", "value": "bs:1"},
+                {"kind": "menu", "value": "delete"},
+                {"kind": "yesno", "status": 0},
+                {"kind": "menu", "value": "__save__"},
                 {"kind": "yesno", "status": 0},
             ]
         )
@@ -282,9 +349,10 @@ class InteractiveTest(unittest.TestCase):
         status, output = self.run_config()
         self.assertEqual(status, 0, output)
         self.assertEqual(self.calls(), 16)
-        self.assertEqual(self.value("local_services_enabled"), "true")
-        self.assertEqual(self.value("local_services"), "ocr:7000")
-        self.assertEqual(self.value("auth_enabled"), "false")
+        self.assertEqual(
+            self.value("bootstrap"),
+            "/ip4/3.3.3.3/tcp/5000/ws/p2p/PeerCCC",
+        )
 
     def test_empty_bootstrap_and_no_services(self):
         self.set_responses(
@@ -293,7 +361,7 @@ class InteractiveTest(unittest.TestCase):
                 {"kind": "inputbox", "value": "node-b"},
                 {"kind": "inputbox", "value": "desc"},
                 {"kind": "menu", "value": "next"},
-                {"kind": "editbox", "write": ""},
+                {"kind": "menu", "value": "__save__"},
                 {"kind": "yesno", "status": 0},
             ]
         )
