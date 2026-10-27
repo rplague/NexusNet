@@ -408,6 +408,18 @@ bs_to_csv() {
     done < "${BS_FILE}"
 }
 
+bs_short_addr() {
+    _value="$1"
+    _len=${#_value}
+    if [ "${_len}" -le 70 ]; then
+        BS_SHORT="${_value}"
+        return 0
+    fi
+    _head="$(printf '%s' "${_value}" | cut -c1-40)"
+    _tail="$(printf '%s' "${_value}" | cut -c$((_len - 19))-)"
+    BS_SHORT="${_head}...${_tail}"
+}
+
 bs_has_value() {
     _want="$1"
     _skip="${2:-}"
@@ -880,7 +892,7 @@ configure_auth_page() {
     _list_h=$(( $(ls_count) + 1 ))
     [ "${_list_h}" -lt 3 ] && _list_h=3
     [ "${_list_h}" -gt "${WIZ_LIST_H}" ] && _list_h="${WIZ_LIST_H}"
-    _menu_h=$((_list_h + 6))
+    _menu_h=$((_list_h + 9))
     [ "${_menu_h}" -gt "${WIZ_H}" ] && _menu_h="${WIZ_H}"
     _menu_text="鉴权网络：${_network_candidate}
 回车切换服务鉴权；完成后选择“保存并返回”"
@@ -997,16 +1009,16 @@ page_bootstrap() {
         _list_h=$((_count + 2))
         [ "${_list_h}" -lt 3 ] && _list_h=3
         [ "${_list_h}" -gt "${WIZ_LIST_H}" ] && _list_h="${WIZ_LIST_H}"
-        _menu_h=$((_list_h + 6))
+        _menu_h=$((_list_h + 9))
         [ "${_menu_h}" -gt "${WIZ_H}" ] && _menu_h="${WIZ_H}"
-        _menu_text="Bootstrap 节点（每项必须包含 /ws 和 /p2p/<PeerId>）
-当前 ${_count} 个；保存后写入逗号分隔列表"
+        _menu_text="Bootstrap 节点：当前 ${_count} 个（选择地址可编辑/删除）"
 
         set -- --menu "${_menu_text}" "${_menu_h}" "${WIZ_W}" "${_list_h}"
         _idx=0
         while IFS= read -r _line; do
             [ -n "${_line}" ] || continue
-            set -- "$@" "bs:${_idx}" "$((_idx + 1)). ${_line}"
+            bs_short_addr "${_line}"
+            set -- "$@" "bs:${_idx}" "$((_idx + 1)). ${BS_SHORT}"
             _idx=$((_idx + 1))
         done < "${BS_FILE}"
         set -- "$@" "__add__" "添加 Bootstrap" "__save__" "保存并返回"

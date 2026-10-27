@@ -354,6 +354,39 @@ class InteractiveTest(unittest.TestCase):
             "/ip4/3.3.3.3/tcp/5000/ws/p2p/PeerCCC",
         )
 
+    def test_long_bootstrap_is_truncated_in_menu(self):
+        address = (
+            "/ip6/2604:a880:400:d1:0:5:4458:a001/tcp/5000/ws/p2p/"
+            "12D3KooWGxp7radf7fBFk7E7J5yyu3xc7yNoS1AutJfH1K5dUm4F"
+        )
+        self.set_responses(
+            [
+                {"kind": "menu", "value": "wizard"},
+                {"kind": "inputbox", "value": "node-e"},
+                {"kind": "inputbox", "value": "desc"},
+                {"kind": "menu", "value": "next"},
+                {"kind": "menu", "value": "__add__"},
+                {"kind": "inputbox", "value": address},
+                {"kind": "menu", "value": "__save__"},
+                {"kind": "yesno", "status": 0},
+            ]
+        )
+
+        status, output = self.run_config()
+        self.assertEqual(status, 0, output)
+        self.assertEqual(self.calls(), 8)
+        self.assertEqual(self.value("bootstrap"), address)
+
+        bootstrap_menus = [
+            args for args in self.menu_calls()
+            if "NexusNet - Bootstrap" in args
+        ]
+        self.assertEqual(len(bootstrap_menus), 2)
+        self.assertTrue(
+            any("当前 1 个" in arg for args in bootstrap_menus for arg in args)
+        )
+        self.assertTrue(any("..." in arg for args in bootstrap_menus for arg in args))
+
     def test_empty_bootstrap_and_no_services(self):
         self.set_responses(
             [
