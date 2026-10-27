@@ -40,7 +40,7 @@ NexusNet 以原生的 Debian 打包（`.deb`）分发，由 `dpkg`/`apt` 管理�
 - 本版本只使用 WebSocket over HTTP；`network.port` 是 WebSocket TCP 端口。
 - bootstrap 地址必须带 `/ws`，例如
   `/ip6/.../tcp/5000/ws/p2p/<PeerId>`。
-- 旧版 raw TCP 节点不兼容，所有节点必须使用 0.6.x；当前发布版本 0.6.2-1026。
+- 旧版 raw TCP 节点不兼容，所有节点必须使用 0.6.x；当前发布版本 0.6.2-1028。
 
 ## 安装
 

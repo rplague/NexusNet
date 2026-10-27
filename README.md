@@ -396,7 +396,7 @@ TCP → HTTP WebSocket → multistream-select → TLS/Noise → Yamux → 应用
 
 ## 开发状态
 
-当前版本：**0.6.2-1026** — 完成度 **6/10**
+当前版本：**0.6.2-1028** — 完成度 **6/10**
 
 ## 许可
 
