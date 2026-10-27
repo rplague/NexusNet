@@ -187,8 +187,10 @@ fn read_text(path: &Path) -> SetupResult<String> {
             )));
         }
         let units: Vec<u16> = bytes[2..]
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_le_bytes(*c))
             .collect();
         String::from_utf16(&units)
             .map_err(|e| SetupError::usage(format!("decode {}: {e}", path.display())))
@@ -413,9 +415,9 @@ mod tests {
             &advanced,
             r#"{"services":{"ping":{"enabled":false}}},"crypto":{"pq_transport_enabled":true}"#,
         );
-        let adv = format!(
-            r#"{{"services":{{"ping":{{"enabled":false}}}},"crypto":{{"pq_transport_enabled":true}}}}"#
-        );
+        let adv =
+            r#"{"services":{"ping":{"enabled":false}},"crypto":{"pq_transport_enabled":true}}"#
+                .to_string();
         write(&advanced, &adv);
         run_setup(&[
             basic.display().to_string(),
