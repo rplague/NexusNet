@@ -54,6 +54,13 @@ for option in ("--menu", "--inputbox", "--yesno", "--msgbox", "--checklist", "--
     if option in args:
         kind = option[2:]
         break
+if kind == "menu" and "--notags" not in args:
+    sys.stderr.write("menu call missing --notags\n")
+    sys.exit(92)
+log_path = os.environ.get("FAKE_WT_LOG")
+if log_path:
+    with open(log_path, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(args, ensure_ascii=False) + "\n")
 
 responses = [json.loads(line) for line in open(os.environ["FAKE_WT_RESPONSES"]) if line.strip()]
 counter_path = os.environ["FAKE_WT_COUNTER"]
@@ -141,6 +148,7 @@ class InteractiveTest(unittest.TestCase):
                 "TEST_CONFIG": str(self.dir / "config.toml"),
                 "FAKE_WT_RESPONSES": str(self.responses),
                 "FAKE_WT_COUNTER": str(self.counter),
+                "FAKE_WT_LOG": str(self.dir / "calls.jsonl"),
             }
         )
         env.pop("DEBIAN_HAS_FRONTEND", None)
@@ -172,6 +180,17 @@ class InteractiveTest(unittest.TestCase):
 
     def calls(self):
         return int(self.counter.read_text()) if self.counter.exists() else 0
+
+    def menu_calls(self):
+        path = self.dir / "calls.jsonl"
+        if not path.exists():
+            return []
+        calls = []
+        for line in path.read_text(encoding="utf-8").splitlines():
+            args = json.loads(line)
+            if "--menu" in args:
+                calls.append(args)
+        return calls
 
     def test_full_wizard_and_second_run_is_ignored(self):
         self.set_responses(
@@ -220,6 +239,14 @@ class InteractiveTest(unittest.TestCase):
             self.value("bootstrap"),
             "/ip4/1.2.3.4/tcp/5000/ws/p2p/12D3KooWExample",
         )
+        auth_menus = [
+            args for args in self.menu_calls()
+            if "NexusNet - 服务鉴权" in args
+        ]
+        self.assertEqual(len(auth_menus), 2)
+        self.assertTrue(all("--notags" in args for args in auth_menus))
+        default_index = auth_menus[1].index("--default-item")
+        self.assertEqual(auth_menus[1][default_index + 1], "svc:ocr")
 
         status, output = self.run_config()
         self.assertEqual(status, 0, output)
@@ -245,7 +272,7 @@ class InteractiveTest(unittest.TestCase):
                     "value": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
                 },
                 {"kind": "menu", "value": "svc:ocr"},
-                {"kind": "menu", "value": "__back__"},
+                {"kind": "menu", "status": 1},
                 {"kind": "menu", "value": "next"},
                 {"kind": "editbox", "write": ""},
                 {"kind": "yesno", "status": 0},

@@ -337,6 +337,10 @@ wt() {
     return "${WT_STATUS}"
 }
 
+wt_menu() {
+    wt --notags "$@"
+}
+
 wt_msg() {
     _h="${2:-12}"
     _w="${3:-74}"
@@ -619,7 +623,7 @@ prompt_service_name() {
 PAGE_NEXT="node"
 
 page_start() {
-    if wt --title "NexusNet - 配置方式" --cancel-button "跳过" --menu \
+    if wt_menu --title "NexusNet - 配置方式" --cancel-button "跳过" --menu \
         "请选择配置方式" "${WIZ_H}" "${WIZ_W}" "${WIZ_LIST_H}" \
         wizard "使用配置向导（推荐）" \
         skip "跳过向导（保留现有配置或生成默认配置）"; then
@@ -679,7 +683,7 @@ configure_local_services_page() {
         done < "${LS_FILE}"
         set -- "$@" "__add__" "添加本地服务" "__save__" "保存并返回" "__cancel__" "取消"
 
-        if ! wt --title "NexusNet - 本地服务" --cancel-button "取消" --menu \
+        if ! wt_menu --title "NexusNet - 本地服务" --cancel-button "取消" --menu \
             "管理本地服务（当前 ${_count} 个）" "${WIZ_H}" "${WIZ_W}" "${WIZ_LIST_H}" "$@"; then
             cp "${_snapshot}" "${LS_FILE}"
             LS_ENABLED="${_previous_enabled}"
@@ -721,7 +725,7 @@ configure_local_services_page() {
                     fi
                 done < "${LS_FILE}"
 
-                if wt --title "NexusNet - ${_selected_service}" --menu \
+                if wt_menu --title "NexusNet - ${_selected_service}" --menu \
                     "选择操作" 11 60 3 \
                     edit "编辑名称与端口" \
                     delete "删除此服务" \
@@ -788,9 +792,17 @@ configure_auth_page() {
 
     _snapshot="${WIZ_TMP}/local_services.auth"
     cp "${LS_FILE}" "${_snapshot}"
+    _default_tag=""
+    _list_h=$(( $(ls_count) + 1 ))
+    [ "${_list_h}" -lt 3 ] && _list_h=3
+    [ "${_list_h}" -gt "${WIZ_LIST_H}" ] && _list_h="${WIZ_LIST_H}"
+    _menu_h=$((_list_h + 6))
+    [ "${_menu_h}" -gt "${WIZ_H}" ] && _menu_h="${WIZ_H}"
+    _menu_text="鉴权网络：${_network_candidate}
+回车切换服务鉴权；完成后选择“保存并返回”"
 
     while :; do
-        set --
+        set -- --menu "${_menu_text}" "${_menu_h}" "${WIZ_W}" "${_list_h}"
         while IFS=: read -r _name _port _flag; do
             [ -n "${_name}" ] || continue
             if [ "${_flag}" = "1" ]; then
@@ -800,10 +812,12 @@ configure_auth_page() {
             fi
             set -- "$@" "svc:${_name}" "${_name}:${_port} [${_state}]"
         done < "${LS_FILE}"
-        set -- "$@" "__save__" "保存并返回" "__back__" "返回（不保存）"
+        set -- "$@" "__save__" "保存并返回"
+        if [ -n "${_default_tag}" ]; then
+            set -- --default-item "${_default_tag}" "$@"
+        fi
 
-        if ! wt --title "NexusNet - 服务鉴权" --cancel-button "返回（不保存）" --menu \
-            "选择服务切换鉴权（回车切换）" "${WIZ_H}" "${WIZ_W}" "${WIZ_LIST_H}" "$@"; then
+        if ! wt_menu --title "NexusNet - 服务鉴权" --cancel-button "返回（不保存）" "$@"; then
             cp "${_snapshot}" "${LS_FILE}"
             return 0
         fi
@@ -815,12 +829,9 @@ configure_auth_page() {
                 AUTH_ENABLED=1
                 return 0
                 ;;
-            __back__)
-                cp "${_snapshot}" "${LS_FILE}"
-                return 0
-                ;;
             svc:*)
                 ls_toggle_auth "${WT_RESULT#svc:}"
+                _default_tag="${WT_RESULT}"
                 ;;
         esac
     done
@@ -851,7 +862,7 @@ page_network() {
         fi
         set -- "$@" next "下一步：Bootstrap" back "返回：节点信息"
 
-        if ! wt --title "NexusNet - 网络与功能" --menu \
+        if ! wt_menu --title "NexusNet - 网络与功能" --menu \
             "配置网络与功能" "${WIZ_H}" "${WIZ_W}" "${WIZ_LIST_H}" "$@"; then
             PAGE_NEXT="node"
             return 0
