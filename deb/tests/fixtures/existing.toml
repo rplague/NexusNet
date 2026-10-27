@@ -1,0 +1,17 @@
+[node]
+name = "edge-01"
+description = "Edge node"
+allow_bootstrap = true
+
+[network]
+port = 6123
+
+[services.kademlia]
+bootstrap_nodes = [
+  "/ip4/1.2.3.4/tcp/5000/ws/p2p/12D3KooWExample",
+]
+
+[crypto]
+pq_transport_enabled = true
+pq_identity_enabled = true
+pq_required = true

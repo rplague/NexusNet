@@ -1,0 +1,11 @@
+[services.dispatcher]
+
+[[services.dispatcher.local_services]]
+name = "ocr"
+port = 5014
+require_auth = true
+
+[[services.dispatcher.local_services]]
+name = "tts"
+port = 5015
+require_auth = false

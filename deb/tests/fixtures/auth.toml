@@ -1,0 +1,5 @@
+[auth]
+network = "corp"
+
+[auth.networks.corp]
+authority = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
