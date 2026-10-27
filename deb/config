@@ -540,16 +540,19 @@ ls_replace() {
     mv "${_tmp}" "${LS_FILE}"
 }
 
-ls_set_auth_selection() {
-    _selected=" $1 "
+ls_toggle_auth() {
+    _want="$1"
     _tmp="${LS_FILE}.tmp"
     : > "${_tmp}"
     while IFS=: read -r _name _port _flag; do
         [ -n "${_name}" ] || continue
-        case "${_selected}" in
-            *" ${_name} "*) _flag=1 ;;
-            *) _flag=0 ;;
-        esac
+        if [ "${_name}" = "${_want}" ]; then
+            if [ "${_flag}" = "1" ]; then
+                _flag=0
+            else
+                _flag=1
+            fi
+        fi
         printf '%s:%s:%s\n' "${_name}" "${_port}" "${_flag}" >> "${_tmp}"
     done < "${LS_FILE}"
     mv "${_tmp}" "${LS_FILE}"
@@ -783,32 +786,44 @@ configure_auth_page() {
         wt_msg "Authority 公钥不能为空。" 9 70
     done
 
-    set --
-    while IFS=: read -r _name _port _flag; do
-        [ -n "${_name}" ] || continue
-        _status="off"
-        [ "${_flag}" = "1" ] && _status="on"
-        set -- "$@" "${_name}" "${_name}:${_port}" "${_status}"
-    done < "${LS_FILE}"
+    _snapshot="${WIZ_TMP}/local_services.auth"
+    cp "${LS_FILE}" "${_snapshot}"
 
-    if ! wt --title "NexusNet - 服务鉴权" --ok-button "保存" --cancel-button "取消" \
-        --checklist "勾选需要鉴权的本地服务" "${WIZ_H}" "${WIZ_W}" "${WIZ_LIST_H}" "$@"; then
-        return 0
-    fi
+    while :; do
+        set --
+        while IFS=: read -r _name _port _flag; do
+            [ -n "${_name}" ] || continue
+            if [ "${_flag}" = "1" ]; then
+                _state="已鉴权"
+            else
+                _state="未鉴权"
+            fi
+            set -- "$@" "svc:${_name}" "${_name}:${_port} [${_state}]"
+        done < "${LS_FILE}"
+        set -- "$@" "__save__" "保存并返回" "__back__" "返回（不保存）"
 
-    _selected_names=""
-    for _token in ${WT_RESULT}; do
-        _token="${_token#\"}"
-        _token="${_token%\"}"
-        [ -n "${_token}" ] && _selected_names="${_selected_names} ${_token}"
+        if ! wt --title "NexusNet - 服务鉴权" --cancel-button "返回（不保存）" --menu \
+            "选择服务切换鉴权（回车切换）" "${WIZ_H}" "${WIZ_W}" "${WIZ_LIST_H}" "$@"; then
+            cp "${_snapshot}" "${LS_FILE}"
+            return 0
+        fi
+
+        case "${WT_RESULT}" in
+            __save__)
+                AUTH_NETWORK_NAME="${_network_candidate}"
+                AUTH_AUTHORITY="${_authority_candidate}"
+                AUTH_ENABLED=1
+                return 0
+                ;;
+            __back__)
+                cp "${_snapshot}" "${LS_FILE}"
+                return 0
+                ;;
+            svc:*)
+                ls_toggle_auth "${WT_RESULT#svc:}"
+                ;;
+        esac
     done
-
-    ls_set_auth_selection "${_selected_names}"
-    AUTH_NETWORK_NAME="${_network_candidate}"
-    AUTH_AUTHORITY="${_authority_candidate}"
-    AUTH_ENABLED=1
-
-    return 0
 }
 
 page_network() {

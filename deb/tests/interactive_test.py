@@ -190,7 +190,8 @@ class InteractiveTest(unittest.TestCase):
                     "kind": "inputbox",
                     "value": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
                 },
-                {"kind": "checklist", "value": '"ocr"'},
+                {"kind": "menu", "value": "svc:ocr"},
+                {"kind": "menu", "value": "__save__"},
                 {"kind": "menu", "value": "next"},
                 {
                     "kind": "editbox",
@@ -202,7 +203,7 @@ class InteractiveTest(unittest.TestCase):
 
         status, output = self.run_config()
         self.assertEqual(status, 0, output)
-        self.assertEqual(self.calls(), 15)
+        self.assertEqual(self.calls(), 16)
         self.assertEqual(self.value("setup_mode"), "wizard")
         self.assertEqual(self.value("node_name"), "node-a")
         self.assertEqual(self.value("node_description"), "desc")
@@ -222,9 +223,41 @@ class InteractiveTest(unittest.TestCase):
 
         status, output = self.run_config()
         self.assertEqual(status, 0, output)
-        self.assertEqual(self.calls(), 15)
+        self.assertEqual(self.calls(), 16)
         self.assertEqual(self.value("node_name"), "node-a")
         self.assertEqual(self.value("local_services"), "ocr:7000:1")
+
+    def test_auth_toggle_discard_restores_flags(self):
+        self.set_responses(
+            [
+                {"kind": "menu", "value": "wizard"},
+                {"kind": "inputbox", "value": "node-c"},
+                {"kind": "inputbox", "value": "desc"},
+                {"kind": "menu", "value": "services"},
+                {"kind": "menu", "value": "__add__"},
+                {"kind": "inputbox", "value": "ocr"},
+                {"kind": "inputbox", "value": "7000"},
+                {"kind": "menu", "value": "__save__"},
+                {"kind": "menu", "value": "auth"},
+                {"kind": "inputbox", "value": "corp"},
+                {
+                    "kind": "inputbox",
+                    "value": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+                },
+                {"kind": "menu", "value": "svc:ocr"},
+                {"kind": "menu", "value": "__back__"},
+                {"kind": "menu", "value": "next"},
+                {"kind": "editbox", "write": ""},
+                {"kind": "yesno", "status": 0},
+            ]
+        )
+
+        status, output = self.run_config()
+        self.assertEqual(status, 0, output)
+        self.assertEqual(self.calls(), 16)
+        self.assertEqual(self.value("local_services_enabled"), "true")
+        self.assertEqual(self.value("local_services"), "ocr:7000")
+        self.assertEqual(self.value("auth_enabled"), "false")
 
     def test_empty_bootstrap_and_no_services(self):
         self.set_responses(
