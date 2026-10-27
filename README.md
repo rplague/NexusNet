@@ -66,13 +66,13 @@ cargo run
 apt install -y ./nexusnet_<version>_amd64.deb
 ```
 
-安装时通过 debconf 向导配置节点；安装后服务按向导结果启用。
+安装时通过 whiptail 向导配置节点；安装后服务按向导结果启用。
 `postinst` 创建专用用户 `nexusnet`、目录并写入 `/etc/nexusnet/config.toml`。
 配置与数据落位到标准目录：
 
 | 文件 | 路径 | 说明 |
 |---|---|---|
-| 配置 | `/etc/nexusnet/config.toml` | debconf 向导生成；跳过向导时生成默认配置 |
+| 配置 | `/etc/nexusnet/config.toml` | whiptail 向导生成；跳过向导时保留现有配置或生成默认配置 |
 | 节点身份 | `/var/lib/nexusnet/keypair.bin` | 不可丢失，升级/卸载保留 |
 | 日志 | journald | systemd 采集/轮转/压缩/保留 |
 

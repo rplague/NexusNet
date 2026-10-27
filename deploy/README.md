@@ -17,7 +17,7 @@ NexusNet 以原生的 Debian 打包（`.deb`）分发，由 `dpkg`/`apt` 管理�
 
 | 文件 | 路径 | 属主/权限 | 说明 |
 |---|---|---|---|
-| 配置 | `/etc/<pkg>/config.toml` | `nexusnet:nexusnet 0755` | debconf 向导生成；跳过向导时生成默认配置 |
+| 配置 | `/etc/<pkg>/config.toml` | `nexusnet:nexusnet 0755` | whiptail 向导生成；跳过向导时保留现有配置或生成默认配置 |
 | 数据 | `/var/lib/<pkg>/keypair.bin` | `nexusnet:nexusnet 0700` | 节点身份，不可丢失 |
 | 日志 | journald | — | 由 systemd 采集/轮转/压缩/保留 |
 | 二进制 | `/usr/bin/<bin>` | `root:root 0755` | 主程序 |
@@ -51,25 +51,33 @@ apt install -y ./<pkg>_<version>_amd64.deb
 ```
 
 安装过程（postinst）自动：确保专用用户 `nexusnet` 存在、创建数据目录、确保 journald 持久化
-（创建 `/var/log/journal`），然后读取 debconf 向导结果写入配置并处理服务状态。
+（创建 `/var/log/journal`），然后读取 whiptail 向导写入 debconf 的结果并处理配置与服务状态。
 
-### 配置向导（debconf）
+### 配置向导（whiptail）
 
-首次安装会通过 debconf 询问常用配置：
+交互安装和 `dpkg-reconfigure <pkg>` 使用 whiptail 向导；debconf 只负责数据存储、
+preseed 和非交互兼容。依赖 `whiptail` 与 `python3 (>= 3.11)`，目标为 Debian 12+。
 
-- 配置方式：向导 / 保留现有配置 / 跳过
-- 节点名、描述、角色
-- IPv4/IPv6 监听、端口
-- bootstrap（逗号分隔，必须带 `/ws`）
-- 本地服务（逗号分隔，`name:port[:auth]`）
-- PQ 开关、单个鉴权网络
+向导页面：
 
-DHT、Ping、Dispatcher、Registry、Relay、Compat 等高级项使用 `low` 优先级，
-默认不显示；需要时执行：
+- 配置方式：向导 / 跳过
+- 节点名称、描述（不再询问角色和 IPv4/IPv6 监听；启动时自动检测地址族）
+- WebSocket 端口（1..65535）、是否配置本地服务、是否配置鉴权网络
+- 本地服务动态编辑器（添加/编辑/删除/保存/取消）
+- 鉴权网络名、Authority 公钥，以及每个服务的 `require_auth` 勾选
+- 汇总确认后写入配置
 
-```bash
-sudo dpkg-reconfigure -plow <pkg>
-```
+PQ 传输和 PQ 身份固定启用，不在页面中显示；`pq_required` 仍可通过 preseed 设置。
+已有 `/etc/<pkg>/config.toml` 时会预填节点、端口、bootstrap、本地服务和鉴权信息；
+解析失败只告警并回退默认值。
+
+“跳过”语义：
+
+- 已有配置：保留原配置，不重新询问，保持服务原有 enabled/disabled 状态。
+- 没有配置：生成默认配置，服务不自动启动，手动 `systemctl enable --now <pkg>`。
+
+DHT、Ping、Dispatcher、Registry、Relay、Compat 等高级项仍保存在 debconf 中，可用
+preseed 设置；向导不再逐项询问。
 
 重新配置会备份旧 `config.toml`，服务原本启用则重启。
 
@@ -87,9 +95,14 @@ DEBIAN_FRONTEND=noninteractive apt install -y ./<pkg>_<version>_amd64.deb
 <pkg> <pkg>/setup_mode seen true
 <pkg> <pkg>/node_name string node-01
 <pkg> <pkg>/bootstrap string /ip4/1.2.3.4/tcp/5000/ws/p2p/12D3KooW...
+<pkg> <pkg>/local_services_enabled boolean true
+<pkg> <pkg>/local_services string ocr:5014:1
+<pkg> <pkg>/auth_enabled boolean true
+<pkg> <pkg>/auth_network string corp
+<pkg> <pkg>/auth_authority string <base64-ed25519-public-key>
 ```
 
-（`seen true` 用于让非交互安装确认该问题已预置；其余问题的值会被 postinst 直接读取。）
+preseed 值优先于现有配置；未预置的字段从现有配置或默认值补齐。
 
 跳过向导后手动启用：
 
@@ -101,8 +114,8 @@ sudo systemctl enable --now <pkg>
 ### 服务状态
 
 - 向导完成：`systemctl enable` 并启动。
-- 跳过向导：生成默认配置，`systemctl disable --now`；用户配置后手动 `enable --now`。
-- 升级：保持原有 enabled 状态；enabled 才启动，disabled 不启动。
+- 跳过且已有配置：保持原有 enabled 状态；enabled 才启动。
+- 跳过且无配置：生成默认配置，`systemctl disable --now`；用户配置后手动 `enable --now`。
 - 旧版 raw TCP bootstrap：`--check-config` 检测到后停止并禁用服务，提示重新运行
   `dpkg-reconfigure <pkg>` 或手动修改配置。
 - Debian 包不管理防火墙；直连节点需要自行放行 TCP 5000（或向导中配置的端口）。
@@ -152,7 +165,8 @@ apt purge <pkg>              # 彻底清除包配置
 | `service.service` | systemd 单元（打包素材，含 `@PKG@`/`@BIN@`/`@USER@` 占位符） |
 | `service.tmpfiles.conf` | 预建目录与属主（打包素材） |
 | `../deb/{postinst,prerm,postrm}` | Debian 维护脚本（打包素材） |
-| `../deb/{config,templates}` | debconf 配置向导（打包素材） |
+| `../deb/{config,templates}` | whiptail 配置向导 / debconf 数据模板（打包素材） |
+| `../deb/tests` | 配置预填与非交互 preseed 测试 |
 | `build-win.sh` | 交叉编译产物 + NSIS 组装 Windows 安装器与便携 zip，自动派生命名 |
 | `win/service.nsi` | NSIS 安装脚本（含 `@PKG@`/`@BIN@`/`@VERSION@` 等占位符） |
 | `win/common.nsh` / `win/wizard.nsh` | NSIS 向导页面、JSON 生成与校验 |
