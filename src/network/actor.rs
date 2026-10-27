@@ -41,7 +41,7 @@ use libp2p::{
     request_response,
 };
 use std::collections::{HashMap, HashSet};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
@@ -556,7 +556,12 @@ pub(crate) struct SwarmActor {
     cmd_rx: mpsc::UnboundedReceiver<SwarmCommand>,
     cmd_tx: mpsc::UnboundedSender<SwarmCommand>,
     event_tx: mpsc::UnboundedSender<NetworkEvent>,
-    last_bootstrap_notice: Option<Instant>,
+    /// Whether a successful bootstrap has already been reported for this Swarm.
+    ///
+    /// Kademlia runs a periodic bootstrap every few minutes; only the first
+    /// success (or the first success after a failure) should trigger the
+    /// service registry to re-announce services.
+    bootstrap_completed: bool,
     /// Peers allowed in the Kademlia routing table.
     ///
     /// Bootstrap peers are seeded at startup; other peers are added only after
@@ -609,7 +614,7 @@ pub async fn spawn(
         cmd_rx,
         cmd_tx,
         event_tx,
-        last_bootstrap_notice: None,
+        bootstrap_completed: false,
         identified_peers,
         peer_protocols: HashMap::new(),
         pq_identities: HashMap::new(),
@@ -820,16 +825,19 @@ impl SwarmActor {
         match result {
             kad::QueryResult::Bootstrap(result) => {
                 if result.is_ok() {
-                    let now = Instant::now();
-                    let due = self
-                        .last_bootstrap_notice
-                        .is_none_or(|last| now.duration_since(last) >= Duration::from_secs(30));
-                    if due {
-                        self.last_bootstrap_notice = Some(now);
+                    if self.bootstrap_completed {
+                        // libp2p runs a periodic bootstrap; do not re-announce
+                        // services or spam IMPORTANT logs on every cycle.
+                        LogStruct::new(LogLevel::Debug, "DHT 周期 bootstrap 完成", "").emit();
+                    } else {
+                        self.bootstrap_completed = true;
                         LogStruct::new(LogLevel::Important, "DHT bootstrap 完成", "").emit();
                         let _ = self.event_tx.send(NetworkEvent::BootstrapCompleted);
                     }
                 } else {
+                    // Allow the next successful bootstrap to recover the
+                    // announcement state after a failed cycle.
+                    self.bootstrap_completed = false;
                     LogStruct::new(
                         LogLevel::Error,
                         "Kademlia bootstrap 失败",
@@ -1717,7 +1725,7 @@ impl SwarmActor {
         );
 
         self.swarm = new_swarm;
-        self.last_bootstrap_notice = None;
+        self.bootstrap_completed = false;
 
         for addr in self.config.bootstrap_nodes() {
             let _ = self.swarm.dial(addr);
