@@ -1,8 +1,11 @@
 [Unit]
 Description=@BIN@ P2P node (OAHD core network layer)
 Documentation=file:/etc/@PKG@/README.md
-Wants=network-online.target
-After=network-online.target
+# These ordering dependencies cover the common case only. The daemon also
+# waits in-process for the configured address families (including a global
+# IPv6 address) before listening; that wait is the primary readiness guarantee.
+Wants=network-online.target NetworkManager-wait-online.service
+After=network-online.target NetworkManager-wait-online.service
 
 [Service]
 Type=simple
