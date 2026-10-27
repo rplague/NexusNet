@@ -395,7 +395,9 @@ bootstrap_to_lines() {
     : > "${_out}"
     printf '%s\n' "${BOOTSTRAP}" | tr ',' '\n' | while IFS= read -r _line; do
         _line="$(printf '%s' "${_line}" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-        [ -n "${_line}" ] && printf '%s\n' "${_line}" >> "${_out}"
+        if [ -n "${_line}" ]; then
+            printf '%s\n' "${_line}" >> "${_out}"
+        fi
     done
     return 0
 }
