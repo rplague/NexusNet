@@ -31,6 +31,15 @@ db_stop_safe() {
     db_stop 2>/dev/null || true
 }
 
+# dpkg may run this config script more than once (preconfigure + configure).
+# Only the first invocation should present the wizard; dpkg-reconfigure must
+# bypass the guard explicitly.
+db_fget "${PKG}/setup_mode" seen || true
+if [ "${RET:-false}" = "true" ] && [ "${DEBCONF_RECONFIGURE:-}" != "1" ]; then
+    db_stop_safe
+    exit 0
+fi
+
 load_prefill() {
     NODE_NAME="NexusNet"
     NODE_DESCRIPTION="NexusNet P2P node"
@@ -188,13 +197,18 @@ PY
     eval "${PREFILL}"
 }
 
-is_noninteractive() {
+is_explicitly_noninteractive() {
     case "${DEBIAN_FRONTEND:-}" in
         noninteractive|editor) return 0 ;;
     esac
-    command -v whiptail >/dev/null 2>&1 || return 0
-    [ -r /dev/tty ] && [ -w /dev/tty ] || return 0
     return 1
+}
+
+has_interactive_tty() {
+    command -v whiptail >/dev/null 2>&1 || return 1
+    ( : < /dev/tty ) 2>/dev/null || return 1
+    ( : > /dev/tty ) 2>/dev/null || return 1
+    return 0
 }
 
 is_valid_name() {
@@ -906,8 +920,13 @@ finalize_skip() {
 }
 
 load_prefill
-if is_noninteractive; then
+if is_explicitly_noninteractive; then
     noninteractive_configure
+    exit 0
+fi
+if ! has_interactive_tty; then
+    echo "NexusNet 警告：未找到 whiptail 或可用的 /dev/tty，跳过交互向导。" >&2
+    db_stop_safe
     exit 0
 fi
 

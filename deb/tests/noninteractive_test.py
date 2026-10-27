@@ -74,12 +74,19 @@ class NoninteractiveTest(unittest.TestCase):
         self.db.mkdir()
         self.marker.unlink(missing_ok=True)
 
-    def run_config(self, config_path=None, extra_env=None):
+    def run_config(
+        self,
+        config_path=None,
+        extra_env=None,
+        frontend="noninteractive",
+        reconfigure=False,
+        start_new_session=False,
+    ):
         env = os.environ.copy()
         env.update(
             {
-                "DEBIAN_FRONTEND": "noninteractive",
-                "DEBCONF_RECONFIGURE": "",
+                "DEBIAN_FRONTEND": frontend,
+                "DEBCONF_RECONFIGURE": "1" if reconfigure else "",
                 "PATH": str(self.bin) + ":" + env.get("PATH", ""),
                 "TEST_DB_STORE": str(self.db),
                 "WHIPTAIL_MARKER": str(self.marker),
@@ -97,6 +104,7 @@ class NoninteractiveTest(unittest.TestCase):
             text=True,
             check=False,
             timeout=30,
+            start_new_session=start_new_session,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(self.marker.exists(), "whiptail must not run")
@@ -119,7 +127,7 @@ class NoninteractiveTest(unittest.TestCase):
 
     def test_preseed_wizard_prefills_existing_config(self):
         self.preseed("setup_mode", "wizard")
-        self.run_config(FIXTURES / "existing.toml")
+        self.run_config(FIXTURES / "existing.toml", reconfigure=True)
         self.assertEqual(self.value("setup_mode"), "wizard")
         self.assertEqual(self.value("node_name"), "edge-01")
         self.assertEqual(self.value("port"), "6123")
@@ -134,7 +142,7 @@ class NoninteractiveTest(unittest.TestCase):
         self.preseed("node_name", "preset-node")
         self.preseed("port", "7000")
         self.preseed("local_services", "ocr:5014:1")
-        self.run_config(FIXTURES / "existing.toml")
+        self.run_config(FIXTURES / "existing.toml", reconfigure=True)
         self.assertEqual(self.value("node_name"), "preset-node")
         self.assertEqual(self.value("port"), "7000")
         self.assertEqual(self.value("local_services"), "ocr:5014:1")
@@ -142,14 +150,14 @@ class NoninteractiveTest(unittest.TestCase):
 
     def test_existing_services_enable_local_service_mode(self):
         self.preseed("setup_mode", "wizard")
-        self.run_config(FIXTURES / "services.toml")
+        self.run_config(FIXTURES / "services.toml", reconfigure=True)
         self.assertEqual(self.value("local_services"), "ocr:5014:1,tts:5015")
         self.assertEqual(self.value("local_services_enabled"), "true")
         self.assertEqual(self.value("auth_enabled"), "false")
 
     def test_existing_auth_enables_auth_mode(self):
         self.preseed("setup_mode", "wizard")
-        self.run_config(FIXTURES / "auth.toml")
+        self.run_config(FIXTURES / "auth.toml", reconfigure=True)
         self.assertEqual(self.value("auth_enabled"), "true")
         self.assertEqual(self.value("auth_network"), "corp")
         self.assertEqual(
@@ -159,11 +167,34 @@ class NoninteractiveTest(unittest.TestCase):
 
     def test_bad_config_falls_back_without_blocking(self):
         self.preseed("setup_mode", "wizard")
-        result = self.run_config(FIXTURES / "bad.toml")
+        result = self.run_config(FIXTURES / "bad.toml", reconfigure=True)
         self.assertIn("警告", result.stderr)
         self.assertEqual(self.value("node_name"), "NexusNet")
         self.assertEqual(self.value("port"), "5000")
         self.assertEqual(self.value("pq_transport"), "true")
+
+    def test_seen_setup_mode_skips_wizard_fill(self):
+        self.preseed("setup_mode", "wizard")
+        self.run_config(FIXTURES / "existing.toml")
+        self.assertEqual(self.value("setup_mode"), "wizard")
+        self.assertIsNone(self.value("node_name"))
+        self.assertIsNone(self.value("port"))
+
+    def test_reconfigure_bypasses_seen_guard(self):
+        self.preseed("setup_mode", "wizard")
+        self.run_config(FIXTURES / "existing.toml", reconfigure=True)
+        self.assertEqual(self.value("setup_mode"), "wizard")
+        self.assertEqual(self.value("node_name"), "edge-01")
+        self.assertEqual(self.value("port"), "6123")
+
+    def test_no_tty_does_not_mark_setup_mode_seen(self):
+        result = self.run_config(
+            FIXTURES / "existing.toml",
+            frontend="dialog",
+            start_new_session=True,
+        )
+        self.assertIn("跳过交互向导", result.stderr)
+        self.assertIsNone(self.value("setup_mode"))
 
 
 if __name__ == "__main__":
