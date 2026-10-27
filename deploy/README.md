@@ -62,9 +62,9 @@ preseed 和非交互兼容。依赖 `whiptail` 与 `python3 (>= 3.11)`，目标�
 
 - 配置方式：向导 / 跳过
 - 节点名称、描述（不再询问角色和 IPv4/IPv6 监听；启动时自动检测地址族）
-- WebSocket 端口（1..65535）、是否配置本地服务、是否配置鉴权网络
-- 本地服务动态编辑器（添加/编辑/删除/保存/取消）
-- 鉴权网络名、Authority 公钥，以及每个服务的 `require_auth` 勾选
+- WebSocket 端口（1..65535）
+- 本地服务动态编辑器（添加/编辑/删除/保存/取消；可关闭并清空本地服务）
+- 鉴权网络名、Authority 公钥，以及每个服务的 `require_auth` 勾选；可关闭鉴权网络
 - Bootstrap 地址（每行一个或逗号分隔，必须包含 `/ws` 和 `/p2p/<PeerId>`；可留空）
 - 汇总确认后写入配置
 
@@ -103,7 +103,7 @@ DEBIAN_FRONTEND=noninteractive apt install -y ./<pkg>_<version>_amd64.deb
 <pkg> <pkg>/auth_authority string <base64-ed25519-public-key>
 ```
 
-preseed 值优先于现有配置；未预置的字段从现有配置或默认值补齐。
+preseed 值优先；设置 `setup_mode seen true` 后 config 脚本不再运行，未预置字段由 `postinst` 使用默认值补齐。
 
 跳过向导后手动启用：
 

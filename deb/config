@@ -685,6 +685,9 @@ configure_local_services_page() {
             __save__)
                 if [ "$(ls_count)" -eq 0 ]; then
                     LS_ENABLED=0
+                    AUTH_ENABLED=0
+                    AUTH_NETWORK_NAME="none"
+                    AUTH_AUTHORITY=""
                 else
                     LS_ENABLED=1
                 fi
@@ -819,13 +822,20 @@ page_network() {
             _auth_state="未启用"
         fi
 
-        if ! wt --title "NexusNet - 网络与功能" --menu \
-            "配置网络与功能" "${WIZ_H}" "${WIZ_W}" "${WIZ_LIST_H}" \
+        set -- \
             port "WebSocket TCP 端口：${PORT}" \
             services "本地服务：${_services_state}" \
-            auth "鉴权网络：${_auth_state}" \
-            next "下一步：汇总并写入" \
-            back "返回：节点信息"; then
+            auth "鉴权网络：${_auth_state}"
+        if [ "${LS_ENABLED}" = "1" ]; then
+            set -- "$@" services_off "关闭并清空本地服务"
+        fi
+        if [ "${AUTH_ENABLED}" = "1" ]; then
+            set -- "$@" auth_off "关闭鉴权网络"
+        fi
+        set -- "$@" next "下一步：Bootstrap" back "返回：节点信息"
+
+        if ! wt --title "NexusNet - 网络与功能" --menu \
+            "配置网络与功能" "${WIZ_H}" "${WIZ_W}" "${WIZ_LIST_H}" "$@"; then
             PAGE_NEXT="node"
             return 0
         fi
@@ -837,30 +847,23 @@ page_network() {
                 fi
                 ;;
             services)
-                if wt_yesno "是否配置本地服务？
-当前：${_services_state}"; then
-                    configure_local_services_page
-                else
-                    if [ "$(ls_count)" -gt 0 ]; then
-                        if wt_yesno_defaultno "关闭本地服务会清空当前已配置的服务，确定继续？" 11 78; then
-                            : > "${LS_FILE}"
-                            LS_ENABLED=0
-                        fi
-                    else
-                        LS_ENABLED=0
-                    fi
-                fi
+                configure_local_services_page
+                ;;
+            services_off)
+                : > "${LS_FILE}"
+                LS_ENABLED=0
+                AUTH_ENABLED=0
+                AUTH_NETWORK_NAME="none"
+                AUTH_AUTHORITY=""
                 ;;
             auth)
-                if wt_yesno "是否配置鉴权网络？
-当前：${_auth_state}"; then
-                    configure_auth_page
-                else
-                    AUTH_ENABLED=0
-                    AUTH_NETWORK_NAME="none"
-                    AUTH_AUTHORITY=""
-                    ls_clear_auth
-                fi
+                configure_auth_page
+                ;;
+            auth_off)
+                AUTH_ENABLED=0
+                AUTH_NETWORK_NAME="none"
+                AUTH_AUTHORITY=""
+                ls_clear_auth
                 ;;
             next)
                 PAGE_NEXT="bootstrap"
@@ -923,19 +926,19 @@ Bootstrap：${_bootstrap_text}
 }
 
 finalize_wizard() {
-    if [ "${AUTH_ENABLED}" != "1" ]; then
+    if [ "${LS_ENABLED}" != "1" ] || [ "$(ls_count)" -eq 0 ]; then
+        LS_ENABLED=0
+        AUTH_ENABLED=0
+        AUTH_NETWORK_NAME="none"
+        AUTH_AUTHORITY=""
+        LOCAL_SERVICES=""
+    elif [ "${AUTH_ENABLED}" != "1" ]; then
+        LOCAL_SERVICES="$(ls_to_csv)"
         AUTH_NETWORK_NAME="none"
         AUTH_AUTHORITY=""
         ls_clear_auth
-    fi
-
-    if [ "${LS_ENABLED}" = "1" ]; then
-        LOCAL_SERVICES="$(ls_to_csv)"
-        if [ -z "${LOCAL_SERVICES}" ]; then
-            LS_ENABLED=0
-        fi
     else
-        LOCAL_SERVICES=""
+        LOCAL_SERVICES="$(ls_to_csv)"
     fi
 
     db_set_seen "${PKG}/setup_mode" wizard
