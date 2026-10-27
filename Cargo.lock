@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "NexusNet"
-version = "0.6.2-10281"
+version = "0.6.2-10282"
 dependencies = [
  "base64 0.22.1",
  "bytes",
