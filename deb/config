@@ -8,98 +8,885 @@ CONFIG="/etc/${PKG}/config.toml"
 
 db_version 2.0 || true
 
-db_fget "${PKG}/setup_mode" seen || true
-if [ "${RET:-false}" = "true" ] && [ "${DEBCONF_RECONFIGURE:-}" != "1" ]; then
-    exit 0
-fi
+db_get_safe() {
+    db_get "$1" || true
+    printf '%s' "${RET:-}"
+}
 
-if [ -f "${CONFIG}" ] && [ "${DEBCONF_RECONFIGURE:-}" != "1" ]; then
-    db_set "${PKG}/setup_mode" keep || true
-    db_fset "${PKG}/setup_mode" seen true || true
-    exit 0
-fi
-if [ -f "${CONFIG}" ]; then
-    db_set "${PKG}/setup_mode" keep || true
-elif [ "${DEBIAN_FRONTEND:-}" = "noninteractive" ]; then
-    db_set "${PKG}/setup_mode" skip || true
-    db_fset "${PKG}/setup_mode" seen true || true
-    exit 0
-fi
+db_seen() {
+    db_fget "$1" seen || true
+    [ "${RET:-false}" = "true" ]
+}
 
-db_input high "${PKG}/setup_mode" || true
-db_go || true
+db_set_safe() {
+    db_set "$1" "$2" || true
+}
 
-db_get "${PKG}/setup_mode" || true
-MODE="${RET:-wizard}"
-case "${MODE}" in
-    skip|keep) exit 0 ;;
-esac
+db_set_seen() {
+    db_set "$1" "$2" || true
+    db_fset "$1" seen true || true
+}
 
-db_input high "${PKG}/node_name" || true
-db_input high "${PKG}/node_description" || true
-db_input high "${PKG}/role" || true
-db_go || true
+db_stop_safe() {
+    db_stop 2>/dev/null || true
+}
 
-db_get "${PKG}/role" || true
-ROLE="${RET:-nat}"
+load_prefill() {
+    NODE_NAME="NexusNet"
+    NODE_DESCRIPTION="NexusNet P2P node"
+    PORT="5000"
+    LOCAL_SERVICES=""
+    AUTH_NETWORK="none"
+    AUTH_AUTHORITY=""
+    BOOTSTRAP=""
+    PQ_TRANSPORT="false"
+    PQ_IDENTITY="false"
+    PQ_REQUIRED="false"
+    CONFIG_FOUND="false"
 
-db_fget "${PKG}/ipv4_enabled" seen || true
-if [ "${RET:-false}" != "true" ]; then
-    case "${ROLE}" in
-        direct) db_set "${PKG}/ipv4_enabled" true || true ;;
-        nat) db_set "${PKG}/ipv4_enabled" false || true ;;
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo "NexusNet 警告：未找到 python3，无法读取现有配置，使用默认值。" >&2
+        return 0
+    fi
+
+    PREFILL="$(python3 - "${CONFIG}" <<'PY'
+# >>> nexusnet-prefill
+import json
+import shlex
+import sys
+import tomllib
+
+
+def _as_bool(value, default=False):
+    if isinstance(value, bool):
+        return value
+    return default
+
+
+def _as_str(value, default=""):
+    if isinstance(value, str):
+        return value
+    return default
+
+
+def _as_int(value, default):
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    return default
+
+
+def load(path):
+    data = {
+        "NODE_NAME": "NexusNet",
+        "NODE_DESCRIPTION": "NexusNet P2P node",
+        "PORT": "5000",
+        "LOCAL_SERVICES": "",
+        "AUTH_NETWORK": "none",
+        "AUTH_AUTHORITY": "",
+        "BOOTSTRAP": "",
+        "PQ_TRANSPORT": "false",
+        "PQ_IDENTITY": "false",
+        "PQ_REQUIRED": "false",
+        "CONFIG_FOUND": "false",
+    }
+    if not path:
+        return data
+    try:
+        with open(path, "rb") as handle:
+            raw = tomllib.load(handle)
+    except FileNotFoundError:
+        return data
+    except Exception as exc:  # noqa: BLE001 - never block package setup
+        print(
+            "NexusNet 警告：无法解析现有配置 %s：%s；使用默认值。" % (path, exc),
+            file=sys.stderr,
+        )
+        return data
+
+    data["CONFIG_FOUND"] = "true"
+    if not isinstance(raw, dict):
+        return data
+
+    node = raw.get("node") if isinstance(raw.get("node"), dict) else {}
+    network = raw.get("network") if isinstance(raw.get("network"), dict) else {}
+    services = raw.get("services") if isinstance(raw.get("services"), dict) else {}
+    dispatcher = (
+        services.get("dispatcher")
+        if isinstance(services.get("dispatcher"), dict)
+        else {}
+    )
+    kademlia = (
+        services.get("kademlia") if isinstance(services.get("kademlia"), dict) else {}
+    )
+    crypto = raw.get("crypto") if isinstance(raw.get("crypto"), dict) else {}
+    auth = raw.get("auth") if isinstance(raw.get("auth"), dict) else {}
+
+    data["NODE_NAME"] = _as_str(node.get("name"), data["NODE_NAME"])
+    data["NODE_DESCRIPTION"] = _as_str(
+        node.get("description"), data["NODE_DESCRIPTION"]
+    )
+    data["PORT"] = str(_as_int(network.get("port"), int(data["PORT"])))
+
+    entries = dispatcher.get("local_services")
+    if isinstance(entries, list):
+        services_out = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            name = entry.get("name")
+            port = entry.get("port")
+            if not isinstance(name, str) or not isinstance(port, int):
+                continue
+            if entry.get("require_auth") is True:
+                services_out.append("%s:%d:1" % (name, port))
+            else:
+                services_out.append("%s:%d" % (name, port))
+        data["LOCAL_SERVICES"] = ",".join(services_out)
+
+    network_name = _as_str(auth.get("network"), data["AUTH_NETWORK"])
+    if network_name:
+        data["AUTH_NETWORK"] = network_name
+    networks = auth.get("networks")
+    if isinstance(networks, dict):
+        entry = networks.get(data["AUTH_NETWORK"])
+        if isinstance(entry, dict):
+            data["AUTH_AUTHORITY"] = _as_str(entry.get("authority"), "")
+
+    bootstrap = kademlia.get("bootstrap_nodes")
+    if isinstance(bootstrap, list):
+        data["BOOTSTRAP"] = ",".join(
+            item for item in bootstrap if isinstance(item, str) and item
+        )
+
+    data["PQ_TRANSPORT"] = "true" if _as_bool(crypto.get("pq_transport_enabled")) else "false"
+    data["PQ_IDENTITY"] = "true" if _as_bool(crypto.get("pq_identity_enabled")) else "false"
+    data["PQ_REQUIRED"] = "true" if _as_bool(crypto.get("pq_required")) else "false"
+    return data
+
+
+def main(argv):
+    json_mode = "--json" in argv
+    args = [arg for arg in argv if arg != "--json"]
+    data = load(args[0] if args else "")
+    if json_mode:
+        print(json.dumps(data, ensure_ascii=False, sort_keys=True))
+        return 0
+    for key, value in data.items():
+        print("%s=%s" % (key, shlex.quote(str(value))))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
+# <<< nexusnet-prefill
+PY
+)" || PREFILL=""
+
+    if [ -z "${PREFILL}" ]; then
+        return 0
+    fi
+    eval "${PREFILL}"
+}
+
+is_noninteractive() {
+    case "${DEBIAN_FRONTEND:-}" in
+        noninteractive|editor) return 0 ;;
     esac
-fi
-db_fget "${PKG}/ipv6_enabled" seen || true
-if [ "${RET:-false}" != "true" ]; then
-    case "${ROLE}" in
-        direct) db_set "${PKG}/ipv6_enabled" true || true ;;
-        nat) db_set "${PKG}/ipv6_enabled" false || true ;;
+    command -v whiptail >/dev/null 2>&1 || return 0
+    [ -r /dev/tty ] && [ -w /dev/tty ] || return 0
+    return 1
+}
+
+is_valid_name() {
+    [ -n "$1" ] || return 1
+    [ "${#1}" -le 64 ] || return 1
+    case "$1" in
+        *[!A-Za-z0-9_-]*) return 1 ;;
     esac
+}
+
+is_valid_port() {
+    case "${1:-}" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    [ "$1" -ge 1 ] 2>/dev/null || return 1
+    [ "$1" -le 65535 ] 2>/dev/null || return 1
+    return 0
+}
+
+# Preseed priority: values already seen by debconf win over the existing
+# config.toml.  Unseen fields are filled from config.toml/defaults.
+fill_unseen() {
+    if ! db_seen "${PKG}/$1"; then
+        db_set_seen "${PKG}/$1" "$2"
+    fi
+}
+
+noninteractive_configure() {
+    if db_seen "${PKG}/setup_mode"; then
+        MODE="$(db_get_safe "${PKG}/setup_mode")"
+    else
+        MODE=""
+    fi
+    case "${MODE}" in
+        wizard) ;;
+        *) MODE="skip" ;;
+    esac
+    db_set_seen "${PKG}/setup_mode" "${MODE}"
+
+    if [ "${MODE}" = "skip" ]; then
+        db_stop_safe
+        return 0
+    fi
+
+    fill_unseen node_name "${NODE_NAME}"
+    fill_unseen node_description "${NODE_DESCRIPTION}"
+    fill_unseen port "${PORT}"
+    fill_unseen bootstrap "${BOOTSTRAP}"
+    fill_unseen local_services "${LOCAL_SERVICES}"
+    fill_unseen auth_network "${AUTH_NETWORK}"
+    fill_unseen auth_authority "${AUTH_AUTHORITY}"
+    fill_unseen pq_required "${PQ_REQUIRED}"
+
+    if ! db_seen "${PKG}/local_services_enabled"; then
+        LOCAL_SERVICES_SEEN="$(db_get_safe "${PKG}/local_services")"
+        if [ -n "${LOCAL_SERVICES_SEEN}" ]; then
+            db_set_seen "${PKG}/local_services_enabled" true
+        else
+            db_set_seen "${PKG}/local_services_enabled" false
+        fi
+    fi
+
+    if ! db_seen "${PKG}/auth_enabled"; then
+        AUTH_NETWORK_SEEN="$(db_get_safe "${PKG}/auth_network")"
+        case "${AUTH_NETWORK_SEEN}" in
+            ''|none) db_set_seen "${PKG}/auth_enabled" false ;;
+            *) db_set_seen "${PKG}/auth_enabled" true ;;
+        esac
+    fi
+
+    db_set_seen "${PKG}/pq_transport" true
+    db_set_seen "${PKG}/pq_identity" true
+    db_stop_safe
+    return 0
+}
+
+# --- whiptail helpers -------------------------------------------------------
+
+WIZ_TMP="$(mktemp -d)"
+trap 'rm -rf "${WIZ_TMP}"' EXIT HUP INT TERM
+
+LS_FILE="${WIZ_TMP}/local_services"
+: > "${LS_FILE}"
+
+wt() {
+    WT_OUT="${WIZ_TMP}/whiptail.out"
+    : > "${WT_OUT}"
+    if ! exec 8>"${WT_OUT}"; then
+        return 1
+    fi
+    set +e
+    whiptail --backtitle "NexusNet 安装向导" --output-fd 8 "$@" \
+        < /dev/tty > /dev/tty 2>&1
+    WT_STATUS=$?
+    set -e
+    exec 8>&-
+    WT_RESULT="$(cat "${WT_OUT}")"
+    return "${WT_STATUS}"
+}
+
+wt_msg() {
+    wt --title "NexusNet" --ok-button "确定" --msgbox "$1" "${2:-12}" "${3:-74}" || true
+    return 0
+}
+
+wt_input() {
+    _label="$1"
+    _default="$2"
+    _title="${3:-NexusNet}"
+    wt --title "${_title}" --ok-button "确定" --cancel-button "返回" \
+        --inputbox "${_label}" 11 74 "${_default}"
+}
+
+wt_yesno() {
+    wt --title "NexusNet" --yes-button "是" --no-button "否" \
+        --yesno "$1" "${2:-12}" "${3:-74}"
+}
+
+wt_yesno_defaultno() {
+    wt --title "NexusNet" --defaultno --yes-button "是" --no-button "否" \
+        --yesno "$1" "${2:-12}" "${3:-74}"
+}
+
+# --- local service list -----------------------------------------------------
+
+parse_local_services() {
+    _csv="$1"
+    _out="$2"
+    : > "${_out}"
+    _oldifs="$IFS"
+    IFS=','
+    for _item in ${_csv}; do
+        IFS="${_oldifs}"
+        _item="$(printf '%s' "${_item}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+        [ -z "${_item}" ] || {
+            _name="${_item%%:*}"
+            _rest="${_item#*:}"
+            _port="${_rest%%:*}"
+            _flag=""
+            if [ "${_rest}" != "${_port}" ]; then
+                _flag="${_rest#*:}"
+            fi
+            case "${_flag}" in
+                1|true|TRUE|yes|on) _flag=1 ;;
+                *) _flag=0 ;;
+            esac
+            if [ -n "${_name}" ] && [ -n "${_port}" ]; then
+                printf '%s:%s:%s\n' "${_name}" "${_port}" "${_flag}" >> "${_out}"
+            fi
+        }
+        IFS=','
+    done
+    IFS="${_oldifs}"
+}
+
+ls_count() {
+    _count="$(wc -l < "${LS_FILE}" 2>/dev/null || printf '0')"
+    printf '%s' "${_count}" | tr -d '[:space:]'
+}
+
+ls_to_csv() {
+    _first=1
+    while IFS=: read -r _name _port _flag; do
+        [ -n "${_name}" ] || continue
+        if [ "${_first}" -eq 0 ]; then
+            printf ','
+        fi
+        if [ "${_flag}" = "1" ]; then
+            printf '%s:%s:1' "${_name}" "${_port}"
+        else
+            printf '%s:%s' "${_name}" "${_port}"
+        fi
+        _first=0
+    done < "${LS_FILE}"
+}
+
+ls_summary() {
+    if [ "$(ls_count)" -eq 0 ]; then
+        printf '无'
+        return 0
+    fi
+    _sep=""
+    while IFS=: read -r _name _port _flag; do
+        [ -n "${_name}" ] || continue
+        printf '%s%s:%s' "${_sep}" "${_name}" "${_port}"
+        [ "${_flag}" = "1" ] && printf '[鉴权]'
+        _sep=", "
+    done < "${LS_FILE}"
+}
+
+ls_has_name() {
+    _want="$1"
+    _skip="${2:-}"
+    while IFS=: read -r _name _port _flag; do
+        [ -n "${_name}" ] || continue
+        if [ "${_name}" = "${_want}" ] && [ "${_name}" != "${_skip}" ]; then
+            return 0
+        fi
+    done < "${LS_FILE}"
+    return 1
+}
+
+ls_remove() {
+    _drop="$1"
+    _tmp="${LS_FILE}.tmp"
+    : > "${_tmp}"
+    while IFS=: read -r _name _port _flag; do
+        [ -n "${_name}" ] || continue
+        [ "${_name}" = "${_drop}" ] && continue
+        printf '%s:%s:%s\n' "${_name}" "${_port}" "${_flag}" >> "${_tmp}"
+    done < "${LS_FILE}"
+    mv "${_tmp}" "${LS_FILE}"
+}
+
+ls_replace() {
+    _old="$1"
+    _new="$2"
+    _newport="$3"
+    _tmp="${LS_FILE}.tmp"
+    : > "${_tmp}"
+    while IFS=: read -r _name _port _flag; do
+        [ -n "${_name}" ] || continue
+        if [ "${_name}" = "${_old}" ]; then
+            printf '%s:%s:%s\n' "${_new}" "${_newport}" "${_flag}" >> "${_tmp}"
+        else
+            printf '%s:%s:%s\n' "${_name}" "${_port}" "${_flag}" >> "${_tmp}"
+        fi
+    done < "${LS_FILE}"
+    mv "${_tmp}" "${LS_FILE}"
+}
+
+ls_set_auth_selection() {
+    _selected=" $1 "
+    _tmp="${LS_FILE}.tmp"
+    : > "${_tmp}"
+    while IFS=: read -r _name _port _flag; do
+        [ -n "${_name}" ] || continue
+        case "${_selected}" in
+            *" ${_name} "*) _flag=1 ;;
+            *) _flag=0 ;;
+        esac
+        printf '%s:%s:%s\n' "${_name}" "${_port}" "${_flag}" >> "${_tmp}"
+    done < "${LS_FILE}"
+    mv "${_tmp}" "${LS_FILE}"
+}
+
+ls_clear_auth() {
+    _tmp="${LS_FILE}.tmp"
+    : > "${_tmp}"
+    while IFS=: read -r _name _port _flag; do
+        [ -n "${_name}" ] || continue
+        printf '%s:%s:0\n' "${_name}" "${_port}" >> "${_tmp}"
+    done < "${LS_FILE}"
+    mv "${_tmp}" "${LS_FILE}"
+}
+
+# --- prompts ----------------------------------------------------------------
+
+prompt_port() {
+    _default="$1"
+    _label="$2"
+    _value="${_default}"
+    while :; do
+        if ! wt_input "${_label}" "${_value}" "NexusNet - 端口"; then
+            return 1
+        fi
+        _value="${WT_RESULT}"
+        if is_valid_port "${_value}"; then
+            PORT_RESULT="${_value}"
+            return 0
+        fi
+        wt_msg "端口必须是 1..65535 之间的整数。" 9 74
+    done
+}
+
+prompt_service_name() {
+    _default="$1"
+    _old="$2"
+    _value="${_default}"
+    while :; do
+        if ! wt_input "本地服务名称（字母、数字、_、-，最长 64）" "${_value}" \
+            "NexusNet - 本地服务"; then
+            return 1
+        fi
+        _value="${WT_RESULT}"
+        if ! is_valid_name "${_value}"; then
+            wt_msg "服务名称无效：不能为空，只允许 A-Z a-z 0-9 _ -，且最长 64 字符。" 10 78
+            continue
+        fi
+        if [ "${_value}" = "service" ]; then
+            wt_msg "service 是保留名称，请使用其它名称。" 9 74
+            continue
+        fi
+        if ls_has_name "${_value}" "${_old}"; then
+            wt_msg "服务名称 ${_value} 已存在，请使用其它名称。" 9 74
+            continue
+        fi
+        NAME_RESULT="${_value}"
+        return 0
+    done
+}
+
+# --- pages ------------------------------------------------------------------
+
+PAGE_NEXT="node"
+
+page_start() {
+    if wt --title "NexusNet - 配置方式" --cancel-button "跳过" --menu \
+        "请选择配置方式" 14 78 4 \
+        wizard "使用配置向导（推荐）" \
+        skip "跳过向导（保留现有配置或生成默认配置）"; then
+        case "${WT_RESULT}" in
+            wizard) MODE="wizard"; PAGE_NEXT="node" ;;
+            *) MODE="skip"; PAGE_NEXT="done" ;;
+        esac
+    else
+        MODE="skip"
+        PAGE_NEXT="done"
+    fi
+}
+
+page_node() {
+    if ! wt_input "节点名称" "${NODE_NAME}" "NexusNet - 节点"; then
+        PAGE_NEXT="start"
+        return 0
+    fi
+    if [ -n "${WT_RESULT}" ]; then
+        NODE_NAME="${WT_RESULT}"
+    else
+        NODE_NAME="NexusNet"
+    fi
+
+    if ! wt_input "节点描述" "${NODE_DESCRIPTION}" "NexusNet - 节点"; then
+        PAGE_NEXT="start"
+        return 0
+    fi
+    if [ -n "${WT_RESULT}" ]; then
+        NODE_DESCRIPTION="${WT_RESULT}"
+    else
+        NODE_DESCRIPTION="NexusNet P2P node"
+    fi
+    PAGE_NEXT="network"
+}
+
+configure_local_services_page() {
+    _snapshot="${WIZ_TMP}/local_services.snapshot"
+    cp "${LS_FILE}" "${_snapshot}"
+    _previous_enabled="${LS_ENABLED}"
+    LS_ENABLED=1
+
+    while :; do
+        _count="$(ls_count)"
+        if [ "${_count}" -eq 0 ]; then
+            _list_text="（尚未添加服务）"
+        else
+            _list_text="$(ls_summary)"
+        fi
+
+        set --
+        while IFS=: read -r _name _port _flag; do
+            [ -n "${_name}" ] || continue
+            _desc="${_name}:${_port}"
+            [ "${_flag}" = "1" ] && _desc="${_desc} [需鉴权]"
+            set -- "$@" "svc:${_name}" "${_desc}"
+        done < "${LS_FILE}"
+        set -- "$@" "__add__" "添加本地服务" "__save__" "保存并返回" "__cancel__" "取消"
+
+        if ! wt --title "NexusNet - 本地服务" --cancel-button "取消" --menu \
+            "管理本地服务（当前 ${_count} 个）" 20 82 12 "$@"; then
+            cp "${_snapshot}" "${LS_FILE}"
+            LS_ENABLED="${_previous_enabled}"
+            return 0
+        fi
+
+        case "${WT_RESULT}" in
+            __save__)
+                if [ "$(ls_count)" -eq 0 ]; then
+                    LS_ENABLED=0
+                else
+                    LS_ENABLED=1
+                fi
+                return 0
+                ;;
+            __cancel__)
+                cp "${_snapshot}" "${LS_FILE}"
+                LS_ENABLED="${_previous_enabled}"
+                return 0
+                ;;
+            __add__)
+                if prompt_service_name "" ""; then
+                    _new_name="${NAME_RESULT}"
+                    if prompt_port "7000" "本地服务 ${_new_name} 的 TCP 端口"; then
+                        printf '%s:%s:0\n' "${_new_name}" "${PORT_RESULT}" >> "${LS_FILE}"
+                    fi
+                fi
+                ;;
+            svc:*)
+                _selected_service="${WT_RESULT#svc:}"
+                _selected_port=""
+                while IFS=: read -r _name _port _flag; do
+                    if [ "${_name}" = "${_selected_service}" ]; then
+                        _selected_port="${_port}"
+                        break
+                    fi
+                done < "${LS_FILE}"
+
+                if wt --title "NexusNet - ${_selected_service}" --menu \
+                    "选择操作" 11 60 3 \
+                    edit "编辑名称与端口" \
+                    delete "删除此服务" \
+                    back "返回列表"; then
+                    case "${WT_RESULT}" in
+                        edit)
+                            if prompt_service_name "${_selected_service}" \
+                                "${_selected_service}"; then
+                                _new_name="${NAME_RESULT}"
+                                if prompt_port "${_selected_port}" \
+                                    "服务 ${_new_name} 的 TCP 端口"; then
+                                    ls_replace "${_selected_service}" "${_new_name}" \
+                                        "${PORT_RESULT}"
+                                fi
+                            fi
+                            ;;
+                        delete)
+                            if wt_yesno_defaultno "确定删除本地服务 ${_selected_service}？" 9 70; then
+                                ls_remove "${_selected_service}"
+                            fi
+                            ;;
+                    esac
+                fi
+                ;;
+        esac
+    done
+}
+
+configure_auth_page() {
+    if [ "$(ls_count)" -eq 0 ]; then
+        wt_msg "当前没有本地服务，无法配置服务鉴权。请先添加本地服务。" 10 76
+        return 0
+    fi
+
+    _network_candidate="${AUTH_NETWORK_NAME}"
+    if [ "${_network_candidate}" = "none" ]; then
+        _network_candidate=""
+    fi
+
+    while :; do
+        if ! wt_input "鉴权网络名称（字母、数字、_、-，最长 64）" \
+            "${_network_candidate}" "NexusNet - 鉴权网络"; then
+            return 0
+        fi
+        _network_candidate="${WT_RESULT}"
+        if is_valid_name "${_network_candidate}"; then
+            break
+        fi
+        wt_msg "鉴权网络名称无效：不能为空，只允许 A-Z a-z 0-9 _ -，且最长 64 字符。" 10 78
+    done
+
+    _authority_candidate="${AUTH_AUTHORITY}"
+    while :; do
+        if ! wt_input "Authority 公钥（base64 Ed25519）" \
+            "${_authority_candidate}" "NexusNet - 鉴权网络"; then
+            return 0
+        fi
+        _authority_candidate="${WT_RESULT}"
+        if [ -n "${_authority_candidate}" ]; then
+            break
+        fi
+        wt_msg "Authority 公钥不能为空。" 9 70
+    done
+
+    set --
+    while IFS=: read -r _name _port _flag; do
+        [ -n "${_name}" ] || continue
+        _status="off"
+        [ "${_flag}" = "1" ] && _status="on"
+        set -- "$@" "${_name}" "${_name}:${_port}" "${_status}"
+    done < "${LS_FILE}"
+
+    if ! wt --title "NexusNet - 服务鉴权" --ok-button "保存" --cancel-button "取消" \
+        --checklist "勾选需要鉴权的本地服务" 20 82 12 "$@"; then
+        return 0
+    fi
+
+    _selected_names=""
+    for _token in ${WT_RESULT}; do
+        _token="${_token#\"}"
+        _token="${_token%\"}"
+        [ -n "${_token}" ] && _selected_names="${_selected_names} ${_token}"
+    done
+
+    ls_set_auth_selection "${_selected_names}"
+    AUTH_NETWORK_NAME="${_network_candidate}"
+    AUTH_AUTHORITY="${_authority_candidate}"
+    AUTH_ENABLED=1
+
+    return 0
+}
+
+page_network() {
+    while :; do
+        if [ "${LS_ENABLED}" = "1" ]; then
+            _services_state="已启用（$(ls_count) 个）"
+        else
+            _services_state="未启用"
+        fi
+        if [ "${AUTH_ENABLED}" = "1" ]; then
+            _auth_state="已启用（${AUTH_NETWORK_NAME}）"
+        else
+            _auth_state="未启用"
+        fi
+
+        if ! wt --title "NexusNet - 网络与功能" --menu \
+            "配置网络与功能" 18 82 7 \
+            port "WebSocket TCP 端口：${PORT}" \
+            services "本地服务：${_services_state}" \
+            auth "鉴权网络：${_auth_state}" \
+            next "下一步：汇总并写入" \
+            back "返回：节点信息"; then
+            PAGE_NEXT="node"
+            return 0
+        fi
+
+        case "${WT_RESULT}" in
+            port)
+                if prompt_port "${PORT}" "WebSocket TCP 端口（1..65535）"; then
+                    PORT="${PORT_RESULT}"
+                fi
+                ;;
+            services)
+                if wt_yesno "是否配置本地服务？
+当前：${_services_state}"; then
+                    configure_local_services_page
+                else
+                    if [ "$(ls_count)" -gt 0 ]; then
+                        if wt_yesno_defaultno "关闭本地服务会清空当前已配置的服务，确定继续？" 11 78; then
+                            : > "${LS_FILE}"
+                            LS_ENABLED=0
+                        fi
+                    else
+                        LS_ENABLED=0
+                    fi
+                fi
+                ;;
+            auth)
+                if wt_yesno "是否配置鉴权网络？
+当前：${_auth_state}"; then
+                    configure_auth_page
+                else
+                    AUTH_ENABLED=0
+                    AUTH_NETWORK_NAME="none"
+                    AUTH_AUTHORITY=""
+                    ls_clear_auth
+                fi
+                ;;
+            next)
+                PAGE_NEXT="summary"
+                return 0
+                ;;
+            back)
+                PAGE_NEXT="node"
+                return 0
+                ;;
+        esac
+    done
+}
+
+page_summary() {
+    if [ "${LS_ENABLED}" = "1" ] && [ "$(ls_count)" -gt 0 ]; then
+        _services_text="$(ls_summary)"
+    else
+        _services_text="未启用"
+    fi
+    if [ "${AUTH_ENABLED}" = "1" ]; then
+        _auth_text="${AUTH_NETWORK_NAME}"
+    else
+        _auth_text="未启用"
+    fi
+    if [ -n "${BOOTSTRAP}" ]; then
+        _bootstrap_text="${BOOTSTRAP}"
+    else
+        _bootstrap_text="未设置"
+    fi
+
+    wt_yesno "请确认配置：
+
+节点名称：${NODE_NAME}
+节点描述：${NODE_DESCRIPTION}
+WebSocket 端口：${PORT}
+本地服务：${_services_text}
+鉴权网络：${_auth_text}
+PQ 传输/身份：固定启用
+Bootstrap：${_bootstrap_text}
+
+写入配置？" 22 86
+}
+
+finalize_wizard() {
+    if [ "${AUTH_ENABLED}" != "1" ]; then
+        AUTH_NETWORK_NAME="none"
+        AUTH_AUTHORITY=""
+        ls_clear_auth
+    fi
+
+    if [ "${LS_ENABLED}" = "1" ]; then
+        LOCAL_SERVICES="$(ls_to_csv)"
+        if [ -z "${LOCAL_SERVICES}" ]; then
+            LS_ENABLED=0
+        fi
+    else
+        LOCAL_SERVICES=""
+    fi
+
+    db_set_seen "${PKG}/setup_mode" wizard
+    db_set_seen "${PKG}/node_name" "${NODE_NAME}"
+    db_set_seen "${PKG}/node_description" "${NODE_DESCRIPTION}"
+    db_set_seen "${PKG}/port" "${PORT}"
+    db_set_seen "${PKG}/bootstrap" "${BOOTSTRAP}"
+    db_set_seen "${PKG}/local_services_enabled" \
+        "$( [ "${LS_ENABLED}" = "1" ] && printf 'true' || printf 'false' )"
+    db_set_seen "${PKG}/local_services" "${LOCAL_SERVICES}"
+    db_set_seen "${PKG}/auth_enabled" \
+        "$( [ "${AUTH_ENABLED}" = "1" ] && printf 'true' || printf 'false' )"
+    db_set_seen "${PKG}/auth_network" \
+        "$( [ "${AUTH_ENABLED}" = "1" ] && printf '%s' "${AUTH_NETWORK_NAME}" || printf 'none' )"
+    db_set_seen "${PKG}/auth_authority" \
+        "$( [ "${AUTH_ENABLED}" = "1" ] && printf '%s' "${AUTH_AUTHORITY}" || printf '' )"
+    db_set_seen "${PKG}/pq_transport" true
+    db_set_seen "${PKG}/pq_identity" true
+    db_set_seen "${PKG}/pq_required" "${PQ_REQUIRED}"
+    db_stop_safe
+}
+
+finalize_skip() {
+    db_set_seen "${PKG}/setup_mode" skip
+    db_stop_safe
+}
+
+load_prefill
+if is_noninteractive; then
+    noninteractive_configure
+    exit 0
 fi
 
-db_input high "${PKG}/ipv4_enabled" || true
-db_input high "${PKG}/ipv6_enabled" || true
-db_input high "${PKG}/port" || true
-db_input high "${PKG}/bootstrap" || true
-db_input high "${PKG}/local_services" || true
-db_input high "${PKG}/pq_transport" || true
-db_input high "${PKG}/pq_identity" || true
-db_input high "${PKG}/pq_required" || true
-db_input high "${PKG}/auth_network" || true
-db_input high "${PKG}/auth_authority" || true
-db_go || true
-
-db_get "${PKG}/pq_required" || true
-if [ "${RET:-false}" = "true" ]; then
-    db_set "${PKG}/pq_transport" true || true
+# Interactive defaults: existing config.toml wins over stale debconf values.
+parse_local_services "${LOCAL_SERVICES}" "${LS_FILE}"
+if [ "$(ls_count)" -gt 0 ]; then
+    LS_ENABLED=1
+else
+    LS_ENABLED=0
 fi
 
-db_get "${PKG}/auth_network" || true
-if [ "${RET:-none}" = "none" ]; then
-    db_set "${PKG}/auth_authority" "" || true
+AUTH_NETWORK_NAME="${AUTH_NETWORK}"
+if [ "${AUTH_NETWORK_NAME}" = "none" ] || [ -z "${AUTH_NETWORK_NAME}" ]; then
+    AUTH_NETWORK_NAME="none"
+    AUTH_ENABLED=0
+    AUTH_AUTHORITY=""
+else
+    AUTH_ENABLED=1
 fi
 
-db_input low "${PKG}/allow_bootstrap" || true
-db_input low "${PKG}/accept_bootstrap_providers" || true
-db_input low "${PKG}/ping_enabled" || true
-db_input low "${PKG}/ping_interval" || true
-db_input low "${PKG}/ping_timeout" || true
-db_input low "${PKG}/ping_failures" || true
-db_input low "${PKG}/kademlia_enabled" || true
-db_input low "${PKG}/kademlia_ttl" || true
-db_input low "${PKG}/kademlia_replication" || true
-db_input low "${PKG}/kademlia_query_timeout" || true
-db_input low "${PKG}/dispatcher_enabled" || true
-db_input low "${PKG}/dispatcher_query_timeout" || true
-db_input low "${PKG}/types_sync" || true
-db_input low "${PKG}/dispatcher_inflight" || true
-db_input low "${PKG}/request_mib" || true
-db_input low "${PKG}/response_mib" || true
-db_input low "${PKG}/registry_inflight" || true
-db_input low "${PKG}/relay_retry" || true
-db_input low "${PKG}/relay_failures" || true
-db_input low "${PKG}/compat_max" || true
-db_go || true
-
-exit 0
+MODE="wizard"
+PAGE="start"
+while :; do
+    case "${PAGE}" in
+        start)
+            page_start
+            PAGE="${PAGE_NEXT}"
+            ;;
+        node)
+            page_node
+            PAGE="${PAGE_NEXT}"
+            ;;
+        network)
+            PAGE_NEXT=""
+            page_network
+            PAGE="${PAGE_NEXT}"
+            ;;
+        summary)
+            if page_summary; then
+                finalize_wizard
+                exit 0
+            fi
+            PAGE="network"
+            ;;
+        done)
+            finalize_skip
+            exit 0
+            ;;
+        *)
+            finalize_skip
+            exit 0
+            ;;
+    esac
+done

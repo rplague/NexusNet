@@ -104,9 +104,34 @@ json_services() {
     printf '[%s]' "$_out"
 }
 
+strip_auth_csv() {
+    _in="$1"
+    _out=""
+    _first=1
+    _oldifs="$IFS"
+    IFS=','
+    for _item in $_in; do
+        _item=$(printf '%s' "$_item" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        [ -z "$_item" ] && continue
+        _name="${_item%%:*}"
+        _rest="${_item#*:}"
+        _port="${_rest%%:*}"
+        [ -z "$_name" ] || [ -z "$_port" ] && continue
+        [ "$_first" -eq 0 ] && _out="${_out},"
+        _out="${_out}${_name}:${_port}"
+        _first=0
+    done
+    IFS="$_oldifs"
+    printf '%s' "$_out"
+}
+
 db_get_mode() {
     db_get "${PKG}/setup_mode" || true
-    MODE="${RET:-keep}"
+    MODE="${RET:-skip}"
+    case "${MODE}" in
+        wizard|skip) ;;
+        *) MODE="skip" ;;
+    esac
 }
 
 db_get_value() {
@@ -136,9 +161,6 @@ if [ -f "${CONFIG}" ]; then
 fi
 
 db_get_mode
-if [ "${CONFIG_EXISTS}" -eq 0 ] && [ "${MODE}" = "keep" ]; then
-    MODE="skip"
-fi
 
 CHECK_FAILED=0
 CHECK_OUTPUT=""
@@ -146,17 +168,16 @@ CHECK_OUTPUT=""
 if [ "${MODE}" = "wizard" ]; then
     NODE_NAME="$(db_get_value node_name NexusNet)"
     NODE_DESCRIPTION="$(db_get_value node_description 'NexusNet P2P node')"
-    ROLE="$(db_get_value role nat)"
-    IPV4="$(json_bool "$(db_get_value ipv4_enabled false)")"
-    IPV6="$(json_bool "$(db_get_value ipv6_enabled false)")"
     PORT="$(json_num "$(db_get_value port 5000)" 5000)"
     BOOTSTRAP="$(db_get_value bootstrap '')"
+    LOCAL_SERVICES_ENABLED="$(json_bool "$(db_get_value local_services_enabled false)")"
     LOCAL_SERVICES="$(db_get_value local_services '')"
     ALLOW_BOOTSTRAP="$(json_bool "$(db_get_value allow_bootstrap true)")"
     ACCEPT_PROVIDERS="$(json_bool "$(db_get_value accept_bootstrap_providers false)")"
-    PQ_TRANSPORT="$(json_bool "$(db_get_value pq_transport false)")"
-    PQ_IDENTITY="$(json_bool "$(db_get_value pq_identity false)")"
+    PQ_TRANSPORT=true
+    PQ_IDENTITY=true
     PQ_REQUIRED="$(json_bool "$(db_get_value pq_required false)")"
+    AUTH_ENABLED="$(json_bool "$(db_get_value auth_enabled false)")"
     AUTH_NETWORK="$(db_get_value auth_network none)"
     AUTH_AUTHORITY="$(db_get_value auth_authority '')"
     PING_ENABLED="$(json_bool "$(db_get_value ping_enabled true)")"
@@ -178,19 +199,20 @@ if [ "${MODE}" = "wizard" ]; then
     RELAY_FAILURES="$(json_num "$(db_get_value relay_failures 3)" 3)"
     COMPAT_MAX="$(json_num "$(db_get_value compat_max 14336)" 14336)"
 
-    if [ -z "${AUTH_NETWORK}" ] || [ "${AUTH_NETWORK}" = "none" ]; then
+    if [ "${LOCAL_SERVICES_ENABLED}" != "true" ]; then
+        LOCAL_SERVICES=""
+    fi
+    if [ "${AUTH_ENABLED}" != "true" ]; then
         AUTH_NETWORK="none"
         AUTH_AUTHORITY=""
+        LOCAL_SERVICES="$(strip_auth_csv "${LOCAL_SERVICES}")"
+    elif [ -z "${AUTH_NETWORK}" ] || [ "${AUTH_NETWORK}" = "none" ]; then
+        AUTH_NETWORK="none"
+        AUTH_AUTHORITY=""
+        LOCAL_SERVICES="$(strip_auth_csv "${LOCAL_SERVICES}")"
     fi
     if [ "${PQ_REQUIRED}" = "true" ]; then
         PQ_TRANSPORT="true"
-    fi
-
-    if [ "${IPV4}" = "false" ] && [ "${IPV6}" = "false" ] && [ -z "${BOOTSTRAP}" ]; then
-        echo "NexusNet: 未启用监听且未配置 bootstrap，节点无法联网。请重新运行 dpkg-reconfigure ${PKG}。" >&2
-        systemctl disable --now "${UNIT_NAME}" >/dev/null 2>&1 || true
-        db_stop || true
-        exit 1
     fi
 
     TMPDIR="$(mktemp -d)"
@@ -219,8 +241,6 @@ if [ "${MODE}" = "wizard" ]; then
     "accept_bootstrap_providers": ${ACCEPT_PROVIDERS}
   },
   "network": {
-    "ipv4_enabled": ${IPV4},
-    "ipv6_enabled": ${IPV6},
     "port": ${PORT}
   },
   "services": {
@@ -287,6 +307,8 @@ elif [ "${MODE}" = "skip" ]; then
             db_stop || true
             exit 1
         fi
+    elif ! CHECK_OUTPUT="$(/usr/bin/"${BIN_NAME}" --check-config --config-dir /etc/"${PKG}" 2>&1)"; then
+        CHECK_FAILED=1
     fi
 else
     if [ "${CONFIG_EXISTS}" -eq 0 ]; then
@@ -314,18 +336,22 @@ if [ "${CHECK_FAILED}" -eq 1 ]; then
 elif [ "${MODE}" = "wizard" ]; then
     systemctl enable "${UNIT_NAME}" >/dev/null 2>&1 || true
     systemctl restart "${UNIT_NAME}" >/dev/null 2>&1 || true
-elif [ "${MODE}" = "keep" ] && [ "${WAS_ENABLED}" = "enabled" ]; then
-    systemctl enable "${UNIT_NAME}" >/dev/null 2>&1 || true
-    systemctl restart "${UNIT_NAME}" >/dev/null 2>&1 || true
+elif [ "${MODE}" = "skip" ] && [ "${CONFIG_EXISTS}" -eq 1 ]; then
+    if [ "${WAS_ENABLED}" = "enabled" ]; then
+        systemctl enable "${UNIT_NAME}" >/dev/null 2>&1 || true
+        systemctl restart "${UNIT_NAME}" >/dev/null 2>&1 || true
+    else
+        systemctl disable --now "${UNIT_NAME}" >/dev/null 2>&1 || true
+    fi
 else
     systemctl disable --now "${UNIT_NAME}" >/dev/null 2>&1 || true
-    if [ "${MODE}" = "skip" ] || { [ "${MODE}" = "keep" ] && [ "${CONFIG_EXISTS}" -eq 0 ]; }; then
+    if [ "${MODE}" = "skip" ] && [ "${CONFIG_EXISTS}" -eq 0 ]; then
         db_input high "${PKG}/skip_note" || true
         db_go || true
     fi
 fi
 
-db_set "${PKG}/setup_mode" keep || true
+db_set "${PKG}/setup_mode" skip || true
 db_fset "${PKG}/setup_mode" seen true || true
 db_go || true
 db_stop || true

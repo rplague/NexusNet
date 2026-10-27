@@ -1,11 +1,11 @@
 Template: @PKG@/setup_mode
 Type: select
-Choices: wizard, keep, skip
+Choices: wizard, skip
 Default: wizard
 Description: 配置方式 / Configuration mode:
  wizard: 使用安装向导 / guided setup
- keep: 保留现有配置 / keep existing config
- skip: 跳过向导，使用默认配置并手动启动 / skip and use defaults
+ skip: 保留现有配置；无配置时使用默认配置并手动启动
+       keep the existing config, or use defaults without autostart
 
 Template: @PKG@/node_name
 Type: string
@@ -16,25 +16,6 @@ Template: @PKG@/node_description
 Type: string
 Default: NexusNet P2P node
 Description: 节点描述 / Node description:
-
-Template: @PKG@/role
-Type: select
-Choices: nat, direct, custom
-Default: nat
-Description: 节点角色 / Node role:
- nat: NAT/客户端，不监听，使用 relay / client behind NAT
- direct: 公网/直连，监听 IPv4/IPv6 / public or direct node
- custom: 手动选择监听地址族 / custom listen families
-
-Template: @PKG@/ipv4_enabled
-Type: boolean
-Default: false
-Description: 是否监听 IPv4 / Listen on IPv4:
-
-Template: @PKG@/ipv6_enabled
-Type: boolean
-Default: false
-Description: 是否监听 IPv6 / Listen on IPv6:
 
 Template: @PKG@/port
 Type: string
@@ -48,21 +29,31 @@ Description: bootstrap 节点 / Bootstrap nodes:
  /ip4/1.2.3.4/tcp/5000/ws/p2p/12D3KooW...
  Comma-separated multiaddrs; /ws and /p2p/<PeerId> are required.
 
+Template: @PKG@/local_services_enabled
+Type: boolean
+Default: false
+Description: 是否启用本地服务 / Enable local services:
+
 Template: @PKG@/local_services
 Type: string
 Description: 本地服务 / Local services:
  逗号分隔，格式 name:port 或 name:port:auth，例如 ocr:5014
  Comma-separated name:port[:auth].
 
-Template: @PKG@/pq_transport
+Template: @PKG@/auth_enabled
 Type: boolean
 Default: false
-Description: 启用 PQ 传输 / Enable PQ transport:
+Description: 是否启用鉴权网络 / Enable authentication network:
+
+Template: @PKG@/pq_transport
+Type: boolean
+Default: true
+Description: PQ 传输由安装器固定启用 / PQ transport is forced on:
 
 Template: @PKG@/pq_identity
 Type: boolean
-Default: false
-Description: 启用 PQ 身份 / Enable PQ identity:
+Default: true
+Description: PQ 身份由安装器固定启用 / PQ identity is forced on:
 
 Template: @PKG@/pq_required
 Type: boolean

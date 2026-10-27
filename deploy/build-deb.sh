@@ -120,7 +120,7 @@ Section: net
 Priority: optional
 Architecture: ${ARCH}
 Maintainer: OAHD
-Depends: libc6 (>= 2.31), debconf (>= 0.5) | debconf-2.0
+Depends: libc6 (>= 2.31), debconf (>= 0.5) | debconf-2.0, whiptail, python3 (>= 3.11)
 Installed-Size: ${INSTALLED_SIZE}
 Description: ${NAME} - OAHD 计划的核心网络层
   基于 libp2p 的去中心化 P2P 节点网络。通过 Kademlia DHT 实现节点自动发现与服务注册查询；
