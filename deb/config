@@ -290,6 +290,34 @@ noninteractive_configure() {
 WIZ_TMP="$(mktemp -d)"
 trap 'rm -rf "${WIZ_TMP}"' EXIT HUP INT TERM
 
+# Keep every dialog inside the current terminal. A fixed 82/86-column dialog
+# pushes the Ok/Cancel buttons off-screen on the common 80x24 console.
+WT_ROWS=24
+WT_COLS=80
+if _size="$(stty size < /dev/tty 2>/dev/null)"; then
+    _rows="${_size%% *}"
+    _cols="${_size##* }"
+    case "${_rows}" in ''|*[!0-9]*) ;; *) [ "${_rows}" -ge 10 ] && WT_ROWS="${_rows}" ;; esac
+    case "${_cols}" in ''|*[!0-9]*) ;; *) [ "${_cols}" -ge 20 ] && WT_COLS="${_cols}" ;; esac
+fi
+
+WIZ_W=$((WT_COLS - 4))
+[ "${WIZ_W}" -gt 76 ] && WIZ_W=76
+if [ "${WIZ_W}" -lt 40 ]; then
+    WIZ_W=$((WT_COLS - 2))
+    [ "${WIZ_W}" -lt 20 ] && WIZ_W=20
+fi
+
+WIZ_H=$((WT_ROWS - 4))
+[ "${WIZ_H}" -gt 20 ] && WIZ_H=20
+[ "${WIZ_H}" -lt 10 ] && WIZ_H=10
+
+WIZ_LIST_H=$((WIZ_H - 8))
+[ "${WIZ_LIST_H}" -lt 3 ] && WIZ_LIST_H=3
+
+WIZ_INPUT_H=11
+[ "${WIZ_INPUT_H}" -gt "${WIZ_H}" ] && WIZ_INPUT_H="${WIZ_H}"
+
 LS_FILE="${WIZ_TMP}/local_services"
 : > "${LS_FILE}"
 
@@ -310,7 +338,11 @@ wt() {
 }
 
 wt_msg() {
-    wt --title "NexusNet" --ok-button "确定" --msgbox "$1" "${2:-12}" "${3:-74}" || true
+    _h="${2:-12}"
+    _w="${3:-74}"
+    [ "${_h}" -gt "${WIZ_H}" ] && _h="${WIZ_H}"
+    [ "${_w}" -gt "${WIZ_W}" ] && _w="${WIZ_W}"
+    wt --title "NexusNet" --ok-button "确定" --msgbox "$1" "${_h}" "${_w}" || true
     return 0
 }
 
@@ -319,26 +351,38 @@ wt_input() {
     _default="$2"
     _title="${3:-NexusNet}"
     wt --title "${_title}" --ok-button "确定" --cancel-button "返回" \
-        --inputbox "${_label}" 11 74 "${_default}"
+        --inputbox "${_label}" "${WIZ_INPUT_H}" "${WIZ_W}" "${_default}"
 }
 
 wt_yesno() {
+    _h="${2:-12}"
+    _w="${3:-74}"
+    [ "${_h}" -gt "${WIZ_H}" ] && _h="${WIZ_H}"
+    [ "${_w}" -gt "${WIZ_W}" ] && _w="${WIZ_W}"
     wt --title "NexusNet" --yes-button "是" --no-button "否" \
-        --yesno "$1" "${2:-12}" "${3:-74}"
+        --yesno "$1" "${_h}" "${_w}"
 }
 
 wt_yesno_defaultno() {
+    _h="${2:-12}"
+    _w="${3:-74}"
+    [ "${_h}" -gt "${WIZ_H}" ] && _h="${WIZ_H}"
+    [ "${_w}" -gt "${WIZ_W}" ] && _w="${WIZ_W}"
     wt --title "NexusNet" --defaultno --yes-button "是" --no-button "否" \
-        --yesno "$1" "${2:-12}" "${3:-74}"
+        --yesno "$1" "${_h}" "${_w}"
 }
 
 wt_editbox() {
     _file="$1"
     _title="${2:-NexusNet}"
+    _h=18
+    _w=82
+    [ "${_h}" -gt "${WIZ_H}" ] && _h="${WIZ_H}"
+    [ "${_w}" -gt "${WIZ_W}" ] && _w="${WIZ_W}"
     set +e
     whiptail --backtitle "NexusNet 安装向导" --title "${_title}" \
         --ok-button "确定" --cancel-button "返回" \
-        --editbox "${_file}" 18 82 < /dev/tty > /dev/tty 2>&1
+        --editbox "${_file}" "${_h}" "${_w}" < /dev/tty > /dev/tty 2>&1
     _status=$?
     set -e
     return "${_status}"
@@ -571,7 +615,7 @@ PAGE_NEXT="node"
 
 page_start() {
     if wt --title "NexusNet - 配置方式" --cancel-button "跳过" --menu \
-        "请选择配置方式" 14 78 4 \
+        "请选择配置方式" "${WIZ_H}" "${WIZ_W}" "${WIZ_LIST_H}" \
         wizard "使用配置向导（推荐）" \
         skip "跳过向导（保留现有配置或生成默认配置）"; then
         case "${WT_RESULT}" in
@@ -631,7 +675,7 @@ configure_local_services_page() {
         set -- "$@" "__add__" "添加本地服务" "__save__" "保存并返回" "__cancel__" "取消"
 
         if ! wt --title "NexusNet - 本地服务" --cancel-button "取消" --menu \
-            "管理本地服务（当前 ${_count} 个）" 20 82 12 "$@"; then
+            "管理本地服务（当前 ${_count} 个）" "${WIZ_H}" "${WIZ_W}" "${WIZ_LIST_H}" "$@"; then
             cp "${_snapshot}" "${LS_FILE}"
             LS_ENABLED="${_previous_enabled}"
             return 0
@@ -743,7 +787,7 @@ configure_auth_page() {
     done < "${LS_FILE}"
 
     if ! wt --title "NexusNet - 服务鉴权" --ok-button "保存" --cancel-button "取消" \
-        --checklist "勾选需要鉴权的本地服务" 20 82 12 "$@"; then
+        --checklist "勾选需要鉴权的本地服务" "${WIZ_H}" "${WIZ_W}" "${WIZ_LIST_H}" "$@"; then
         return 0
     fi
 
@@ -776,7 +820,7 @@ page_network() {
         fi
 
         if ! wt --title "NexusNet - 网络与功能" --menu \
-            "配置网络与功能" 18 82 7 \
+            "配置网络与功能" "${WIZ_H}" "${WIZ_W}" "${WIZ_LIST_H}" \
             port "WebSocket TCP 端口：${PORT}" \
             services "本地服务：${_services_state}" \
             auth "鉴权网络：${_auth_state}" \
