@@ -61,6 +61,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     {
         LogStruct::new(LogLevel::Warning, "PQ 密钥初始化失败", e.to_string()).emit();
     }
+    // Wait for the configured address families before probing so the probe
+    // reflects the addresses that actually exist once the network is online.
+    // The wait is bounded and does not block startup on timeout.
+    network::wait_for_configured_addresses(&config_handle).await;
     if let Err(e) = network::update_config_with_public_ip(&config_handle) {
         LogStruct::new(LogLevel::Warning, "更新公网IP失败", e.to_string()).emit();
     }
