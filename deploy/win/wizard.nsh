@@ -4,49 +4,36 @@ Function ModePageCreate
   ${If} $Dialog == error
     Abort
   ${EndIf}
-  ${NSD_CreateLabel} 10 10 280 36 "选择配置方式。首次安装可以跳过向导，服务将使用默认配置并保持手动启动。重新配置从默认值开始，旧配置会备份。"
-  Pop $0
   ${If} $ConfigExists == "1"
-    ${NSD_CreateRadioButton} 10 50 270 14 "保留现有配置（推荐）"
-    Pop $hModeKeep
-    ${NSD_CreateRadioButton} 10 70 270 14 "重新配置（备份旧 config.toml）"
-    Pop $hModeReconfig
-    ${If} $CfgAction == "wizard"
-      ${NSD_SetState} $hModeReconfig ${BST_CHECKED}
-    ${Else}
-      ${NSD_SetState} $hModeKeep ${BST_CHECKED}
-    ${EndIf}
-  ${Else}
-    ${NSD_CreateRadioButton} 10 50 270 14 "使用配置向导（推荐）"
+    ${NSD_CreateLabel} 10 10 280 28 "检测到现有配置。使用向导会备份旧 config.toml，并从默认值开始重新配置；跳过向导会保留现有配置。"
+    Pop $0
+    ${NSD_CreateRadioButton} 10 45 270 14 "使用配置向导（推荐）"
     Pop $hModeWizard
-    ${NSD_CreateRadioButton} 10 70 270 14 "跳过向导，使用默认配置并手动启动服务"
+    ${NSD_CreateRadioButton} 10 65 270 14 "跳过向导（保留现有配置）"
     Pop $hModeSkip
-    ${If} $CfgAction == "skip"
-      ${NSD_SetState} $hModeSkip ${BST_CHECKED}
-    ${Else}
-      ${NSD_SetState} $hModeWizard ${BST_CHECKED}
-    ${EndIf}
+    ${NSD_SetState} $hModeSkip ${BST_CHECKED}
+  ${Else}
+    ${NSD_CreateLabel} 10 10 280 28 "首次安装。向导会询问节点、网络、本地服务、鉴权和 bootstrap；跳过向导会生成默认配置并保持服务手动启动。"
+    Pop $0
+    ${NSD_CreateRadioButton} 10 45 270 14 "使用配置向导（推荐）"
+    Pop $hModeWizard
+    ${NSD_CreateRadioButton} 10 65 270 14 "跳过向导（使用默认配置，手动启动）"
+    Pop $hModeSkip
+    ${NSD_SetState} $hModeWizard ${BST_CHECKED}
   ${EndIf}
   nsDialogs::Show
 FunctionEnd
 
 Function ModePageLeave
-  ${If} $ConfigExists == "1"
-    ${NSD_GetState} $hModeKeep $R0
-    ${If} $R0 == ${BST_CHECKED}
-      StrCpy $CfgAction "keep"
-      StrCpy $DoBackup "0"
-    ${Else}
-      StrCpy $CfgAction "wizard"
-      StrCpy $DoBackup "1"
-    ${EndIf}
+  ${NSD_GetState} $hModeSkip $R0
+  ${If} $R0 == ${BST_CHECKED}
+    StrCpy $CfgAction "skip"
+    StrCpy $DoBackup "0"
   ${Else}
-    ${NSD_GetState} $hModeSkip $R0
-    ${If} $R0 == ${BST_CHECKED}
-      StrCpy $CfgAction "skip"
-      StrCpy $DoBackup "0"
+    StrCpy $CfgAction "wizard"
+    ${If} $ConfigExists == "1"
+      StrCpy $DoBackup "1"
     ${Else}
-      StrCpy $CfgAction "wizard"
       StrCpy $DoBackup "0"
     ${EndIf}
   ${EndIf}
@@ -65,88 +52,26 @@ Function NodePageCreate
   Pop $0
   ${NSD_CreateText} 75 8 210 14 "$NodeName"
   Pop $hName
-  ${NSD_CreateLabel} 10 30 60 14 "描述"
+  ${NSD_CreateLabel} 10 32 60 14 "描述"
   Pop $0
-  ${NSD_CreateText} 75 28 210 14 "$NodeDescription"
+  ${NSD_CreateText} 75 30 210 14 "$NodeDescription"
   Pop $hDescription
-  ${NSD_CreateLabel} 10 55 270 14 "节点角色："
+  ${NSD_CreateLabel} 10 58 270 28 "网络地址族由程序启动时自动探测；防火墙规则会在安装时按端口自动添加。"
   Pop $0
-  ${NSD_CreateRadioButton} 10 72 270 14 "NAT / 客户端（不监听，使用 relay）"
-  Pop $hRoleNat
-  ${NSD_CreateRadioButton} 10 89 270 14 "公网 / 直连（监听 IPv4/IPv6，可做 bootstrap）"
-  Pop $hRoleDirect
-  ${NSD_CreateRadioButton} 10 106 270 14 "自定义"
-  Pop $hRoleCustom
-  ${If} $Role == "direct"
-    ${NSD_SetState} $hRoleDirect ${BST_CHECKED}
-  ${ElseIf} $Role == "custom"
-    ${NSD_SetState} $hRoleCustom ${BST_CHECKED}
-  ${Else}
-    ${NSD_SetState} $hRoleNat ${BST_CHECKED}
-  ${EndIf}
-  ${NSD_CreateCheckBox} 10 130 270 14 "允许在双栈公网时作为 bootstrap"
-  Pop $hAllowBootstrap
-  ${If} $AllowBootstrap == "1"
-    ${NSD_SetState} $hAllowBootstrap ${BST_CHECKED}
-  ${EndIf}
-  ${NSD_CreateCheckBox} 10 148 270 14 "接受 Identify 发现的 bootstrap provider"
-  Pop $hAcceptProviders
-  ${If} $AcceptProviders == "1"
-    ${NSD_SetState} $hAcceptProviders ${BST_CHECKED}
-  ${EndIf}
   nsDialogs::Show
 FunctionEnd
 
 Function NodePageLeave
+  ${If} $CfgAction != "wizard"
+    Abort
+  ${EndIf}
   ${NSD_GetText} $hName $NodeName
   ${NSD_GetText} $hDescription $NodeDescription
   ${If} $NodeName == ""
-    MessageBox MB_ICONEXCLAMATION "节点名称不能为空。"
-    Abort
+    StrCpy $NodeName "NexusNet"
   ${EndIf}
-  StrCpy $R0 "$NodeName"
-  Call HasJsonSpecial
-  ${If} $R3 == "1"
-    MessageBox MB_ICONEXCLAMATION "节点名称不能包含双引号或反斜杠。"
-    Abort
-  ${EndIf}
-  StrCpy $R0 "$NodeDescription"
-  Call HasJsonSpecial
-  ${If} $R3 == "1"
-    MessageBox MB_ICONEXCLAMATION "描述不能包含双引号或反斜杠。"
-    Abort
-  ${EndIf}
-  ${NSD_GetState} $hRoleNat $R0
-  ${If} $R0 == ${BST_CHECKED}
-    StrCpy $Role "nat"
-  ${Else}
-    ${NSD_GetState} $hRoleDirect $R0
-    ${If} $R0 == ${BST_CHECKED}
-      StrCpy $Role "direct"
-    ${Else}
-      StrCpy $Role "custom"
-    ${EndIf}
-  ${EndIf}
-  ${NSD_GetState} $hAllowBootstrap $R0
-  ${If} $R0 == ${BST_CHECKED}
-    StrCpy $AllowBootstrap "1"
-  ${Else}
-    StrCpy $AllowBootstrap "0"
-  ${EndIf}
-  ${NSD_GetState} $hAcceptProviders $R0
-  ${If} $R0 == ${BST_CHECKED}
-    StrCpy $AcceptProviders "1"
-  ${Else}
-    StrCpy $AcceptProviders "0"
-  ${EndIf}
-  ${If} $Role == "nat"
-    StrCpy $Ipv4 "0"
-    StrCpy $Ipv6 "0"
-    StrCpy $Firewall "0"
-  ${ElseIf} $Role == "direct"
-    StrCpy $Ipv4 "1"
-    StrCpy $Ipv6 "1"
-    StrCpy $Firewall "1"
+  ${If} $NodeDescription == ""
+    StrCpy $NodeDescription "NexusNet P2P node"
   ${EndIf}
 FunctionEnd
 
@@ -159,31 +84,40 @@ Function NetworkPageCreate
   ${If} $Dialog == error
     Abort
   ${EndIf}
-  ${NSD_CreateLabel} 10 10 60 14 "WebSocket 端口"
+  ${NSD_CreateLabel} 10 10 70 14 "WebSocket 端口"
   Pop $0
   ${NSD_CreateText} 120 8 70 14 "$Port"
   Pop $hPort
-  ${NSD_CreateCheckBox} 10 40 270 14 "监听 IPv4（地址自动检测）"
-  Pop $hIpv4
-  ${If} $Ipv4 == "1"
-    ${NSD_SetState} $hIpv4 ${BST_CHECKED}
+  ${NSD_CreateCheckBox} 10 38 270 14 "配置本地服务"
+  Pop $hServicesEnabled
+  ${If} $ServicesEnabled == "1"
+    ${NSD_SetState} $hServicesEnabled ${BST_CHECKED}
   ${EndIf}
-  ${NSD_CreateCheckBox} 10 58 270 14 "监听 IPv6（地址自动检测）"
-  Pop $hIpv6
-  ${If} $Ipv6 == "1"
-    ${NSD_SetState} $hIpv6 ${BST_CHECKED}
+  ${NSD_CreateCheckBox} 10 58 270 14 "配置鉴权网络"
+  Pop $hAuthEnabled
+  ${If} $AuthEnabled == "1"
+    ${NSD_SetState} $hAuthEnabled ${BST_CHECKED}
   ${EndIf}
-  ${NSD_CreateCheckBox} 10 82 270 14 "添加 Windows 防火墙入站规则"
-  Pop $hFirewall
-  ${If} $Firewall == "1"
-    ${NSD_SetState} $hFirewall ${BST_CHECKED}
-  ${EndIf}
-  ${NSD_CreateLabel} 10 110 270 32 "端口是 WebSocket 的 TCP 端口。公网地址由程序自动检测；无公网地址时使用 relay。"
+  ${NSD_CreateLabel} 10 88 270 40 "本地服务固定连接 127.0.0.1。鉴权网络需要至少一个本地服务才能勾选服务鉴权。"
   Pop $0
+  StrCpy $BackPressed "0"
+  GetFunctionAddress $0 NetworkPageBack
+  nsDialogs::OnBack $0
   nsDialogs::Show
 FunctionEnd
 
+Function NetworkPageBack
+  StrCpy $BackPressed "1"
+FunctionEnd
+
 Function NetworkPageLeave
+  ${If} $CfgAction != "wizard"
+    Abort
+  ${EndIf}
+  ${If} $BackPressed == "1"
+    StrCpy $BackPressed "0"
+    Return
+  ${EndIf}
   ${NSD_GetText} $hPort $Port
   StrCpy $R0 "$Port"
   StrCpy $R1 "1"
@@ -193,28 +127,351 @@ Function NetworkPageLeave
     MessageBox MB_ICONEXCLAMATION "端口必须是 1-65535 的数字。"
     Abort
   ${EndIf}
-  ${NSD_GetState} $hIpv4 $R0
+
+  ${NSD_GetState} $hServicesEnabled $R0
   ${If} $R0 == ${BST_CHECKED}
-    StrCpy $Ipv4 "1"
+    StrCpy $ServicesEnabled "1"
   ${Else}
-    StrCpy $Ipv4 "0"
+    StrCpy $ServicesEnabled "0"
   ${EndIf}
-  ${NSD_GetState} $hIpv6 $R0
+
+  ${NSD_GetState} $hAuthEnabled $R0
   ${If} $R0 == ${BST_CHECKED}
-    StrCpy $Ipv6 "1"
+    ${If} $ServicesEnabled == "1"
+      StrCpy $AuthEnabled "1"
+    ${Else}
+      StrCpy $AuthEnabled "0"
+    ${EndIf}
   ${Else}
-    StrCpy $Ipv6 "0"
+    StrCpy $AuthEnabled "0"
   ${EndIf}
-  ${NSD_GetState} $hFirewall $R0
-  ${If} $R0 == ${BST_CHECKED}
-    StrCpy $Firewall "1"
+
+  ${If} $ServicesEnabled == "0"
+    Call ServicesInit
+    StrCpy $AuthEnabled "0"
+    StrCpy $AuthNetwork "none"
+    StrCpy $AuthAuthority ""
+  ${ElseIf} $AuthEnabled == "0"
+    StrCpy $AuthNetwork "none"
+    StrCpy $AuthAuthority ""
+    Call ServicesClearAuth
+  ${EndIf}
+FunctionEnd
+
+Function RefreshServiceList
+  SendMessage $hServicesList ${LB_RESETCONTENT} 0 0
+  FileOpen $0 "$ServicesFile" r
+  IfErrors RefreshServiceList_done
+  RefreshServiceList_loop:
+    ClearErrors
+    FileRead $0 $1
+    IfErrors RefreshServiceList_close
+    StrCmp $1 "" RefreshServiceList_close
+    ${StrTrimNewLines} $1 $1
+    StrCpy $R0 "$1"
+    Call ServiceParse
+    StrCmp $SvcName "" RefreshServiceList_next
+    ${If} $SvcFlag == "1"
+      ${NSD_LB_AddString} $hServicesList "$SvcName:$SvcPort [鉴权]"
+    ${Else}
+      ${NSD_LB_AddString} $hServicesList "$SvcName:$SvcPort"
+    ${EndIf}
+  RefreshServiceList_next:
+    Goto RefreshServiceList_loop
+  RefreshServiceList_close:
+    FileClose $0
+  RefreshServiceList_done:
+  SendMessage $hServicesList ${LB_SETCURSEL} 0 0
+FunctionEnd
+
+Function ServicePromptDialog
+  FileOpen $0 "$IoIni" w
+  FileWriteByte $0 255
+  FileWriteByte $0 254
+  FileWriteUTF16LE $0 "[Settings]$\r$\n"
+  FileWriteUTF16LE $0 "NumFields=4$\r$\n"
+  FileWriteUTF16LE $0 "Title=$SvcPromptTitle$\r$\n"
+  FileWriteUTF16LE $0 "NextButtonText=确定$\r$\n"
+  FileWriteUTF16LE $0 "CancelButtonText=取消$\r$\n$\r$\n"
+  FileWriteUTF16LE $0 "[Field 1]$\r$\n"
+  FileWriteUTF16LE $0 "Type=Label$\r$\n"
+  FileWriteUTF16LE $0 "Text=服务名称（字母、数字、_、-，最长 64）$\r$\n"
+  FileWriteUTF16LE $0 "Left=10$\r$\n"
+  FileWriteUTF16LE $0 "Right=-10$\r$\n"
+  FileWriteUTF16LE $0 "Top=10$\r$\n"
+  FileWriteUTF16LE $0 "Bottom=24$\r$\n$\r$\n"
+  FileWriteUTF16LE $0 "[Field 2]$\r$\n"
+  FileWriteUTF16LE $0 "Type=Text$\r$\n"
+  FileWriteUTF16LE $0 "State=$SvcName$\r$\n"
+  FileWriteUTF16LE $0 "Left=10$\r$\n"
+  FileWriteUTF16LE $0 "Right=-10$\r$\n"
+  FileWriteUTF16LE $0 "Top=26$\r$\n"
+  FileWriteUTF16LE $0 "Bottom=40$\r$\n$\r$\n"
+  FileWriteUTF16LE $0 "[Field 3]$\r$\n"
+  FileWriteUTF16LE $0 "Type=Label$\r$\n"
+  FileWriteUTF16LE $0 "Text=TCP 端口（1..65535）$\r$\n"
+  FileWriteUTF16LE $0 "Left=10$\r$\n"
+  FileWriteUTF16LE $0 "Right=-10$\r$\n"
+  FileWriteUTF16LE $0 "Top=50$\r$\n"
+  FileWriteUTF16LE $0 "Bottom=64$\r$\n$\r$\n"
+  FileWriteUTF16LE $0 "[Field 4]$\r$\n"
+  FileWriteUTF16LE $0 "Type=Text$\r$\n"
+  FileWriteUTF16LE $0 "State=$SvcPort$\r$\n"
+  FileWriteUTF16LE $0 "Left=10$\r$\n"
+  FileWriteUTF16LE $0 "Right=90$\r$\n"
+  FileWriteUTF16LE $0 "Top=66$\r$\n"
+  FileWriteUTF16LE $0 "Bottom=80$\r$\n"
+  FileClose $0
+
+  InstallOptions::dialog "$IoIni"
+  Pop $0
+  StrCmp $0 "success" 0 ServicePromptDialog_cancel
+  ReadINIStr $1 "$IoIni" "Field 2" "State"
+  ReadINIStr $2 "$IoIni" "Field 4" "State"
+  ${StrTrimNewLines} $1 $1
+  ${StrTrimNewLines} $2 $2
+  StrCpy $SvcName "$1"
+  StrCpy $SvcPort "$2"
+  StrCpy $PromptOk "1"
+  Return
+  ServicePromptDialog_cancel:
+    StrCpy $PromptOk "0"
+FunctionEnd
+
+Function PromptService
+  PromptService_loop:
+    Call ServicePromptDialog
+    StrCmp $PromptOk "1" 0 PromptService_cancel
+    StrCpy $R0 "$SvcName"
+    Call IsValidServiceName
+    ${If} $R1 != "1"
+      MessageBox MB_ICONEXCLAMATION "服务名称无效：不能为空，只允许 A-Z a-z 0-9 _ -，最长 64 字符，且不能是 service。"
+      Goto PromptService_loop
+    ${EndIf}
+    StrCpy $R0 "$SvcPort"
+    StrCpy $R1 "1"
+    StrCpy $R2 "65535"
+    Call ValidateInt
+    ${If} $R3 != "1"
+      MessageBox MB_ICONEXCLAMATION "服务端口必须是 1-65535 的数字。"
+      Goto PromptService_loop
+    ${EndIf}
+    StrCpy $R0 "$SvcName"
+    StrCpy $R1 "$SvcOldName"
+    Call ServicesHasName
+    ${If} $R2 == "1"
+      MessageBox MB_ICONEXCLAMATION "服务名称 $SvcName 已存在，请使用其它名称。"
+      Goto PromptService_loop
+    ${EndIf}
+    StrCpy $PromptOk "1"
+    Return
+  PromptService_cancel:
+    StrCpy $PromptOk "0"
+FunctionEnd
+
+Function ServiceAddClick
+  StrCpy $SvcOldName ""
+  StrCpy $SvcName ""
+  StrCpy $SvcPort "7000"
+  StrCpy $SvcPromptTitle "添加本地服务"
+  Call PromptService
+  StrCmp $PromptOk "1" 0 ServiceAddClick_done
+  StrCpy $SvcFlag "0"
+  Call ServicesAdd
+  Call RefreshServiceList
+  ServiceAddClick_done:
+FunctionEnd
+
+Function ServiceEditClick
+  SendMessage $hServicesList ${LB_GETCURSEL} 0 0
+  Pop $R0
+  StrCmp $R0 "-1" 0 ServiceEditClick_get
+    MessageBox MB_ICONINFORMATION "请先选择要编辑的服务。"
+    Return
+  ServiceEditClick_get:
+    Call ServicesGetByIndex
+    StrCmp $SvcName "" ServiceEditClick_done
+    StrCpy $SvcOldName "$SvcName"
+    StrCpy $SvcPromptTitle "编辑本地服务"
+    Call PromptService
+    StrCmp $PromptOk "1" 0 ServiceEditClick_done
+    StrCpy $R0 "$SvcOldName"
+    Call ServicesReplace
+    Call RefreshServiceList
+  ServiceEditClick_done:
+FunctionEnd
+
+Function ServiceDeleteClick
+  SendMessage $hServicesList ${LB_GETCURSEL} 0 0
+  Pop $R0
+  StrCmp $R0 "-1" 0 ServiceDeleteClick_get
+    MessageBox MB_ICONINFORMATION "请先选择要删除的服务。"
+    Return
+  ServiceDeleteClick_get:
+    Call ServicesGetByIndex
+    StrCmp $SvcName "" ServiceDeleteClick_done
+    MessageBox MB_YESNO|MB_ICONQUESTION "确定删除本地服务 $SvcName？" IDYES +2
+      Return
+    StrCpy $R0 "$SvcName"
+    Call ServicesRemove
+    Call RefreshServiceList
+  ServiceDeleteClick_done:
+FunctionEnd
+
+Function ServicesPageCreate
+  ${If} $CfgAction != "wizard"
+    Abort
+  ${EndIf}
+  ${If} $ServicesEnabled != "1"
+    Abort
+  ${EndIf}
+  nsDialogs::Create 1018
+  Pop $Dialog
+  ${If} $Dialog == error
+    Abort
+  ${EndIf}
+  ${NSD_CreateLabel} 10 10 270 24 "管理本地服务。服务固定连接 127.0.0.1，鉴权在下一步配置。"
+  Pop $0
+  ${NSD_CreateListBox} 10 38 270 150 ""
+  Pop $hServicesList
+  ${NSD_CreateButton} 10 196 80 16 "添加"
+  Pop $0
+  ${NSD_OnClick} $0 ServiceAddClick
+  ${NSD_CreateButton} 100 196 80 16 "编辑"
+  Pop $0
+  ${NSD_OnClick} $0 ServiceEditClick
+  ${NSD_CreateButton} 190 196 80 16 "删除"
+  Pop $0
+  ${NSD_OnClick} $0 ServiceDeleteClick
+  Call RefreshServiceList
+  nsDialogs::Show
+FunctionEnd
+
+Function ServicesPageLeave
+  IfFileExists "$ServicesFile" 0 ServicesPageLeave_done
+  Call ServicesCount
+  ${If} $SvcCount == 0
+    StrCpy $ServicesEnabled "0"
+    StrCpy $AuthEnabled "0"
+    StrCpy $AuthNetwork "none"
+    StrCpy $AuthAuthority ""
+  ${EndIf}
+  ServicesPageLeave_done:
+FunctionEnd
+
+Function RefreshAuthList
+  SendMessage $hAuthList ${LB_GETCURSEL} 0 0
+  Pop $SvcIndex
+  SendMessage $hAuthList ${LB_RESETCONTENT} 0 0
+  FileOpen $0 "$ServicesFile" r
+  IfErrors RefreshAuthList_done
+  RefreshAuthList_loop:
+    ClearErrors
+    FileRead $0 $1
+    IfErrors RefreshAuthList_close
+    StrCmp $1 "" RefreshAuthList_close
+    ${StrTrimNewLines} $1 $1
+    StrCpy $R0 "$1"
+    Call ServiceParse
+    StrCmp $SvcName "" RefreshAuthList_next
+    ${If} $SvcFlag == "1"
+      ${NSD_LB_AddString} $hAuthList "$SvcName:$SvcPort [鉴权]"
+    ${Else}
+      ${NSD_LB_AddString} $hAuthList "$SvcName:$SvcPort"
+    ${EndIf}
+  RefreshAuthList_next:
+    Goto RefreshAuthList_loop
+  RefreshAuthList_close:
+    FileClose $0
+  RefreshAuthList_done:
+  ${If} $SvcIndex == "-1"
+    StrCpy $SvcIndex "0"
+  ${EndIf}
+  SendMessage $hAuthList ${LB_SETCURSEL} $SvcIndex 0
+FunctionEnd
+
+Function AuthToggleClick
+  SendMessage $hAuthList ${LB_GETCURSEL} 0 0
+  Pop $R0
+  StrCmp $R0 "-1" 0 AuthToggleClick_do
+    MessageBox MB_ICONINFORMATION "请先选择需要切换鉴权的服务。"
+    Return
+  AuthToggleClick_do:
+    Call ServicesToggleAuth
+    Call RefreshAuthList
+FunctionEnd
+
+Function AuthPageCreate
+  ${If} $CfgAction != "wizard"
+    Abort
+  ${EndIf}
+  ${If} $AuthEnabled != "1"
+    Abort
+  ${EndIf}
+  nsDialogs::Create 1018
+  Pop $Dialog
+  ${If} $Dialog == error
+    Abort
+  ${EndIf}
+  ${If} $AuthNetwork == "none"
+    StrCpy $AuthDisplay ""
   ${Else}
-    StrCpy $Firewall "0"
+    StrCpy $AuthDisplay "$AuthNetwork"
   ${EndIf}
-  ${If} $Ipv4 == "0"
-    ${AndIf} $Ipv6 == "0"
-    StrCpy $Firewall "0"
+  ${NSD_CreateLabel} 10 10 80 14 "鉴权网络名称"
+  Pop $0
+  ${NSD_CreateText} 120 8 160 14 "$AuthDisplay"
+  Pop $hAuthNetwork
+  ${NSD_CreateLabel} 10 34 80 14 "Authority 公钥"
+  Pop $0
+  ${NSD_CreateText} 120 32 160 14 "$AuthAuthority"
+  Pop $hAuthAuthority
+  ${NSD_CreateLabel} 10 60 270 24 "选择服务后点击按钮切换是否需要鉴权。Authority 为 base64 Ed25519 公钥。"
+  Pop $0
+  ${NSD_CreateListBox} 10 88 270 100 ""
+  Pop $hAuthList
+  ${NSD_CreateButton} 10 194 100 16 "切换鉴权"
+  Pop $0
+  ${NSD_OnClick} $0 AuthToggleClick
+  Call RefreshAuthList
+  StrCpy $BackPressed "0"
+  GetFunctionAddress $0 AuthPageBack
+  nsDialogs::OnBack $0
+  nsDialogs::Show
+FunctionEnd
+
+Function AuthPageBack
+  StrCpy $BackPressed "1"
+FunctionEnd
+
+Function AuthPageLeave
+  ${If} $BackPressed == "1"
+    StrCpy $BackPressed "0"
+    Return
   ${EndIf}
+  ${NSD_GetText} $hAuthNetwork $AuthNetwork
+  ${NSD_GetText} $hAuthAuthority $AuthAuthority
+  ${If} $AuthNetwork == "none"
+    StrCpy $AuthEnabled "0"
+    StrCpy $AuthAuthority ""
+    Call ServicesClearAuth
+    Return
+  ${EndIf}
+  ${If} $AuthNetwork == ""
+    MessageBox MB_ICONEXCLAMATION "启用鉴权网络时网络名称不能为空。"
+    Abort
+  ${EndIf}
+  StrCpy $R0 "$AuthNetwork"
+  Call IsValidName
+  ${If} $R1 != "1"
+    MessageBox MB_ICONEXCLAMATION "鉴权网络名称无效：只允许 A-Z a-z 0-9 _ -，最长 64 字符。"
+    Abort
+  ${EndIf}
+  ${If} $AuthAuthority == ""
+    MessageBox MB_ICONEXCLAMATION "启用鉴权网络时 Authority 公钥不能为空。"
+    Abort
+  ${EndIf}
+  StrCpy $AuthEnabled "1"
 FunctionEnd
 
 Function BootstrapPageCreate
@@ -226,494 +483,34 @@ Function BootstrapPageCreate
   ${If} $Dialog == error
     Abort
   ${EndIf}
-  ${NSD_CreateLabel} 10 10 270 28 "每行一个 bootstrap multiaddr，必须包含 /ws 和 /p2p/<PeerId>。"
+  ${NSD_CreateLabel} 10 10 270 28 "每行一个 bootstrap multiaddr，也可用逗号分隔；必须包含 /ws 和 /p2p/<PeerId>。留空表示不配置。"
   Pop $0
-  ${NSD_CreateMLText} 10 42 270 105 "$Bootstrap"
+  ${NSD_CreateMLText} 10 42 270 120 "$Bootstrap"
   Pop $hBootstrap
-  ${NSD_CreateLabel} 10 155 270 32 "例如 /ip4/167.99.153.118/tcp/5000/ws/p2p/12D3KooW..."
+  ${NSD_CreateLabel} 10 168 270 28 "例如 /ip4/167.99.153.118/tcp/5000/ws/p2p/12D3KooW..."
   Pop $0
+  StrCpy $BackPressed "0"
+  GetFunctionAddress $0 BootstrapPageBack
+  nsDialogs::OnBack $0
   nsDialogs::Show
+FunctionEnd
+
+Function BootstrapPageBack
+  StrCpy $BackPressed "1"
 FunctionEnd
 
 Function BootstrapPageLeave
+  ${If} $BackPressed == "1"
+    StrCpy $BackPressed "0"
+    Return
+  ${EndIf}
   ${NSD_GetText} $hBootstrap $Bootstrap
-  StrCpy $R0 "$Bootstrap"
-  Call HasJsonSpecial
-  ${If} $R3 == "1"
-    MessageBox MB_ICONEXCLAMATION "bootstrap 地址不能包含双引号或反斜杠。"
+  Call ValidateBootstrap
+  ${If} $BootResult != "1"
+    MessageBox MB_ICONEXCLAMATION "$BootError"
     Abort
   ${EndIf}
-  ${If} $Role == "nat"
-    ${AndIf} $Bootstrap == ""
-    MessageBox MB_ICONEXCLAMATION "NAT/客户端模式至少需要一个 bootstrap。"
-    Abort
-  ${EndIf}
-  ${If} $Bootstrap != ""
-    StrCpy $R0 "$Bootstrap"
-    StrCpy $R1 "/ws"
-    Call Contains
-    ${If} $R2 != "1"
-      MessageBox MB_ICONEXCLAMATION "本版本只支持 WebSocket，bootstrap 必须包含 /ws。"
-      Abort
-    ${EndIf}
-    StrCpy $R0 "$Bootstrap"
-    StrCpy $R1 "/p2p/"
-    Call Contains
-    ${If} $R2 != "1"
-      MessageBox MB_ICONEXCLAMATION "bootstrap 必须包含 /p2p/<PeerId>。"
-      Abort
-    ${EndIf}
-  ${EndIf}
-FunctionEnd
-
-Function ServicesPageCreate
-  ${If} $CfgAction != "wizard"
-    Abort
-  ${EndIf}
-  nsDialogs::Create 1018
-  Pop $Dialog
-  ${If} $Dialog == error
-    Abort
-  ${EndIf}
-  ${NSD_CreateLabel} 10 10 270 28 "可选。每行一个本地服务：name:port 或 name:port:auth。"
-  Pop $0
-  ${NSD_CreateMLText} 10 42 270 105 "$Services"
-  Pop $hServices
-  ${NSD_CreateLabel} 10 155 270 32 "auth 可写 1/0/true/false；服务固定连接 127.0.0.1。"
-  Pop $0
-  nsDialogs::Show
-FunctionEnd
-
-Function ServicesPageLeave
-  ${NSD_GetText} $hServices $Services
-  StrCpy $R0 "$Services"
-  Call HasJsonSpecial
-  ${If} $R3 == "1"
-    MessageBox MB_ICONEXCLAMATION "本地服务配置不能包含双引号或反斜杠。"
-    Abort
-  ${EndIf}
-  ${If} $Services != ""
-    StrCpy $R0 "$Services"
-    StrCpy $R1 ":"
-    Call Contains
-    ${If} $R2 != "1"
-      MessageBox MB_ICONEXCLAMATION "本地服务格式应为 name:port[:auth]。"
-      Abort
-    ${EndIf}
-  ${EndIf}
-FunctionEnd
-
-Function PingPageCreate
-  ${If} $CfgAction != "wizard"
-    Abort
-  ${EndIf}
-  nsDialogs::Create 1018
-  Pop $Dialog
-  ${If} $Dialog == error
-    Abort
-  ${EndIf}
-  ${NSD_CreateCheckBox} 10 5 270 14 "使用默认 Ping / Kademlia 参数"
-  Pop $hAdvPingDefaults
-  ${If} $AdvPingDefaults == "1"
-    ${NSD_SetState} $hAdvPingDefaults ${BST_CHECKED}
-  ${EndIf}
-  ${NSD_CreateCheckBox} 10 25 270 14 "启用 Ping"
-  Pop $hPingEnabled
-  ${If} $PingEnabled == "1"
-    ${NSD_SetState} $hPingEnabled ${BST_CHECKED}
-  ${EndIf}
-  ${NSD_CreateLabel} 10 45 80 14 "Ping 间隔(秒)"
-  Pop $0
-  ${NSD_CreateText} 95 43 45 14 "$PingInterval"
-  Pop $hPingInterval
-  ${NSD_CreateLabel} 155 45 80 14 "超时(秒)"
-  Pop $0
-  ${NSD_CreateText} 235 43 45 14 "$PingTimeout"
-  Pop $hPingTimeout
-  ${NSD_CreateLabel} 10 65 80 14 "连续失败数"
-  Pop $0
-  ${NSD_CreateText} 95 63 45 14 "$PingFailures"
-  Pop $hPingFailures
-  ${NSD_CreateCheckBox} 10 85 270 14 "启用 Kademlia"
-  Pop $hKademliaEnabled
-  ${If} $KademliaEnabled == "1"
-    ${NSD_SetState} $hKademliaEnabled ${BST_CHECKED}
-  ${EndIf}
-  ${NSD_CreateLabel} 10 105 80 14 "记录 TTL(秒)"
-  Pop $0
-  ${NSD_CreateText} 95 103 45 14 "$KademliaTtl"
-  Pop $hKademliaTtl
-  ${NSD_CreateLabel} 155 105 80 14 "复制因子"
-  Pop $0
-  ${NSD_CreateText} 235 103 45 14 "$KademliaReplication"
-  Pop $hKademliaReplication
-  ${NSD_CreateLabel} 10 125 80 14 "查询超时(秒)"
-  Pop $0
-  ${NSD_CreateText} 95 123 45 14 "$KademliaTimeout"
-  Pop $hKademliaTimeout
-  nsDialogs::Show
-FunctionEnd
-
-Function PingPageLeave
-  ${NSD_GetState} $hAdvPingDefaults $R0
-  ${If} $R0 == ${BST_CHECKED}
-    StrCpy $AdvPingDefaults "1"
-    StrCpy $PingEnabled "1"
-    StrCpy $PingInterval "15"
-    StrCpy $PingTimeout "10"
-    StrCpy $PingFailures "2"
-    StrCpy $KademliaEnabled "1"
-    StrCpy $KademliaTtl "3600"
-    StrCpy $KademliaReplication "20"
-    StrCpy $KademliaTimeout "60"
-    Return
-  ${EndIf}
-  StrCpy $AdvPingDefaults "0"
-  ${NSD_GetState} $hPingEnabled $R0
-  ${If} $R0 == ${BST_CHECKED}
-    StrCpy $PingEnabled "1"
-  ${Else}
-    StrCpy $PingEnabled "0"
-  ${EndIf}
-  ${NSD_GetState} $hKademliaEnabled $R0
-  ${If} $R0 == ${BST_CHECKED}
-    StrCpy $KademliaEnabled "1"
-  ${Else}
-    StrCpy $KademliaEnabled "0"
-  ${EndIf}
-  ${NSD_GetText} $hPingInterval $PingInterval
-  ${NSD_GetText} $hPingTimeout $PingTimeout
-  ${NSD_GetText} $hPingFailures $PingFailures
-  ${NSD_GetText} $hKademliaTtl $KademliaTtl
-  ${NSD_GetText} $hKademliaReplication $KademliaReplication
-  ${NSD_GetText} $hKademliaTimeout $KademliaTimeout
-  StrCpy $R0 "$PingInterval"
-  StrCpy $R1 "1"
-  StrCpy $R2 "86400"
-  Call ValidateInt
-  ${If} $R3 != "1"
-    MessageBox MB_ICONEXCLAMATION "Ping 间隔必须是 1-86400 的数字。"
-    Abort
-  ${EndIf}
-  StrCpy $R0 "$PingTimeout"
-  StrCpy $R1 "1"
-  StrCpy $R2 "3600"
-  Call ValidateInt
-  ${If} $R3 != "1"
-    MessageBox MB_ICONEXCLAMATION "Ping 超时必须是 1-3600 的数字。"
-    Abort
-  ${EndIf}
-  StrCpy $R0 "$PingFailures"
-  StrCpy $R1 "0"
-  StrCpy $R2 "100"
-  Call ValidateInt
-  ${If} $R3 != "1"
-    MessageBox MB_ICONEXCLAMATION "Ping 失败数必须是 0-100 的数字。"
-    Abort
-  ${EndIf}
-  StrCpy $R0 "$KademliaTtl"
-  StrCpy $R1 "1"
-  StrCpy $R2 "604800"
-  Call ValidateInt
-  ${If} $R3 != "1"
-    MessageBox MB_ICONEXCLAMATION "Kademlia TTL 必须是 1-604800 的数字。"
-    Abort
-  ${EndIf}
-  StrCpy $R0 "$KademliaReplication"
-  StrCpy $R1 "1"
-  StrCpy $R2 "100"
-  Call ValidateInt
-  ${If} $R3 != "1"
-    MessageBox MB_ICONEXCLAMATION "Kademlia 复制因子必须是 1-100 的数字。"
-    Abort
-  ${EndIf}
-  StrCpy $R0 "$KademliaTimeout"
-  StrCpy $R1 "1"
-  StrCpy $R2 "3600"
-  Call ValidateInt
-  ${If} $R3 != "1"
-    MessageBox MB_ICONEXCLAMATION "Kademlia 查询超时必须是 1-3600 的数字。"
-    Abort
-  ${EndIf}
-FunctionEnd
-
-Function DispatcherPageCreate
-  ${If} $CfgAction != "wizard"
-    Abort
-  ${EndIf}
-  nsDialogs::Create 1018
-  Pop $Dialog
-  ${If} $Dialog == error
-    Abort
-  ${EndIf}
-  ${NSD_CreateCheckBox} 10 5 270 14 "使用默认 Dispatcher / Registry 参数"
-  Pop $hAdvDispatcherDefaults
-  ${If} $AdvDispatcherDefaults == "1"
-    ${NSD_SetState} $hAdvDispatcherDefaults ${BST_CHECKED}
-  ${EndIf}
-  ${NSD_CreateCheckBox} 10 25 270 14 "启用 Dispatcher"
-  Pop $hDispatcherEnabled
-  ${If} $DispatcherEnabled == "1"
-    ${NSD_SetState} $hDispatcherEnabled ${BST_CHECKED}
-  ${EndIf}
-  ${NSD_CreateLabel} 10 45 80 14 "查询超时(秒)"
-  Pop $0
-  ${NSD_CreateText} 95 43 45 14 "$DispatcherTimeout"
-  Pop $hDispatcherTimeout
-  ${NSD_CreateLabel} 155 45 80 14 "类型同步(秒)"
-  Pop $0
-  ${NSD_CreateText} 235 43 45 14 "$TypesSync"
-  Pop $hTypesSync
-  ${NSD_CreateLabel} 10 65 80 14 "DHT 并发"
-  Pop $0
-  ${NSD_CreateText} 95 63 45 14 "$DispatcherInflight"
-  Pop $hDispatcherInflight
-  ${NSD_CreateLabel} 155 65 80 14 "Registry 并发"
-  Pop $0
-  ${NSD_CreateText} 235 63 45 14 "$RegistryInflight"
-  Pop $hRegistryInflight
-  ${NSD_CreateLabel} 10 85 80 14 "请求上限(MiB)"
-  Pop $0
-  ${NSD_CreateText} 95 83 45 14 "$RequestMiB"
-  Pop $hRequestMiB
-  ${NSD_CreateLabel} 155 85 80 14 "响应上限(MiB)"
-  Pop $0
-  ${NSD_CreateText} 235 83 45 14 "$ResponseMiB"
-  Pop $hResponseMiB
-  nsDialogs::Show
-FunctionEnd
-
-Function DispatcherPageLeave
-  ${NSD_GetState} $hAdvDispatcherDefaults $R0
-  ${If} $R0 == ${BST_CHECKED}
-    StrCpy $AdvDispatcherDefaults "1"
-    StrCpy $DispatcherEnabled "1"
-    StrCpy $DispatcherTimeout "60"
-    StrCpy $TypesSync "300"
-    StrCpy $DispatcherInflight "4"
-    StrCpy $RequestMiB "16"
-    StrCpy $ResponseMiB "16"
-    StrCpy $RegistryInflight "4"
-    Return
-  ${EndIf}
-  StrCpy $AdvDispatcherDefaults "0"
-  ${NSD_GetState} $hDispatcherEnabled $R0
-  ${If} $R0 == ${BST_CHECKED}
-    StrCpy $DispatcherEnabled "1"
-  ${Else}
-    StrCpy $DispatcherEnabled "0"
-  ${EndIf}
-  ${NSD_GetText} $hDispatcherTimeout $DispatcherTimeout
-  ${NSD_GetText} $hTypesSync $TypesSync
-  ${NSD_GetText} $hDispatcherInflight $DispatcherInflight
-  ${NSD_GetText} $hRegistryInflight $RegistryInflight
-  ${NSD_GetText} $hRequestMiB $RequestMiB
-  ${NSD_GetText} $hResponseMiB $ResponseMiB
-  StrCpy $R0 "$DispatcherTimeout"
-  StrCpy $R1 "1"
-  StrCpy $R2 "3600"
-  Call ValidateInt
-  ${If} $R3 != "1"
-    MessageBox MB_ICONEXCLAMATION "Dispatcher 查询超时必须是 1-3600 的数字。"
-    Abort
-  ${EndIf}
-  StrCpy $R0 "$TypesSync"
-  StrCpy $R1 "1"
-  StrCpy $R2 "86400"
-  Call ValidateInt
-  ${If} $R3 != "1"
-    MessageBox MB_ICONEXCLAMATION "类型同步间隔必须是 1-86400 的数字。"
-    Abort
-  ${EndIf}
-  StrCpy $R0 "$DispatcherInflight"
-  StrCpy $R1 "1"
-  StrCpy $R2 "16"
-  Call ValidateInt
-  ${If} $R3 != "1"
-    MessageBox MB_ICONEXCLAMATION "DHT 并发必须是 1-16 的数字。"
-    Abort
-  ${EndIf}
-  StrCpy $R0 "$RegistryInflight"
-  StrCpy $R1 "1"
-  StrCpy $R2 "16"
-  Call ValidateInt
-  ${If} $R3 != "1"
-    MessageBox MB_ICONEXCLAMATION "Registry 并发必须是 1-16 的数字。"
-    Abort
-  ${EndIf}
-  StrCpy $R0 "$RequestMiB"
-  StrCpy $R1 "1"
-  StrCpy $R2 "64"
-  Call ValidateInt
-  ${If} $R3 != "1"
-    MessageBox MB_ICONEXCLAMATION "请求上限必须是 1-64 MiB 的数字。"
-    Abort
-  ${EndIf}
-  StrCpy $R0 "$ResponseMiB"
-  StrCpy $R1 "1"
-  StrCpy $R2 "64"
-  Call ValidateInt
-  ${If} $R3 != "1"
-    MessageBox MB_ICONEXCLAMATION "响应上限必须是 1-64 MiB 的数字。"
-    Abort
-  ${EndIf}
-FunctionEnd
-
-Function RelayPageCreate
-  ${If} $CfgAction != "wizard"
-    Abort
-  ${EndIf}
-  nsDialogs::Create 1018
-  Pop $Dialog
-  ${If} $Dialog == error
-    Abort
-  ${EndIf}
-  ${NSD_CreateCheckBox} 10 5 270 14 "使用默认 Relay / Compat 参数"
-  Pop $hAdvRelayDefaults
-  ${If} $AdvRelayDefaults == "1"
-    ${NSD_SetState} $hAdvRelayDefaults ${BST_CHECKED}
-  ${EndIf}
-  ${NSD_CreateLabel} 10 35 100 14 "Relay 重试(秒)"
-  Pop $0
-  ${NSD_CreateText} 120 33 60 14 "$RelayRetry"
-  Pop $hRelayRetry
-  ${NSD_CreateLabel} 10 60 100 14 "最大失败次数"
-  Pop $0
-  ${NSD_CreateText} 120 58 60 14 "$RelayFailures"
-  Pop $hRelayFailures
-  ${NSD_CreateLabel} 10 85 100 14 "Compat 记录上限"
-  Pop $0
-  ${NSD_CreateText} 120 83 60 14 "$CompatMax"
-  Pop $hCompatMax
-  nsDialogs::Show
-FunctionEnd
-
-Function RelayPageLeave
-  ${NSD_GetState} $hAdvRelayDefaults $R0
-  ${If} $R0 == ${BST_CHECKED}
-    StrCpy $AdvRelayDefaults "1"
-    StrCpy $RelayRetry "60"
-    StrCpy $RelayFailures "3"
-    StrCpy $CompatMax "14336"
-    Return
-  ${EndIf}
-  StrCpy $AdvRelayDefaults "0"
-  ${NSD_GetText} $hRelayRetry $RelayRetry
-  ${NSD_GetText} $hRelayFailures $RelayFailures
-  ${NSD_GetText} $hCompatMax $CompatMax
-  StrCpy $R0 "$RelayRetry"
-  StrCpy $R1 "1"
-  StrCpy $R2 "86400"
-  Call ValidateInt
-  ${If} $R3 != "1"
-    MessageBox MB_ICONEXCLAMATION "Relay 重试间隔必须是 1-86400 的数字。"
-    Abort
-  ${EndIf}
-  StrCpy $R0 "$RelayFailures"
-  StrCpy $R1 "0"
-  StrCpy $R2 "100"
-  Call ValidateInt
-  ${If} $R3 != "1"
-    MessageBox MB_ICONEXCLAMATION "Relay 最大失败次数必须是 0-100 的数字。"
-    Abort
-  ${EndIf}
-  StrCpy $R0 "$CompatMax"
-  StrCpy $R1 "1"
-  StrCpy $R2 "1048576"
-  Call ValidateInt
-  ${If} $R3 != "1"
-    MessageBox MB_ICONEXCLAMATION "Compat 记录上限必须是 1-1048576 的数字。"
-    Abort
-  ${EndIf}
-FunctionEnd
-
-Function SecurityPageCreate
-  ${If} $CfgAction != "wizard"
-    Abort
-  ${EndIf}
-  nsDialogs::Create 1018
-  Pop $Dialog
-  ${If} $Dialog == error
-    Abort
-  ${EndIf}
-  ${NSD_CreateCheckBox} 10 10 270 14 "启用 PQ 传输"
-  Pop $hPqTransport
-  ${If} $PqTransport == "1"
-    ${NSD_SetState} $hPqTransport ${BST_CHECKED}
-  ${EndIf}
-  ${NSD_CreateCheckBox} 10 28 270 14 "启用 PQ 身份"
-  Pop $hPqIdentity
-  ${If} $PqIdentity == "1"
-    ${NSD_SetState} $hPqIdentity ${BST_CHECKED}
-  ${EndIf}
-  ${NSD_CreateCheckBox} 10 46 270 14 "要求对端必须支持 PQ"
-  Pop $hPqRequired
-  ${If} $PqRequired == "1"
-    ${NSD_SetState} $hPqRequired ${BST_CHECKED}
-  ${EndIf}
-  ${NSD_CreateLabel} 10 72 100 14 "鉴权网络"
-  Pop $0
-  ${NSD_CreateText} 120 70 160 14 "$AuthNetwork"
-  Pop $hAuthNetwork
-  ${NSD_CreateLabel} 10 96 100 14 "Authority 公钥"
-  Pop $0
-  ${NSD_CreateText} 120 94 160 14 "$AuthAuthority"
-  Pop $hAuthAuthority
-  ${NSD_CreateLabel} 10 120 270 32 "鉴权网络填 none 表示关闭；启用时只支持一个网络。Authority 为 base64 Ed25519 公钥。"
-  Pop $0
-  nsDialogs::Show
-FunctionEnd
-
-Function SecurityPageLeave
-  ${NSD_GetState} $hPqTransport $R0
-  ${If} $R0 == ${BST_CHECKED}
-    StrCpy $PqTransport "1"
-  ${Else}
-    StrCpy $PqTransport "0"
-  ${EndIf}
-  ${NSD_GetState} $hPqIdentity $R0
-  ${If} $R0 == ${BST_CHECKED}
-    StrCpy $PqIdentity "1"
-  ${Else}
-    StrCpy $PqIdentity "0"
-  ${EndIf}
-  ${NSD_GetState} $hPqRequired $R0
-  ${If} $R0 == ${BST_CHECKED}
-    StrCpy $PqRequired "1"
-  ${Else}
-    StrCpy $PqRequired "0"
-  ${EndIf}
-  ${NSD_GetText} $hAuthNetwork $AuthNetwork
-  ${NSD_GetText} $hAuthAuthority $AuthAuthority
-  ${If} $AuthNetwork == ""
-    StrCpy $AuthNetwork "none"
-  ${EndIf}
-  ${If} $AuthNetwork == "none"
-    StrCpy $AuthAuthority ""
-  ${Else}
-    ${If} $AuthAuthority == ""
-      MessageBox MB_ICONEXCLAMATION "启用鉴权网络时 Authority 不能为空。"
-      Abort
-    ${EndIf}
-    StrCpy $R0 "$AuthNetwork"
-    Call HasJsonSpecial
-    ${If} $R3 == "1"
-      MessageBox MB_ICONEXCLAMATION "鉴权网络名不能包含双引号或反斜杠。"
-      Abort
-    ${EndIf}
-    StrCpy $R0 "$AuthAuthority"
-    Call HasJsonSpecial
-    ${If} $R3 == "1"
-      MessageBox MB_ICONEXCLAMATION "Authority 不能包含双引号或反斜杠。"
-      Abort
-    ${EndIf}
-  ${EndIf}
-  ${If} $PqIdentity == "1"
-    StrCpy $PqTransport "1"
-  ${EndIf}
-  ${If} $PqRequired == "1"
-    StrCpy $PqTransport "1"
-  ${EndIf}
+  StrCpy $Bootstrap "$BootNormalized"
 FunctionEnd
 
 Function SummaryPageCreate
@@ -725,24 +522,32 @@ Function SummaryPageCreate
   ${If} $Dialog == error
     Abort
   ${EndIf}
-  StrCpy $R0 "节点名称: $NodeName$\r$\n"
-  StrCpy $R0 "$R0角色: $Role$\r$\n"
-  StrCpy $R0 "$R0端口: $Port$\r$\n"
-  StrCpy $R0 "$R0IPv4: $Ipv4  IPv6: $Ipv6  防火墙: $Firewall$\r$\n"
-  StrCpy $R0 "$R0PQ: $PqTransport / $PqIdentity / $PqRequired$\r$\n"
-  StrCpy $R0 "$R0鉴权网络: $AuthNetwork$\r$\n"
-  StrCpy $R0 "$R0本地服务: $Services$\r$\n"
-  StrCpy $R0 "$R0Bootstrap:$\r$\n$Bootstrap"
-  ${NSD_CreateMLText} 10 10 270 165 "$R0"
+  ${If} $ServicesEnabled == "1"
+    Call ServicesSummary
+  ${Else}
+    StrCpy $SvcSummary "未启用"
+  ${EndIf}
+  ${If} $AuthEnabled == "1"
+    StrCpy $R1 "$AuthNetwork"
+  ${Else}
+    StrCpy $R1 "未启用"
+  ${EndIf}
+  ${If} $Bootstrap == ""
+    StrCpy $R2 "未设置"
+  ${Else}
+    StrCpy $R2 "$Bootstrap"
+  ${EndIf}
+  StrCpy $R0 "节点名称：$NodeName$\r$\n"
+  StrCpy $R0 "$R0节点描述：$NodeDescription$\r$\n"
+  StrCpy $R0 "$R0WebSocket 端口：$Port$\r$\n"
+  StrCpy $R0 "$R0本地服务：$SvcSummary$\r$\n"
+  StrCpy $R0 "$R0鉴权网络：$R1$\r$\n"
+  StrCpy $R0 "$R0PQ 传输/身份：固定启用$\r$\n"
+  StrCpy $R0 "$R0Bootstrap：$R2"
+  ${NSD_CreateMLText} 10 10 270 210 "$R0"
   Pop $hSummary
   nsDialogs::Show
 FunctionEnd
 
 Function SummaryPageLeave
-  ${If} $Ipv4 == "0"
-    ${AndIf} $Ipv6 == "0"
-    ${AndIf} $Bootstrap == ""
-    MessageBox MB_YESNO|MB_ICONEXCLAMATION "未启用监听且未配置 bootstrap，节点将无法联网。仍然继续？" IDYES +2
-    Abort
-  ${EndIf}
 FunctionEnd

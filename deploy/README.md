@@ -65,6 +65,7 @@ preseed 和非交互兼容。依赖 `whiptail` 与 `python3 (>= 3.11)`，目标�
 - WebSocket 端口（1..65535）、是否配置本地服务、是否配置鉴权网络
 - 本地服务动态编辑器（添加/编辑/删除/保存/取消）
 - 鉴权网络名、Authority 公钥，以及每个服务的 `require_auth` 勾选
+- Bootstrap 地址（每行一个或逗号分隔，必须包含 `/ws` 和 `/p2p/<PeerId>`；可留空）
 - 汇总确认后写入配置
 
 PQ 传输和 PQ 身份固定启用，不在页面中显示；`pq_required` 仍可通过 preseed 设置。
@@ -239,7 +240,7 @@ NSSM 由脚本按固定版本（2.24）+ SHA256 下载缓存到 `target/nssm-cac
 |---|---|---|
 | 二进制 | `%ProgramFiles%\<pkg>\<bin>.exe` | 主程序 |
 | 包装器 | `%ProgramFiles%\<pkg>\nssm.exe` | NSSM，服务 ImagePath |
-| 配置 | `%ProgramData%\<pkg>\config.toml` | 向导生成；跳过时生成默认配置 |
+| 配置 | `%ProgramData%\<pkg>\config.toml` | 向导生成；跳过时保留现有配置或生成默认配置 |
 | 数据/日志 | `%ProgramData%\<pkg>` | 身份/日志文件 `log` 与轮转 `.gz` 同目录 |
 
 路径经 `NEXUSNET_CONFIG_PATH` / `NEXUSNET_KEYPAIR_PATH` / `NEXUSNET_LOG_PATH` 与
@@ -248,19 +249,27 @@ NSSM 由脚本按固定版本（2.24）+ SHA256 下载缓存到 `target/nssm-cac
 
 ### 配置向导
 
-安装器包含完整向导，页面覆盖：
+安装器向导与 Linux 保持同一流程：
 
-- 配置方式（首次安装：向导 / 跳过；升级：保留 / 重新配置）
-- 节点名、描述、角色、bootstrap 权限
-- WebSocket 端口、IPv4/IPv6 监听、Windows 防火墙
-- bootstrap 地址（一行一个，必须包含 `/ws` 和 `/p2p/`）
-- 本地服务（一行一个 `name:port[:auth]`）
-- Ping/Kademlia、Dispatcher/Registry、Relay/Compat 高级页
-- PQ 与单个鉴权网络
+- 配置方式：使用配置向导 / 跳过（已有配置时跳过即保留）
+- 节点名称、描述
+- WebSocket 端口（1..65535）
+- 本地服务编辑器（添加/编辑/删除；名称、端口校验）
+- 单个鉴权网络与 Authority，以及每个服务的鉴权开关
+- Bootstrap 地址（每行一个或逗号分隔，必须包含 `/ws` 和 `/p2p/<PeerId>`；可留空）
 - 摘要确认
 
-首次安装可以跳过向导：安装器生成默认 `config.toml`，服务设为
-`SERVICE_DEMAND_START` 且不启动。完成提示会给出：
+不再询问角色、IPv4/IPv6 监听和防火墙；程序启动时自动探测地址族。
+PQ 传输和 PQ 身份固定启用，`pq_required` 使用默认值。
+Ping/Kademlia、Dispatcher/Registry、Relay/Compat 等高级项使用默认值，不在页面中逐项询问。
+Windows 不预填旧 `config.toml`；重新配置从默认值开始，旧配置会备份为
+`config.toml.bak.<timestamp>`。
+
+跳过语义：
+
+- 已有配置：保留原配置，保持原有自动/手动启动方式。
+- 没有配置：生成默认 `config.toml`，服务设为 `SERVICE_DEMAND_START` 且不启动。
+  完成提示会给出：
 
 ```powershell
 notepad "$env:ProgramData\<pkg>\config.toml"
@@ -268,9 +277,7 @@ sc.exe start <pkg>
 sc.exe config <pkg> start= auto
 ```
 
-升级默认保留现有配置；选择“重新配置”时旧配置备份为
-`config.toml.bak.<timestamp>`，向导从默认值开始，不反向解析旧 TOML。0.6.x 检测到旧版 raw TCP bootstrap 时会阻断安装，
-提示重新配置。
+0.6.x 检测到旧版 raw TCP bootstrap 时会阻断安装，提示重新使用配置向导。
 
 静默安装：
 
@@ -281,14 +288,15 @@ setup.exe /S /SETUPFILE=C:\deploy\nexusnet-setup.json
 示例见 `deploy/win/setup.example.json`（其中的 PeerId 为占位，请替换）。没有 `/SETUPFILE` 时：已有配置保留，无配置则
 使用默认配置并保持手动启动。
 
-向导在监听启用且勾选防火墙时添加 `NexusNet (<pkg>)` 的 TCP 入站规则；卸载时删除。
+向导完成后安装器按端口自动添加 `NexusNet (<pkg>)` 的 TCP 入站规则；卸载时删除。
+跳过/保留现有配置以及 `/SETUPFILE` 静默安装时不改动已有规则。
 配置写入失败、端口非法或旧版 bootstrap 会在服务安装前中止。
 
 ### 安装 / 升级 / 卸载
 
 以管理员运行 `setup.exe`。安装过程：停删旧服务（升级场景）→ 释放文件 → 建数据目录 →
 按向导写入配置并对 `NT SERVICE\<pkg>` 授予写权限 → 按模式配置 NSSM 服务
-（向导：自动启动并启动；跳过：手动启动）→ 写卸载项。
+（向导：自动启动并启动；跳过且无配置：手动；跳过且已有配置：保持原状态）→ 写卸载项。
 
 - 服务账号：虚拟账号 `NT SERVICE\<pkg>`（无需密码），配置/日志目录已 ACL 放行。
 - 升级：运行新版本 `setup.exe`，`%ProgramData%\<pkg>` 保留；原有服务启动方式（自动/手动）保持。

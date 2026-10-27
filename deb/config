@@ -318,6 +318,60 @@ wt_yesno_defaultno() {
         --yesno "$1" "${2:-12}" "${3:-74}"
 }
 
+wt_editbox() {
+    _file="$1"
+    _title="${2:-NexusNet}"
+    set +e
+    whiptail --backtitle "NexusNet 安装向导" --title "${_title}" \
+        --ok-button "确定" --cancel-button "返回" \
+        --editbox "${_file}" 18 82 < /dev/tty > /dev/tty 2>&1
+    _status=$?
+    set -e
+    return "${_status}"
+}
+
+# --- bootstrap --------------------------------------------------------------
+
+bootstrap_to_lines() {
+    _out="$1"
+    : > "${_out}"
+    printf '%s\n' "${BOOTSTRAP}" | tr ',' '\n' | while IFS= read -r _line; do
+        _line="$(printf '%s' "${_line}" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+        [ -n "${_line}" ] && printf '%s\n' "${_line}" >> "${_out}"
+    done
+    return 0
+}
+
+validate_bootstrap_file() {
+    _file="$1"
+    BOOTSTRAP_RESULT=""
+    BOOTSTRAP_ERROR=""
+    while IFS= read -r _line; do
+        _line="$(printf '%s' "${_line}" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+        [ -n "${_line}" ] || continue
+        case "${_line}" in
+            *"/ws"*) ;;
+            *)
+                BOOTSTRAP_ERROR="bootstrap 必须包含 /ws：${_line}"
+                return 1
+                ;;
+        esac
+        case "${_line}" in
+            *"/p2p/"*) ;;
+            *)
+                BOOTSTRAP_ERROR="bootstrap 必须包含 /p2p/<PeerId>：${_line}"
+                return 1
+                ;;
+        esac
+        if [ -n "${BOOTSTRAP_RESULT}" ]; then
+            BOOTSTRAP_RESULT="${BOOTSTRAP_RESULT},${_line}"
+        else
+            BOOTSTRAP_RESULT="${_line}"
+        fi
+    done < "${_file}"
+    return 0
+}
+
 # --- local service list -----------------------------------------------------
 
 parse_local_services() {
@@ -751,7 +805,7 @@ page_network() {
                 fi
                 ;;
             next)
-                PAGE_NEXT="summary"
+                PAGE_NEXT="bootstrap"
                 return 0
                 ;;
             back)
@@ -759,6 +813,24 @@ page_network() {
                 return 0
                 ;;
         esac
+    done
+}
+
+page_bootstrap() {
+    _file="${WIZ_TMP}/bootstrap"
+    bootstrap_to_lines "${_file}"
+
+    while :; do
+        if ! wt_editbox "${_file}" "NexusNet - Bootstrap"; then
+            PAGE_NEXT="network"
+            return 0
+        fi
+        if validate_bootstrap_file "${_file}"; then
+            BOOTSTRAP="${BOOTSTRAP_RESULT}"
+            PAGE_NEXT="summary"
+            return 0
+        fi
+        wt_msg "${BOOTSTRAP_ERROR}" 10 78
     done
 }
 
@@ -873,12 +945,17 @@ while :; do
             page_network
             PAGE="${PAGE_NEXT}"
             ;;
+        bootstrap)
+            PAGE_NEXT=""
+            page_bootstrap
+            PAGE="${PAGE_NEXT}"
+            ;;
         summary)
             if page_summary; then
                 finalize_wizard
                 exit 0
             fi
-            PAGE="network"
+            PAGE="bootstrap"
             ;;
         done)
             finalize_skip

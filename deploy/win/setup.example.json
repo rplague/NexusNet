@@ -21,8 +21,8 @@
     }
   },
   "crypto": {
-    "pq_transport_enabled": false,
-    "pq_identity_enabled": false,
+    "pq_transport_enabled": true,
+    "pq_identity_enabled": true,
     "pq_required": false
   },
   "auth": {

@@ -25,9 +25,11 @@ Description: WebSocket TCP 端口 / WebSocket TCP port:
 Template: @PKG@/bootstrap
 Type: string
 Description: bootstrap 节点 / Bootstrap nodes:
- 逗号分隔，必须包含 /ws 和 /p2p/<PeerId>，例如
+ 向导中每行一个或逗号分隔；preseed 使用逗号分隔。
+ 必须包含 /ws 和 /p2p/<PeerId>，例如
  /ip4/1.2.3.4/tcp/5000/ws/p2p/12D3KooW...
- Comma-separated multiaddrs; /ws and /p2p/<PeerId> are required.
+ One per line or comma-separated in the wizard; comma-separated in preseed.
+ /ws and /p2p/<PeerId> are required.
 
 Template: @PKG@/local_services_enabled
 Type: boolean
