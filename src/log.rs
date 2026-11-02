@@ -23,9 +23,9 @@ use flate2::write::GzEncoder;
 use scopeguard::defer;
 use std::fs;
 use std::io::{IsTerminal, Read, Write};
-use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::spawn;
 use std::time::{Duration, Instant};
 
@@ -80,6 +80,25 @@ fn use_color() -> bool {
     std::io::stdout().is_terminal()
 }
 
+/// One structured log record delivered to an embedded sink.
+#[derive(Clone, Debug)]
+pub struct LogEntry {
+    pub level: String,
+    pub topic: String,
+    pub content: String,
+    pub timestamp: String,
+}
+
+static SINK: OnceLock<Arc<dyn Fn(LogEntry) + Send + Sync>> = OnceLock::new();
+
+/// Install a process-wide structured log sink.
+///
+/// Intended for mobile hosts (Android/HarmonyOS) where logs are shown in the
+/// app instead of a terminal or file. Only the first call succeeds.
+pub fn install_sink(sink: Arc<dyn Fn(LogEntry) + Send + Sync>) -> bool {
+    SINK.set(sink).is_ok()
+}
+
 /// Log output mode.
 ///
 /// Chosen entirely from the `NEXUSNET_LOG_MODE` environment variable, set by
@@ -89,6 +108,7 @@ enum LogMode {
     Journald,
     Nssm,
     File,
+    Sink,
 }
 
 impl LogMode {
@@ -103,8 +123,11 @@ impl LogMode {
     }
 }
 
-/// Cached process-wide log mode, resolved on first use.
+/// Process-wide log mode. An installed sink always wins.
 fn log_mode() -> LogMode {
+    if SINK.get().is_some() {
+        return LogMode::Sink;
+    }
     static MODE: OnceLock<LogMode> = OnceLock::new();
     *MODE.get_or_init(LogMode::from_env)
 }
@@ -127,6 +150,18 @@ impl LogLevel {
             LogLevel::Warning => "[*]",
             LogLevel::Error => "[!]",
             LogLevel::Critical => "[CRITICAL]",
+        }
+    }
+
+    /// Plain level name for structured sinks.
+    pub fn label(&self) -> &'static str {
+        match self {
+            LogLevel::Important => "IMPORTANT",
+            LogLevel::Debug => "DEBUG",
+            LogLevel::Preset => "PRESET",
+            LogLevel::Warning => "WARNING",
+            LogLevel::Error => "ERROR",
+            LogLevel::Critical => "CRITICAL",
         }
     }
 
@@ -257,6 +292,19 @@ fn log(info: &LogStruct) {
                 format_entry(info.level.as_str(), Some(&time), &info.topic, &info.content);
             append_file(&file_text);
         }
+        LogMode::Sink => {
+            if let Some(sink) = SINK.get() {
+                let entry = LogEntry {
+                    level: info.level.label().to_string(),
+                    topic: info.topic.clone(),
+                    content: info.content.clone(),
+                    timestamp: Local::now().to_rfc3339(),
+                };
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sink(entry))).is_err() {
+                    eprintln!("[NexusNet] 日志 sink 发生 panic，已忽略该条日志");
+                }
+            }
+        }
     }
 }
 
@@ -291,6 +339,7 @@ fn log_onlycli(info: &LogStruct) {
             let time = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
             write_stream(&info.level, &render_stream(info, Some(&time)));
         }
+        LogMode::Sink => {}
     }
 }
 

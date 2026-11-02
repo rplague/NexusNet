@@ -4,6 +4,10 @@ version = "0.6.2-10285"
 edition = "2024"
 license = "GPL-3.0"
 
+[lib]
+name = "nexusnet"
+path = "src/lib.rs"
+
 [dependencies]
 base64 = "0.22"
 bytes = "1"
@@ -16,12 +20,28 @@ coset = "0.4"
 flate2 = "1.1.9"
 get_if_addrs = "0.5.3"
 hkdf = "0.12"
-libp2p = { version = "0.56.0", features = ["full"] }
+libp2p = { version = "0.56.0", features = [
+    "cbor",
+    "dns",
+    "ed25519",
+    "identify",
+    "kad",
+    "macros",
+    "noise",
+    "ping",
+    "relay",
+    "request-response",
+    "serde",
+    "tcp",
+    "tls",
+    "tokio",
+    "websocket",
+    "yamux",
+] }
 log = "0.4.29"
 ml-dsa = { version = "0.1.1", features = ["alloc", "getrandom", "rand_core", "zeroize"] }
 ml-kem = { version = "0.3.2", features = ["alloc", "getrandom", "zeroize"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
-reqwest = { version = "0.11", default-features = false, features = ["blocking", "rustls-tls"] }
 scopeguard = "1"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"

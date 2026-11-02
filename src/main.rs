@@ -15,35 +15,12 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-mod auth;
-mod config;
-mod controller;
-mod cose;
-mod dht_cache;
-mod limits;
-mod log;
-mod network;
-mod paths;
-mod service_dispatcher;
-mod service_protocol;
-mod setup;
-mod sidecar_protocol;
-
-use crate::config::ConfigHandle;
-use controller::NodeController;
-use log::{LogLevel, LogStruct};
-use network::{KeyManager, Network};
+use nexusnet::log::{LogLevel, LogStruct};
+use nexusnet::paths::{self, FailType};
+use nexusnet::runtime::{NodeHandle, NodeOptions};
+use nexusnet::setup;
+use nexusnet::sidecar_protocol::Message;
 use std::error::Error;
-use tokio::sync::mpsc;
-#[cfg(unix)]
-use tokio::sync::oneshot;
-use tokio::sync::watch;
-
-#[cfg(unix)]
-use crate::service_dispatcher::ControlCommand;
-use crate::service_dispatcher::{ServiceDispatcher, ToController};
-#[cfg(unix)]
-use crate::sidecar_protocol::Message;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -51,108 +28,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
         std::process::exit(code);
     }
 
-    let config_handle = ConfigHandle::load_or_create_default();
-    let mut key_manager = KeyManager::load_or_create(paths::fail_path_gener(
-        paths::FailType::Keypair,
-        "keypair.bin",
-    ))?;
-    if config_handle.pq_enabled()
-        && let Err(e) = key_manager.ensure_pq_keys()
-    {
-        LogStruct::new(LogLevel::Warning, "PQ 密钥初始化失败", e.to_string()).emit();
-    }
-    // Wait for the configured address families before probing so the probe
-    // reflects the addresses that actually exist once the network is online.
-    // The wait is bounded and does not block startup on timeout.
-    network::wait_for_configured_addresses(&config_handle).await;
-    if let Err(e) = network::update_config_with_public_ip(&config_handle) {
-        LogStruct::new(LogLevel::Warning, "更新公网IP失败", e.to_string()).emit();
-    }
-    let peer_id = key_manager.peer_id();
-    let announce: Vec<String> = config_handle
-        .dialable_addrs(peer_id)
-        .iter()
-        .map(|a| a.to_string())
-        .collect();
-    let identity = if announce.is_empty() {
-        format!("PeerId: {}", peer_id)
-    } else {
-        format!("PeerId: {}\n    {}", peer_id, announce.join("\n    "))
-    };
-    LogStruct::new(LogLevel::Important, "节点身份", identity).emit();
+    let handle = nexusnet::start_node(NodeOptions {
+        config_path: paths::fail_path_gener(FailType::Config, "config.toml"),
+        keypair_path: paths::fail_path_gener(FailType::Keypair, "keypair.bin"),
+        log_sink: None,
+        update_public_ip: true,
+        wait_for_addresses: true,
+    })
+    .await?;
 
-    // Build the network and start the Swarm actor.
-    let keypair = key_manager.keypair().clone();
-    let pq_keys = key_manager.take_pq_keys();
-    let network = Network::start(config_handle.clone(), keypair, pq_keys).await?;
-
-    // Dial the configured bootstrap nodes.
-    for addr in config_handle.bootstrap_nodes() {
-        if let Err(e) = network.handle.dial(addr).await {
-            LogStruct::new(LogLevel::Warning, "拨号节点失败", e.to_string()).emit();
-        }
-    }
-
-    //   to_controller_tx -> ServiceDispatcher reports control commands and
-    //                       backend status to NodeController
-    //   to_dispatcher_tx -> NodeController forwards inbound service requests to
-    //                       ServiceDispatcher
-    let (to_controller_tx, to_controller_rx) = mpsc::channel(128);
-    let (to_dispatcher_tx, to_dispatcher_rx) = mpsc::channel(256);
-
-    // Signal handling: SIGINT/SIGTERM/Ctrl-C trigger shutdown; SIGHUP requests a
-    // hot reload (unix only).
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let signal_tx = to_controller_tx.clone();
-    tokio::spawn(async move {
-        wait_for_signal(signal_tx).await;
-        LogStruct::new(LogLevel::Warning, "收到退出信号", "正在关闭...").emit();
-        let _ = shutdown_tx.send(true);
-    });
-
-    let (dispatcher, readiness_rx) = ServiceDispatcher::new(
-        to_dispatcher_rx,
-        to_controller_tx.clone(),
-        config_handle.clone(),
-        peer_id,
-        shutdown_rx.clone(),
-    );
-    tokio::spawn(async move {
-        dispatcher.run().await;
-    });
-
-    // Keep-alive: even if the dispatcher exits early, NodeController's
-    // controller channel stays open.
-    let _to_controller_keepalive = to_controller_tx;
-
-    let controller = NodeController::new(
-        config_handle,
-        peer_id,
-        to_controller_rx,
-        to_dispatcher_tx,
-        readiness_rx,
-        network,
-        shutdown_rx,
-    );
-    controller.run().await;
+    wait_for_exit(&handle).await;
+    handle.shutdown().await;
     Ok(())
 }
 
-/// Request a hot reload on SIGHUP (fire-and-forget).
 #[cfg(unix)]
-fn request_reload(reload_tx: &mpsc::Sender<ToController>) {
-    let (resp_tx, _resp_rx) = oneshot::channel();
-    let _ = reload_tx.try_send(ToController::Control(ControlCommand {
-        msg: Message::ReloadConfig {
-            id: uuid::Uuid::new_v4(),
-        },
-        resp_tx,
-    }));
-}
-
-/// Wait for an exit signal, handling SIGHUP reloads while waiting.
-#[cfg(unix)]
-async fn wait_for_signal(reload_tx: mpsc::Sender<ToController>) {
+async fn wait_for_exit(handle: &NodeHandle) {
     use tokio::signal::unix::{SignalKind, signal};
 
     let mut sigint = signal(SignalKind::interrupt()).expect("无法安装 SIGINT 处理器");
@@ -161,19 +52,22 @@ async fn wait_for_signal(reload_tx: mpsc::Sender<ToController>) {
 
     loop {
         tokio::select! {
-            _ = sigint.recv() => return,
-            _ = sigterm.recv() => return,
+            _ = sigint.recv() => break,
+            _ = sigterm.recv() => break,
             _ = sighup.recv() => {
                 LogStruct::new(LogLevel::Warning, "收到 SIGHUP", "重新加载配置并重建网络...").emit();
-                request_reload(&reload_tx);
+                if let Err(e) = handle.control(Message::ReloadConfig { id: uuid::Uuid::new_v4() }).await {
+                    LogStruct::new(LogLevel::Error, "配置重载失败", e).emit();
+                }
             }
         }
     }
+
+    LogStruct::new(LogLevel::Warning, "收到退出信号", "正在关闭...").emit();
 }
 
 #[cfg(windows)]
-async fn wait_for_signal(_reload_tx: mpsc::Sender<ToController>) {
-    // Windows service (NSSM) triggers graceful shutdown via Ctrl+C; no SIGHUP
-    // hot reload.
+async fn wait_for_exit(_handle: &NodeHandle) {
     let _ = tokio::signal::ctrl_c().await;
+    LogStruct::new(LogLevel::Warning, "收到退出信号", "正在关闭...").emit();
 }

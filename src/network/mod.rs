@@ -47,7 +47,7 @@ mod identity;
 pub mod pq;
 
 pub use actor::{NetworkEvent, NetworkHandle, NetworkStart};
-pub use addr::{update_config_with_public_ip, wait_for_configured_addresses};
+pub use addr::{get_public_ips, update_config_with_public_ip, wait_for_configured_addresses};
 pub use behaviour::AGENT_NAME;
 pub use identity::KeyManager;
 

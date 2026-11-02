@@ -33,6 +33,7 @@ use crate::network::pq::{self, PqIdentity, PqKeys, PqRequest, PqResponse};
 use crate::service_protocol;
 use crate::{LogLevel, LogStruct};
 
+use libp2p::core::transport::ListenerId;
 use libp2p::futures::StreamExt;
 use libp2p::kad::store::RecordStore as _;
 use libp2p::swarm::{ConnectionId, SwarmEvent};
@@ -41,7 +42,7 @@ use libp2p::{
     request_response,
 };
 use std::collections::{HashMap, HashSet};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
@@ -101,7 +102,7 @@ pub enum SwarmCommand {
     },
     ListenOn {
         addr: Multiaddr,
-        resp: oneshot::Sender<Result<(), NetworkError>>,
+        resp: oneshot::Sender<Result<ListenerId, NetworkError>>,
     },
     Dial {
         addr: Multiaddr,
@@ -137,6 +138,7 @@ pub enum NetworkEvent {
     /// failed or dropped relay reservations show up here with a `p2p-circuit`
     /// address.
     ListenerClosed {
+        listener_id: ListenerId,
         addresses: Vec<Multiaddr>,
     },
     /// A relay circuit listener became available.
@@ -334,7 +336,7 @@ impl NetworkHandle {
         });
     }
 
-    pub async fn listen_on(&self, addr: Multiaddr) -> Result<(), NetworkError> {
+    pub async fn listen_on(&self, addr: Multiaddr) -> Result<ListenerId, NetworkError> {
         match self
             .request(|resp| SwarmCommand::ListenOn { addr, resp })
             .await
@@ -577,6 +579,9 @@ pub(crate) struct SwarmActor {
     pending_outbound_pq: HashMap<request_response::OutboundRequestId, PqOutboundPending>,
     pending_pq_identity: HashMap<request_response::OutboundRequestId, PeerId>,
     pending_inbound: HashMap<String, PendingInboundEntry>,
+    /// Last logged outbound failure per peer, used to rate-limit relay/offline
+    /// provider noise in the mobile log view.
+    last_outgoing_error: HashMap<Option<PeerId>, Instant>,
 }
 
 /// Extract the `/p2p/<PeerId>` component of a bootstrap multiaddr.
@@ -623,6 +628,7 @@ pub async fn spawn(
         pending_outbound_pq: HashMap::new(),
         pending_pq_identity: HashMap::new(),
         pending_inbound: HashMap::new(),
+        last_outgoing_error: HashMap::new(),
     };
 
     let task = tokio::spawn(async move {
@@ -712,7 +718,16 @@ impl SwarmActor {
                         .retain(|_, pending_peer| *pending_peer != peer_id);
                 }
             }
-            SwarmEvent::NewListenAddr { address, .. } => {
+            SwarmEvent::NewListenAddr {
+                listener_id,
+                address,
+            } => {
+                LogStruct::new(
+                    LogLevel::Debug,
+                    "监听地址",
+                    format!("{listener_id:?} {address}"),
+                )
+                .emit();
                 if address
                     .iter()
                     .any(|p| matches!(p, libp2p::multiaddr::Protocol::P2pCircuit))
@@ -722,18 +737,58 @@ impl SwarmActor {
                     });
                 }
             }
-            SwarmEvent::ListenerClosed { addresses, .. } => {
-                let _ = self
-                    .event_tx
-                    .send(NetworkEvent::ListenerClosed { addresses });
-            }
-            SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+            SwarmEvent::ListenerClosed {
+                listener_id,
+                addresses,
+                reason,
+            } => {
+                let circuit = addresses.iter().any(|addr| {
+                    addr.iter()
+                        .any(|p| matches!(p, libp2p::multiaddr::Protocol::P2pCircuit))
+                });
                 LogStruct::new(
-                    LogLevel::Error,
-                    "出站连接失败",
-                    format!("{:?}: {error}", peer_id),
+                    if circuit {
+                        LogLevel::Debug
+                    } else {
+                        LogLevel::Warning
+                    },
+                    "监听器关闭",
+                    format!("listener={listener_id:?} reason={reason:?} addrs={addresses:?}"),
                 )
                 .emit();
+                let _ = self.event_tx.send(NetworkEvent::ListenerClosed {
+                    listener_id,
+                    addresses,
+                });
+            }
+            SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+                let now = Instant::now();
+                let should_log = self
+                    .last_outgoing_error
+                    .get(&peer_id)
+                    .is_none_or(|last| now.duration_since(*last) >= Duration::from_secs(30));
+                if should_log {
+                    let text = error.to_string();
+                    let level = if text.contains("Relay has no reservation")
+                        || text.contains("resource limit")
+                        || text.contains("Timeout has been reached")
+                        || text.contains("Connection refused")
+                        || text.contains("Invalid argument")
+                        || text.contains("Response from behaviour was cancelled")
+                        || text.contains("Response from behaviour was canceled")
+                    {
+                        LogLevel::Warning
+                    } else {
+                        LogLevel::Error
+                    };
+                    let detail = format!("{:?}: {error}", peer_id);
+                    self.last_outgoing_error.insert(peer_id, now);
+                    if self.last_outgoing_error.len() > 1024 {
+                        let cutoff = now - Duration::from_secs(300);
+                        self.last_outgoing_error.retain(|_, last| *last >= cutoff);
+                    }
+                    LogStruct::new(level, "出站连接失败", detail).emit();
+                }
             }
             SwarmEvent::IncomingConnectionError {
                 local_addr,
@@ -748,8 +803,13 @@ impl SwarmActor {
                 )
                 .emit();
             }
-            SwarmEvent::ListenerError { error, .. } => {
-                LogStruct::new(LogLevel::Error, "监听器错误", error.to_string()).emit();
+            SwarmEvent::ListenerError { listener_id, error } => {
+                LogStruct::new(
+                    LogLevel::Error,
+                    "监听器错误",
+                    format!("listener={listener_id:?}: {error}"),
+                )
+                .emit();
             }
             _ => {}
         }
@@ -1556,7 +1616,6 @@ impl SwarmActor {
                 let result = self
                     .swarm
                     .listen_on(addr)
-                    .map(|_| ())
                     .map_err(|e| NetworkError::Transport(e.to_string()));
                 let _ = resp.send(result);
             }

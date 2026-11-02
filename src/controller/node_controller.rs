@@ -20,6 +20,8 @@ use std::time::Duration;
 
 use libp2p::{PeerId, identify, kad, ping};
 use tokio::sync::{mpsc, oneshot, watch};
+use tokio::task::JoinHandle;
+use tokio::time::timeout;
 
 use crate::config::ConfigHandle;
 use crate::dht_cache::DhtCache;
@@ -32,7 +34,7 @@ use super::auth_gate::{AuthGate, Decision};
 use super::bootstrap::BootstrapDiscovery;
 use super::dht_fetchers::{GenericRecordFetcher, ProviderFetcher};
 use super::peer_tracker::PeerTracker;
-use super::relay_manager::RelayManager;
+use super::relay_manager::{RELAY_TARGET, RelayManager};
 use super::service_registry::{self, ServiceCommand, ServiceSnapshot};
 
 const AUTH_WORKERS: usize = 4;
@@ -58,6 +60,9 @@ pub struct NodeController {
     pub(super) bootstrap: BootstrapDiscovery,
     pub(super) record_cache: Arc<DhtCache<kad::RecordKey, Vec<u8>, GenericRecordFetcher>>,
     pub(super) provider_cache: Arc<DhtCache<kad::RecordKey, Vec<PeerId>, ProviderFetcher>>,
+    /// Swarm actor task, awaited during shutdown so the listen port is released
+    /// before a restart can try to bind it again.
+    network_task: Option<JoinHandle<()>>,
 }
 
 impl NodeController {
@@ -73,7 +78,7 @@ impl NodeController {
         let NetworkStart {
             handle: swarm,
             events: event_rx,
-            task: _network_task,
+            task: network_task,
         } = network;
 
         let peers = PeerTracker::new(my_peer_id);
@@ -133,6 +138,7 @@ impl NodeController {
             bootstrap,
             record_cache,
             provider_cache,
+            network_task: Some(network_task),
         }
     }
 
@@ -144,6 +150,11 @@ impl NodeController {
         let retry = Duration::from_secs(self.config.relay_retry_interval().max(1) as u64);
         let mut relay_tick = tokio::time::interval_at(tokio::time::Instant::now() + retry, retry);
         relay_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        // Fast relay recovery tick: after a reservation is lost, retry quickly
+        // instead of waiting for the full configured interval.
+        let mut relay_fast_tick = tokio::time::interval(Duration::from_secs(5));
+        relay_fast_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         // Withdrawal check: fixed 1s, only for processing due withdrawals.
         let mut service_tick = tokio::time::interval(Duration::from_secs(1));
@@ -164,8 +175,25 @@ impl NodeController {
                     self.bootstrap.announce_self().await;
                     self.relay.tick().await;
                 }
+                _ = relay_fast_tick.tick() => {
+                    if self.relay.need_relay()
+                        && self.relay.active().len() < RELAY_TARGET
+                    {
+                        self.relay.tick().await;
+                    }
+                }
                 _ = self.shutdown_rx.changed() => {
                     self.swarm.shutdown();
+                    if let Some(task) = self.network_task.take()
+                        && timeout(Duration::from_secs(5), task).await.is_err()
+                    {
+                        LogStruct::new(
+                            LogLevel::Warning,
+                            "网络任务关闭超时",
+                            "继续关闭，端口可能短暂占用",
+                        )
+                        .emit();
+                    }
                     return;
                 }
             }
@@ -195,9 +223,12 @@ impl NodeController {
                 self.relay.on_circuit_ready(&addr);
                 self.notify_relay_state().await;
             }
-            NetworkEvent::ListenerClosed { addresses } => {
+            NetworkEvent::ListenerClosed {
+                listener_id,
+                addresses,
+            } => {
                 // Relay dropped: try to top up to the target immediately.
-                if self.relay.on_listener_closed(addresses).await {
+                if self.relay.on_listener_closed(listener_id, addresses).await {
                     self.notify_relay_state().await;
                     self.relay.tick().await;
                 }

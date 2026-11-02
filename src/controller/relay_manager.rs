@@ -18,6 +18,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
+use libp2p::core::transport::ListenerId;
 use libp2p::multiaddr::Protocol;
 use libp2p::{Multiaddr, PeerId, relay};
 
@@ -35,8 +36,8 @@ pub struct RelayManager {
     my_peer_id: PeerId,
     /// Relays confirmed usable.
     active: HashSet<PeerId>,
-    /// Reservations started and awaiting confirmation; value is the start time.
-    pending: HashMap<PeerId, Instant>,
+    /// Reservations started and awaiting confirmation.
+    pending: HashMap<PeerId, (Instant, ListenerId)>,
     /// Consecutive relay failure counts.
     failures: HashMap<PeerId, u32>,
     /// Relay backoff deadlines.
@@ -138,7 +139,11 @@ impl RelayManager {
     }
 
     /// Handle a closed relay listener. Returns whether a tracked relay was lost.
-    pub async fn on_listener_closed(&mut self, addresses: Vec<Multiaddr>) -> bool {
+    pub async fn on_listener_closed(
+        &mut self,
+        listener_id: ListenerId,
+        addresses: Vec<Multiaddr>,
+    ) -> bool {
         let mut lost = false;
         for addr in addresses {
             if !addr.iter().any(|p| matches!(p, Protocol::P2pCircuit)) {
@@ -157,7 +162,23 @@ impl RelayManager {
             if was_active {
                 LogStruct::new(LogLevel::Error, "中继连接断开", peer_id.to_string()).emit();
             }
-            self.record_failure(peer_id, Instant::now());
+            self.record_loss(peer_id, Instant::now());
+        }
+
+        // A reservation can be denied before the circuit listener ever
+        // produces an address; in that case `addresses` is empty. Match the
+        // pending reservation by listener id so it does not stay "pending"
+        // until the 180s expiry and block fast retries.
+        if let Some(peer_id) = self
+            .pending
+            .iter()
+            .find(|(_, (_, id))| *id == listener_id)
+            .map(|(peer, _)| *peer)
+        {
+            self.pending.remove(&peer_id);
+            self.record_loss(peer_id, Instant::now());
+            LogStruct::new(LogLevel::Warning, "中继预约监听器关闭", peer_id.to_string()).emit();
+            lost = true;
         }
         lost
     }
@@ -203,8 +224,8 @@ impl RelayManager {
             let mut relay_listen_addr = addr.clone();
             relay_listen_addr.push(Protocol::P2pCircuit);
             match self.swarm.listen_on(relay_listen_addr).await {
-                Ok(_) => {
-                    self.pending.insert(peer_id, now);
+                Ok(listener_id) => {
+                    self.pending.insert(peer_id, (now, listener_id));
                 }
                 Err(e) => {
                     LogStruct::new(
@@ -229,13 +250,25 @@ impl RelayManager {
         let expired: Vec<PeerId> = self
             .pending
             .iter()
-            .filter(|(_, since)| now.duration_since(**since) >= timeout)
+            .filter(|(_, (since, _))| now.duration_since(*since) >= timeout)
             .map(|(peer, _)| *peer)
             .collect();
         for peer_id in expired {
             self.pending.remove(&peer_id);
             self.record_failure(peer_id, now);
         }
+    }
+
+    /// Record a lost active reservation. Retry quickly so a transient relay
+    /// disconnect does not leave the node unreachable for a whole tick.
+    fn record_loss(&mut self, peer_id: PeerId, now: Instant) {
+        let count = {
+            let c = self.failures.entry(peer_id).or_insert(0);
+            *c += 1;
+            *c
+        };
+        let delay = Duration::from_secs(relay_loss_backoff_secs(count));
+        self.backoff.insert(peer_id, now + delay);
     }
 
     /// Record a relay failure and set exponential backoff. Bootstrap
@@ -272,6 +305,11 @@ fn relay_backoff_secs(count: u32) -> u64 {
     (30u64 << shift).min(600)
 }
 
+fn relay_loss_backoff_secs(count: u32) -> u64 {
+    let shift = count.saturating_sub(1).min(5);
+    (5u64 << shift).min(120)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -281,5 +319,12 @@ mod tests {
         assert_eq!(relay_backoff_secs(1), 30);
         assert_eq!(relay_backoff_secs(2), 60);
         assert_eq!(relay_backoff_secs(10), 600);
+    }
+
+    #[test]
+    fn loss_backoff_recovers_quickly_then_caps() {
+        assert_eq!(relay_loss_backoff_secs(1), 5);
+        assert_eq!(relay_loss_backoff_secs(2), 10);
+        assert_eq!(relay_loss_backoff_secs(10), 120);
     }
 }

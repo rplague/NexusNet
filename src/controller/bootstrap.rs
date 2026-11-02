@@ -15,7 +15,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use libp2p::multiaddr::Protocol;
 use libp2p::{Multiaddr, PeerId, identify, kad};
@@ -37,6 +37,9 @@ pub struct BootstrapDiscovery {
     swarm: NetworkHandle,
     provider_cache: Arc<DhtCache<kad::RecordKey, Vec<PeerId>, ProviderFetcher>>,
     is_bootstrap_provider: bool,
+    /// Serializes config read/modify/write when several Identify events add
+    /// bootstrap nodes concurrently.
+    add_lock: Arc<Mutex<()>>,
 }
 
 impl BootstrapDiscovery {
@@ -50,6 +53,7 @@ impl BootstrapDiscovery {
             swarm,
             provider_cache,
             is_bootstrap_provider: false,
+            add_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -95,40 +99,79 @@ impl BootstrapDiscovery {
         if !is_dual_stack_addrs(&info.listen_addrs) {
             return;
         }
+
         let key = kad::RecordKey::new(&BOOTSTRAP_PROVIDER_KEY);
-        // Never block the controller on a DHT lookup. A stale or missing
-        // cache entry triggers one background refresh.
         self.provider_cache.refresh(key.clone());
-        let providers = match self.provider_cache.peek(&key) {
-            Some(read) => read.value.unwrap_or_default(),
-            None => return,
-        };
-        if !providers.contains(&peer_id) {
-            return;
-        }
-        let candidates = bootstrap_addrs_from(&info.listen_addrs, peer_id);
-        if candidates.is_empty() {
+
+        if let Some(read) = self.provider_cache.peek(&key) {
+            if read.value.unwrap_or_default().contains(&peer_id) {
+                add_bootstrap_provider(&self.config, &self.add_lock, peer_id, &info.listen_addrs);
+            }
             return;
         }
 
-        let mut nodes = self.config.bootstrap_nodes();
-        let mut changed = false;
-        for addr in candidates {
-            if !nodes.contains(&addr) {
-                nodes.push(addr);
-                changed = true;
+        // Cold cache: an Identify event is often the first time we see the
+        // bootstrap provider. Wait for the DHT lookup in the background, then
+        // re-check the switch and provider status before adding it.
+        let cache = self.provider_cache.clone();
+        let config = self.config.clone();
+        let add_lock = self.add_lock.clone();
+        let addrs = info.listen_addrs.clone();
+        tokio::spawn(async move {
+            match cache.get(key).await {
+                Ok(read) => {
+                    if !config.accept_bootstrap_providers() {
+                        return;
+                    }
+                    if read.value.unwrap_or_default().contains(&peer_id) {
+                        add_bootstrap_provider(&config, &add_lock, peer_id, &addrs);
+                    }
+                }
+                Err(error) => {
+                    LogStruct::new(
+                        LogLevel::Debug,
+                        "Bootstrap 发现查询失败",
+                        format!("{peer_id}: {error}"),
+                    )
+                    .emit();
+                }
             }
+        });
+    }
+}
+
+fn add_bootstrap_provider(
+    config: &ConfigHandle,
+    add_lock: &Mutex<()>,
+    peer_id: PeerId,
+    addrs: &[Multiaddr],
+) {
+    let _guard = add_lock.lock().unwrap_or_else(|e| e.into_inner());
+    if !config.accept_bootstrap_providers() {
+        return;
+    }
+    let candidates = bootstrap_addrs_from(addrs, peer_id);
+    if candidates.is_empty() {
+        return;
+    }
+
+    let mut nodes = config.bootstrap_nodes();
+    let mut changed = false;
+    for addr in candidates {
+        if !nodes.contains(&addr) {
+            nodes.push(addr);
+            changed = true;
         }
-        if changed {
-            self.config.set_bootstrap_nodes(nodes);
-            self.config.save_to_default();
-            LogStruct::new(
-                LogLevel::Preset,
-                "配置更新",
-                format!("添加 bootstrap 节点: {}", peer_id),
-            )
-            .emit();
-        }
+    }
+    if changed {
+        config.set_bootstrap_nodes(nodes);
+        config.save_to_default();
+        LogStruct::new(
+            LogLevel::Preset,
+            "配置更新",
+            format!("添加 bootstrap 节点: {peer_id}"),
+        )
+        .emit();
     }
 }
 

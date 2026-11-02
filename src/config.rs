@@ -21,6 +21,7 @@ use crate::{LogLevel, LogStruct};
 use libp2p::multiaddr::Protocol;
 use libp2p::{Multiaddr, PeerId};
 use std::collections::HashMap;
+use std::fmt;
 use std::fs;
 use std::io;
 use std::net::IpAddr;
@@ -34,6 +35,10 @@ fn bool_true() -> bool {
 
 fn bool_false() -> bool {
     false
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 const fn hours(h: u32) -> u32 {
@@ -116,8 +121,40 @@ pub struct NodeConfig {
     pub compat: CompatConfig,
 }
 
+/// Kind of configuration loading failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigErrorKind {
+    Io,
+    Parse,
+    Invalid,
+}
+
+/// Configuration loading failure that does not terminate the process.
+#[derive(Debug, Clone)]
+pub struct ConfigError {
+    pub kind: ConfigErrorKind,
+    pub message: String,
+}
+
+impl ConfigError {
+    fn new(kind: ConfigErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for ConfigError {}
+
 impl NodeConfig {
-    pub(crate) fn validate(&self) -> Result<(), String> {
+    pub fn validate(&self) -> Result<(), String> {
         if self.network.port > u16::MAX as u32 {
             return Err(format!(
                 "network.port 超出范围: {} (最大 {})",
@@ -231,11 +268,17 @@ impl NodeConfig {
         Ok(())
     }
 
-    /// Always returns a valid `NodeConfig`.
-    fn from_toml_file(path: impl AsRef<Path>, create_if_missing: bool) -> NodeConfig {
+    /// Load a configuration file without terminating the process on failure.
+    ///
+    /// Missing files are created with defaults when `create_if_missing` is true;
+    /// otherwise defaults are returned. Parse, validation and I/O errors are
+    /// reported to the caller.
+    pub fn try_from_toml_file(
+        path: impl AsRef<Path>,
+        create_if_missing: bool,
+    ) -> Result<NodeConfig, ConfigError> {
         let path = path.as_ref();
 
-        // If creation is not requested and the file is missing, return defaults.
         if !create_if_missing && !path.exists() {
             LogStruct::new(
                 LogLevel::Warning,
@@ -243,68 +286,95 @@ impl NodeConfig {
                 "配置文件不存在且未要求创建，使用默认配置",
             )
             .emit();
-            return NodeConfig::default();
+            return Ok(NodeConfig::default());
         }
 
-        // Try to read and parse the file.
         match fs::read_to_string(path) {
-            Ok(content) => match toml::from_str::<NodeConfig>(&content) {
-                Ok(config) => {
-                    if let Err(e) = config.validate() {
-                        LogStruct::new(LogLevel::Critical, "配置校验失败", e).emit();
-                        std::process::exit(1);
-                    }
-                    if let Some(completed) = complete_missing_fields(&content, &config) {
-                        write_atomic_or_exit(path, &completed);
-                        LogStruct::new(
-                            LogLevel::Preset,
-                            "配置已自动补全",
-                            path.display().to_string(),
+            Ok(content) => {
+                let config = toml::from_str::<NodeConfig>(&content)
+                    .map_err(|e| ConfigError::new(ConfigErrorKind::Parse, e.to_string()))?;
+                config
+                    .validate()
+                    .map_err(|e| ConfigError::new(ConfigErrorKind::Invalid, e))?;
+                if let Some(completed) = complete_missing_fields(&content, &config) {
+                    try_write_atomic(path, &completed).map_err(|e| {
+                        ConfigError::new(
+                            ConfigErrorKind::Io,
+                            format!("写入配置文件失败 {}: {e}", path.display()),
                         )
-                        .emit();
-                    }
-                    return config;
-                }
-                Err(e) => {
+                    })?;
                     LogStruct::new(
-                        LogLevel::Error,
-                        "配置文件解析失败，将会创建新的配置文件",
-                        e.to_string(),
+                        LogLevel::Preset,
+                        "配置已自动补全",
+                        path.display().to_string(),
                     )
                     .emit();
-                    if let Err(rename_err) = rename_bad_config(path) {
-                        LogStruct::new(
-                            LogLevel::Critical,
-                            "重命名损坏的配置文件失败",
-                            rename_err.to_string(),
-                        )
-                        .emit();
+                }
+                Ok(config)
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                let default_config = NodeConfig::default();
+                let toml_string = toml::to_string_pretty(&default_config).map_err(|e| {
+                    ConfigError::new(ConfigErrorKind::Io, format!("序列化默认配置失败: {e}"))
+                })?;
+                try_write_atomic(path, &toml_string).map_err(|e| {
+                    ConfigError::new(
+                        ConfigErrorKind::Io,
+                        format!("写入默认配置文件失败 {}: {e}", path.display()),
+                    )
+                })?;
+                Ok(default_config)
+            }
+            Err(e) => Err(ConfigError::new(
+                ConfigErrorKind::Io,
+                format!("无法读取配置文件 {}: {e}", path.display()),
+            )),
+        }
+    }
+
+    /// Legacy loader used by the desktop binary: always returns a valid config,
+    /// repairing or exiting on unrecoverable errors.
+    fn from_toml_file(path: impl AsRef<Path>, create_if_missing: bool) -> NodeConfig {
+        let path = path.as_ref();
+        match Self::try_from_toml_file(path, create_if_missing) {
+            Ok(config) => config,
+            Err(error) if error.kind == ConfigErrorKind::Parse => {
+                LogStruct::new(
+                    LogLevel::Error,
+                    "配置文件解析失败，将会创建新的配置文件",
+                    &error.message,
+                )
+                .emit();
+                if let Err(rename_err) = rename_bad_config(path) {
+                    LogStruct::new(
+                        LogLevel::Critical,
+                        "重命名损坏的配置文件失败",
+                        rename_err.to_string(),
+                    )
+                    .emit();
+                    std::process::exit(1);
+                }
+                let default_config = NodeConfig::default();
+                let toml_string = match toml::to_string_pretty(&default_config) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        LogStruct::new(LogLevel::Critical, "序列化默认配置失败", e.to_string())
+                            .emit();
                         std::process::exit(1);
                     }
+                };
+                if let Err(e) = fs::write(path, toml_string) {
+                    LogStruct::new(LogLevel::Critical, "写入默认配置文件失败", e.to_string())
+                        .emit();
+                    std::process::exit(1);
                 }
-            },
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => {
-                LogStruct::new(LogLevel::Critical, "无法读取配置文件", e.to_string()).emit();
+                default_config
+            }
+            Err(error) => {
+                LogStruct::new(LogLevel::Critical, "配置加载失败", error.message).emit();
                 std::process::exit(1);
             }
         }
-
-        // Reached here when the file is missing or was renamed after a parse failure.
-        // Create the default config and write it to disk.
-        let default_config = NodeConfig::default();
-        let toml_string = match toml::to_string_pretty(&default_config) {
-            Ok(s) => s,
-            Err(e) => {
-                LogStruct::new(LogLevel::Critical, "序列化默认配置失败", e.to_string()).emit();
-                std::process::exit(1);
-            }
-        };
-        if let Err(e) = fs::write(path, toml_string) {
-            LogStruct::new(LogLevel::Critical, "写入默认配置文件失败", e.to_string()).emit();
-            std::process::exit(1);
-        }
-        default_config
     }
 }
 
@@ -349,28 +419,22 @@ fn merge_missing(dst: &mut toml_edit::Table, src: &toml_edit::Table) {
     }
 }
 
-fn write_atomic_or_exit(path: &Path, content: &str) {
+fn try_write_atomic(path: &Path, content: &str) -> io::Result<()> {
     let temp_path = path.with_extension("tmp");
-    if let Err(e) = fs::write(&temp_path, content) {
-        LogStruct::new(
-            LogLevel::Critical,
-            "写入临时配置文件失败",
-            format!("路径: {}, 错误: {}", temp_path.display(), e),
-        )
-        .emit();
-        std::process::exit(1);
-    }
+    fs::write(&temp_path, content)?;
     if let Err(e) = fs::rename(&temp_path, path) {
         let _ = fs::remove_file(&temp_path);
+        return Err(e);
+    }
+    Ok(())
+}
+
+fn write_atomic_or_exit(path: &Path, content: &str) {
+    if let Err(e) = try_write_atomic(path, content) {
         LogStruct::new(
             LogLevel::Critical,
-            "重命名配置文件失败",
-            format!(
-                "从 {} 到 {}, 错误: {}",
-                temp_path.display(),
-                path.display(),
-                e
-            ),
+            "写入配置文件失败",
+            format!("路径: {}, 错误: {}", path.display(), e),
         )
         .emit();
         std::process::exit(1);
@@ -427,6 +491,13 @@ pub struct NetworkConfig {
     pub ipv6_address: Option<IpAddr>,
     #[serde(default = "default_port")]
     pub port: u32,
+    /// Always require relay reservations even when a public address is detected.
+    ///
+    /// Mobile networks often expose a global IPv6 address while still blocking
+    /// inbound connections (CGNAT/firewall), so IP-based reachability is not
+    /// trustworthy. Desktop defaults to `false`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub force_relay: bool,
     /// Whether a public address was detected on a local interface at startup.
     ///
     /// Runtime only: never read from or written to `config.toml`.
@@ -442,6 +513,7 @@ impl Default for NetworkConfig {
             ipv6_enabled: bool_false(),
             ipv6_address: None,
             port: default_port(),
+            force_relay: bool_false(),
             has_public_address: bool_false(),
         }
     }
@@ -655,6 +727,7 @@ pub struct AuthNetworkConfig {
 #[derive(Clone)]
 pub struct ConfigHandle {
     inner: Arc<RwLock<NodeConfig>>,
+    path: Option<Arc<PathBuf>>,
 }
 
 /// Config file path, resolved once via `paths::fail_path_gener`.
@@ -668,16 +741,39 @@ impl ConfigHandle {
     pub fn new(config: NodeConfig) -> Self {
         Self {
             inner: Arc::new(RwLock::new(config)),
+            path: None,
         }
     }
 
     pub fn from_toml_file(path: impl AsRef<Path>, create_if_missing: bool) -> Self {
-        let config = NodeConfig::from_toml_file(path, create_if_missing);
-        Self::new(config)
+        let path = path.as_ref().to_path_buf();
+        let config = NodeConfig::from_toml_file(&path, create_if_missing);
+        Self {
+            inner: Arc::new(RwLock::new(config)),
+            path: Some(Arc::new(path)),
+        }
+    }
+
+    /// Load a configuration file without terminating the process.
+    pub fn try_from_toml_file(
+        path: impl AsRef<Path>,
+        create_if_missing: bool,
+    ) -> Result<Self, ConfigError> {
+        let path = path.as_ref().to_path_buf();
+        let config = NodeConfig::try_from_toml_file(&path, create_if_missing)?;
+        Ok(Self {
+            inner: Arc::new(RwLock::new(config)),
+            path: Some(Arc::new(path)),
+        })
     }
 
     pub fn load_or_create_default() -> Self {
         Self::from_toml_file(config_filepath(), true)
+    }
+
+    /// Path this handle was loaded from, if any.
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref().map(PathBuf::as_path)
     }
 
     /// Save the current config to a TOML file.
@@ -698,9 +794,22 @@ impl ConfigHandle {
         write_atomic_or_exit(path, &toml_string);
     }
 
-    /// Save to the default config path (`NEXUSNET_CONFIG_PATH`).
+    /// Save to the bound path, falling back to `NEXUSNET_CONFIG_PATH`.
     pub fn save_to_default(&self) {
-        self.save_to_file(config_filepath());
+        match &self.path {
+            Some(path) => self.save_to_file(path.as_path()),
+            None => self.save_to_file(config_filepath()),
+        }
+    }
+
+    /// Save to an explicit path without exiting on failure.
+    pub fn save_to_path(&self, path: impl AsRef<Path>) -> Result<(), String> {
+        let path = path.as_ref();
+        let snapshot = self.snapshot();
+        let toml_string =
+            toml::to_string_pretty(&snapshot).map_err(|e| format!("序列化配置失败: {e}"))?;
+        try_write_atomic(path, &toml_string)
+            .map_err(|e| format!("写入配置失败 {}: {e}", path.display()))
     }
 
     /// Acquire a read lock.
@@ -908,7 +1017,9 @@ impl ConfigHandle {
     /// A relay is needed unless this node is dual-stack and has a public address.
     pub fn needs_relay(&self) -> bool {
         let cfg = self.read();
-        !(cfg.network.ipv4_enabled && cfg.network.ipv6_enabled) || !cfg.network.has_public_address
+        cfg.network.force_relay
+            || !(cfg.network.ipv4_enabled && cfg.network.ipv6_enabled)
+            || !cfg.network.has_public_address
     }
 
     // ========== Convenience setters ==========

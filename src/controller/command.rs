@@ -18,6 +18,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use libp2p::multiaddr::Protocol;
 use libp2p::{Multiaddr, PeerId, kad};
 
 use crate::auth;
@@ -41,6 +42,9 @@ struct WhoamiResult {
     peer_id: String,
     name: String,
     description: String,
+    bootstrapped: bool,
+    announced: Vec<String>,
+    backend_ready: Vec<String>,
 }
 
 /// `query_key` result payload.
@@ -166,11 +170,34 @@ async fn fetch_record(
         .map_err(|e| e.to_string())
 }
 
+fn peer_id_from_addr(addr: &Multiaddr) -> Option<PeerId> {
+    addr.iter().find_map(|proto| match proto {
+        Protocol::P2p(peer) => Some(peer),
+        _ => None,
+    })
+}
+
+fn is_dialable_remote_addr(addr: &Multiaddr) -> bool {
+    for proto in addr.iter() {
+        match proto {
+            Protocol::Ip4(ip) => return !(ip.is_loopback() || ip.is_unspecified()),
+            Protocol::Ip6(ip) => return !(ip.is_loopback() || ip.is_unspecified()),
+            _ => {}
+        }
+    }
+    true
+}
+
 fn provider_addresses(peers: Vec<kad::PeerInfo>, peer: PeerId) -> Vec<Multiaddr> {
     peers
         .into_iter()
         .find(|info| info.peer_id == peer)
-        .map(|info| info.addrs)
+        .map(|info| {
+            info.addrs
+                .into_iter()
+                .filter(is_dialable_remote_addr)
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -245,22 +272,21 @@ async fn request_service(
         if candidates.is_empty() {
             return Err("No remote provider found".to_string());
         }
-        let best = peers
-            .best_peer(&candidates)
-            .or_else(|| candidates.first().copied())
-            .expect("candidates is non-empty");
+        let ranked = peers.ranked_peers(&candidates);
         let request = service_protocol::Request {
             service: service.clone(),
             payload: payload.clone(),
         };
-        match send_request_resolved(swarm, best, &request).await {
-            Ok(response) => return response_payload(response),
-            Err(error) => {
-                last_error = Some(error);
-                if attempt == 0 {
-                    provider_cache.invalidate(&key);
-                }
+        let mut attempt_error = None;
+        for candidate in ranked.into_iter().take(4) {
+            match send_request_resolved(swarm, candidate, &request).await {
+                Ok(response) => return response_payload(response),
+                Err(error) => attempt_error = Some(error),
             }
+        }
+        last_error = attempt_error;
+        if attempt == 0 {
+            provider_cache.invalidate(&key);
         }
     }
     Err(last_error.unwrap_or_else(|| "service request failed".to_string()))
@@ -487,16 +513,23 @@ impl NodeController {
 
     fn cmd_whoami(&self) -> Result<Vec<u8>, String> {
         let node = self.config.read().node.clone();
+        let snapshot = self.services_snapshot.borrow();
         Ok(to_cbor(&WhoamiResult {
             peer_id: self.my_peer_id.to_string(),
             name: node.name,
             description: node.description,
+            bootstrapped: snapshot.bootstrapped,
+            announced: snapshot.announced.clone(),
+            backend_ready: snapshot.backend_ready.clone(),
         }))
     }
 
     async fn cmd_reconnect_bootstrap(&self) -> Result<Vec<u8>, String> {
         let mut any_success = false;
         for addr in self.config.bootstrap_nodes() {
+            if peer_id_from_addr(&addr) == Some(self.my_peer_id) {
+                continue;
+            }
             if self.swarm.dial(addr).await.is_ok() {
                 any_success = true;
             }
@@ -747,6 +780,9 @@ mod tests {
             peer_id: "12D3KooW".to_string(),
             name: "节点A".to_string(),
             description: "测试节点".to_string(),
+            bootstrapped: true,
+            announced: vec!["mobile".to_string()],
+            backend_ready: vec!["mobile".to_string()],
         };
         let bytes = to_cbor(&result);
         let decoded: WhoamiResult = ciborium::de::from_reader(bytes.as_slice()).unwrap();
@@ -848,11 +884,11 @@ mod tests {
     fn provider_addresses_selects_the_requested_peer() {
         let wanted = PeerId::random();
         let other = PeerId::random();
-        let addr: Multiaddr = "/ip4/127.0.0.1/tcp/5000".parse().unwrap();
+        let addr: Multiaddr = "/ip4/192.0.2.10/tcp/5000".parse().unwrap();
         let peers = vec![
             kad::PeerInfo {
                 peer_id: other,
-                addrs: vec!["/ip4/127.0.0.2/tcp/5000".parse().unwrap()],
+                addrs: vec!["/ip4/192.0.2.11/tcp/5000".parse().unwrap()],
             },
             kad::PeerInfo {
                 peer_id: wanted,
@@ -866,9 +902,27 @@ mod tests {
     fn provider_addresses_empty_when_peer_is_absent() {
         let peers = vec![kad::PeerInfo {
             peer_id: PeerId::random(),
-            addrs: vec!["/ip4/127.0.0.1/tcp/5000".parse().unwrap()],
+            addrs: vec!["/ip4/192.0.2.10/tcp/5000".parse().unwrap()],
         }];
         assert!(provider_addresses(peers, PeerId::random()).is_empty());
+    }
+
+    #[test]
+    fn provider_addresses_drops_loopback_and_unspecified() {
+        let wanted = PeerId::random();
+        let peers = vec![kad::PeerInfo {
+            peer_id: wanted,
+            addrs: vec![
+                "/ip6/::1/tcp/5000".parse().unwrap(),
+                "/ip4/127.0.0.1/tcp/5000".parse().unwrap(),
+                "/ip4/0.0.0.0/tcp/5000".parse().unwrap(),
+                "/ip4/192.0.2.10/tcp/5000".parse().unwrap(),
+            ],
+        }];
+        assert_eq!(
+            provider_addresses(peers, wanted),
+            vec!["/ip4/192.0.2.10/tcp/5000".parse().unwrap()]
+        );
     }
 
     #[test]

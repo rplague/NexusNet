@@ -70,13 +70,11 @@ impl PeerTracker {
         }
     }
 
-    /// Pick the provider with the lowest known RTT.
-    pub fn best_peer(&self, providers: &[PeerId]) -> Option<PeerId> {
-        providers
-            .iter()
-            .filter_map(|p| self.rtts.get(p).map(|rtt| (p, rtt)))
-            .min_by_key(|(_, rtt)| *rtt)
-            .map(|(p, _)| *p)
+    /// Rank providers by known RTT; unknown peers go last, preserving order.
+    pub fn ranked_peers(&self, providers: &[PeerId]) -> Vec<PeerId> {
+        let mut ranked = providers.to_vec();
+        ranked.sort_by_key(|peer| self.rtts.get(peer).copied().unwrap_or(Duration::MAX));
+        ranked
     }
 }
 
@@ -89,20 +87,13 @@ mod tests {
     }
 
     #[test]
-    fn best_peer_picks_lowest_rtt() {
+    fn ranked_peers_orders_known_rtt_first() {
         let mut tracker = PeerTracker::default();
         let a = PeerId::random();
         let b = PeerId::random();
         let c = PeerId::random();
-        tracker.rtts.insert(a, rtt(50));
-        tracker.rtts.insert(b, rtt(10));
-        // c is unknown and must be ignored.
-        assert_eq!(tracker.best_peer(&[a, b, c]), Some(b));
-    }
-
-    #[test]
-    fn best_peer_none_when_all_unknown() {
-        let tracker = PeerTracker::default();
-        assert_eq!(tracker.best_peer(&[PeerId::random()]), None);
+        tracker.rtts.insert(a, rtt(80));
+        tracker.rtts.insert(b, rtt(20));
+        assert_eq!(tracker.ranked_peers(&[a, c, b]), vec![b, a, c]);
     }
 }

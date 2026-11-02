@@ -22,72 +22,60 @@ use crate::network::NetworkError;
 use crate::network::addr::to_multiaddr;
 use crate::network::behaviour::NetBehaviour;
 use crate::{LogLevel, LogStruct};
+#[cfg(any(target_os = "android", target_env = "ohos"))]
+use libp2p::Transport;
 use libp2p::{Multiaddr, Swarm, SwarmBuilder, identity, noise, tls, yamux};
 use std::net::IpAddr;
 use std::time::Duration;
 
-/// Build a fresh Swarm from the current config and start listening.
-///
-/// Used both at first start and for `reload()` rebuilds, so it holds no
-/// long-lived state.
-pub async fn build_swarm(
+fn listen_addrs(config: &ConfigHandle) -> Vec<Multiaddr> {
+    let cfg = config.read();
+    let mut addrs = Vec::new();
+    if cfg.network.ipv4_enabled {
+        let ip = cfg
+            .network
+            .ipv4_address
+            .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+        let mut addr = to_multiaddr(ip, cfg.network.port as u16);
+        addr.push(libp2p::multiaddr::Protocol::Ws("/".into()));
+        addrs.push(addr);
+    }
+    if cfg.network.ipv6_enabled {
+        let ip = cfg
+            .network
+            .ipv6_address
+            .unwrap_or(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED));
+        let mut addr = to_multiaddr(ip, cfg.network.port as u16);
+        addr.push(libp2p::multiaddr::Protocol::Ws("/".into()));
+        addrs.push(addr);
+    }
+    addrs
+}
+
+fn finish_swarm(
+    mut swarm: Swarm<NetBehaviour>,
     config: &ConfigHandle,
     keypair: &identity::Keypair,
 ) -> Result<Swarm<NetBehaviour>, NetworkError> {
-    let config_clone = config.clone();
-
-    let listen_addrs: Vec<Multiaddr> = {
-        let cfg = config.read();
-        let mut addrs = Vec::new();
-        if cfg.network.ipv4_enabled {
-            let ip = cfg
-                .network
-                .ipv4_address
-                .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
-            let mut addr = to_multiaddr(ip, cfg.network.port as u16);
-            addr.push(libp2p::multiaddr::Protocol::Ws("/".into()));
-            addrs.push(addr);
+    for addr in listen_addrs(config) {
+        if let Err(e) = swarm.listen_on(addr.clone()) {
+            #[cfg(any(target_os = "android", target_env = "ohos"))]
+            {
+                // Phones may be unable to bind a TCP port (VPN/local-network
+                // policy, port conflicts). Relay mode still works.
+                LogStruct::new(
+                    LogLevel::Warning,
+                    "监听失败，继续中继模式",
+                    format!("{addr}: {e:?}"),
+                )
+                .emit();
+                continue;
+            }
+            #[cfg(not(any(target_os = "android", target_env = "ohos")))]
+            {
+                return Err(NetworkError::Build(format!("listen_on {addr}: {e:?}")));
+            }
         }
-        if cfg.network.ipv6_enabled {
-            let ip = cfg
-                .network
-                .ipv6_address
-                .unwrap_or(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED));
-            let mut addr = to_multiaddr(ip, cfg.network.port as u16);
-            addr.push(libp2p::multiaddr::Protocol::Ws("/".into()));
-            addrs.push(addr);
-        }
-        addrs
-    };
-
-    // WebSocket-only transport: the outer HTTP/WS handshake keeps libp2p's
-    // plaintext multistream-select inside WebSocket frames, which is required
-    // on networks that only allow HTTP/TLS/SSH. TLS remains the preferred
-    // inner security upgrade, with Noise retained for compatibility.
-    let mut swarm = SwarmBuilder::with_existing_identity(keypair.clone())
-        .with_tokio()
-        .with_websocket(
-            (tls::Config::new, noise::Config::new),
-            yamux::Config::default,
-        )
-        .await
-        .map_err(|e| NetworkError::Build(format!("{e:?}")))?
-        .with_relay_client(
-            (tls::Config::new, noise::Config::new),
-            yamux::Config::default,
-        )
-        .map_err(|e| NetworkError::Build(format!("{e:?}")))?
-        .with_behaviour(|keypair, relay_client| {
-            NetBehaviour::new(&config_clone, keypair, relay_client)
-        })
-        .map_err(|e| NetworkError::Build(e.to_string()))?
-        .with_swarm_config(|config| config.with_idle_connection_timeout(Duration::from_secs(300)))
-        .build();
-
-    for addr in listen_addrs {
-        swarm
-            .listen_on(addr.clone())
-            .map_err(|e| NetworkError::Build(format!("listen_on {addr}: {e:?}")))?;
     }
 
     // Confirm externally reachable addresses: broadcast by Identify and used
@@ -113,4 +101,73 @@ pub async fn build_swarm(
     }
 
     Ok(swarm)
+}
+
+/// Desktop/host transport: libp2p's DNS-enabled WebSocket builder.
+#[cfg(not(any(target_os = "android", target_env = "ohos")))]
+pub async fn build_swarm(
+    config: &ConfigHandle,
+    keypair: &identity::Keypair,
+) -> Result<Swarm<NetBehaviour>, NetworkError> {
+    let config_clone = config.clone();
+
+    let swarm = SwarmBuilder::with_existing_identity(keypair.clone())
+        .with_tokio()
+        .with_websocket(
+            (tls::Config::new, noise::Config::new),
+            yamux::Config::default,
+        )
+        .await
+        .map_err(|e| NetworkError::Build(format!("{e:?}")))?
+        .with_relay_client(
+            (tls::Config::new, noise::Config::new),
+            yamux::Config::default,
+        )
+        .map_err(|e| NetworkError::Build(format!("{e:?}")))?
+        .with_behaviour(|keypair, relay_client| {
+            NetBehaviour::new(&config_clone, keypair, relay_client)
+        })
+        .map_err(|e| NetworkError::Build(e.to_string()))?
+        .with_swarm_config(|config| config.with_idle_connection_timeout(Duration::from_secs(300)))
+        .build();
+
+    finish_swarm(swarm, config, keypair)
+}
+
+/// Mobile transport: WebSocket over TCP without libp2p's system DNS resolver.
+///
+/// Android has no `/etc/resolv.conf`; hickory's system resolver fails before
+/// the first dial. NexusNet mobile uses IP multiaddrs for bootstrap/relay, so
+/// the DNS layer is unnecessary here.
+#[cfg(any(target_os = "android", target_env = "ohos"))]
+pub async fn build_swarm(
+    config: &ConfigHandle,
+    keypair: &identity::Keypair,
+) -> Result<Swarm<NetBehaviour>, NetworkError> {
+    let config_clone = config.clone();
+
+    let swarm = SwarmBuilder::with_existing_identity(keypair.clone())
+        .with_tokio()
+        .with_other_transport(|keypair| {
+            let tcp = libp2p::tcp::tokio::Transport::new(libp2p::tcp::Config::default());
+            let transport = libp2p::websocket::Config::new(tcp)
+                .upgrade(libp2p::core::upgrade::Version::V1Lazy)
+                .authenticate(tls::Config::new(keypair)?)
+                .multiplex(yamux::Config::default());
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(transport)
+        })
+        .map_err(|e| NetworkError::Build(format!("mobile websocket transport: {e}")))?
+        .with_relay_client(
+            (tls::Config::new, noise::Config::new),
+            yamux::Config::default,
+        )
+        .map_err(|e| NetworkError::Build(format!("{e:?}")))?
+        .with_behaviour(|keypair, relay_client| {
+            NetBehaviour::new(&config_clone, keypair, relay_client)
+        })
+        .map_err(|e| NetworkError::Build(e.to_string()))?
+        .with_swarm_config(|config| config.with_idle_connection_timeout(Duration::from_secs(300)))
+        .build();
+
+    finish_swarm(swarm, config, keypair)
 }
