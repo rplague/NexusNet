@@ -36,10 +36,27 @@ read_package_field() {
     ' "${PROJECT_DIR}/Cargo.toml"
 }
 
+read_schema_field() {
+    awk -v key="$1" '
+        /^[[:space:]]*#/ { next }
+        /^[[:space:]]*$/ { next }
+        $0 ~ "^[[:space:]]*" key "[[:space:]]*=" {
+            if (match($0, /[0-9]+/)) {
+                print substr($0, RSTART, RLENGTH)
+                exit
+            }
+        }
+    ' "${PROJECT_DIR}/config-schema.toml"
+}
+
 NAME="$(read_package_field name)"
 VERSION="$(read_package_field version)"
+CONFIG_SCHEMA="$(read_schema_field current)"
+BREAKING_BELOW="$(read_schema_field breaking_below)"
 [ -n "${NAME}" ] || { echo "[build-win] 无法从 Cargo.toml 提取包名" >&2; exit 1; }
 [ -n "${VERSION}" ] || { echo "[build-win] 无法从 Cargo.toml 提取版本" >&2; exit 1; }
+[ -n "${CONFIG_SCHEMA}" ] || { echo "[build-win] 无法从 config-schema.toml 提取 current" >&2; exit 1; }
+[ -n "${BREAKING_BELOW}" ] || { echo "[build-win] 无法从 config-schema.toml 提取 breaking_below" >&2; exit 1; }
 
 PKG="$(printf '%s' "${NAME}" | tr '[:upper:]_' '[:lower:]-')"
 BIN="${NAME}"
@@ -59,7 +76,7 @@ SETUP="${OUT_DIR}/${PKG}_${VERSION}_windows_amd64_setup.exe"
 PORTABLE="${OUT_DIR}/${NAME}-windows-amd64.exe"
 ZIP="${OUT_DIR}/${PKG}_${VERSION}_windows_amd64.zip"
 
-echo "[build-win] 包名=${PKG} 二进制=${BIN} 版本=${VERSION} 目标=${TARGET}"
+echo "[build-win] 包名=${PKG} 二进制=${BIN} 版本=${VERSION} 目标=${TARGET} schema=${CONFIG_SCHEMA} breaking_below=${BREAKING_BELOW}"
 
 [ -f "${BINARY}" ] || {
     echo "[build-win] 未找到 ${BINARY}，请先: cargo build --release --target ${TARGET}" >&2
@@ -85,6 +102,8 @@ cp "${SCRIPT_DIR}/win/wizard.nsh" "${STAGE}/wizard.nsh"
 sed -e "s|@PKG@|${PKG}|g" \
     -e "s|@BIN@|${BIN}|g" \
     -e "s|@VERSION@|${VERSION}|g" \
+    -e "s|@CONFIG_SCHEMA@|${CONFIG_SCHEMA}|g" \
+    -e "s|@BREAKING_BELOW@|${BREAKING_BELOW}|g" \
     -e "s|@BIN_EXE@|${BINARY}|g" \
     -e "s|@NSSM_EXE@|${NSSM_EXE}|g" \
     -e "s|@OUTFILE@|${SETUP}|g" \

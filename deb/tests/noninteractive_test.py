@@ -4,12 +4,14 @@
 import os
 import subprocess
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 CONFIG_SCRIPT = ROOT / "deb" / "config"
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
+SCHEMA_FILE = ROOT / "config-schema.toml"
 
 DEBCONF_STUB = r'''
 DB_STORE="${TEST_DB_STORE:?}"
@@ -51,6 +53,13 @@ class NoninteractiveTest(unittest.TestCase):
             'CONFIG="/etc/${PKG}/config.toml"',
             'CONFIG="${TEST_CONFIG:-/etc/nexusnet/config.toml}"',
         )
+        text = text.replace(
+            'CONFIG_SCHEMA_FILE="/etc/${PKG}/config.schema"',
+            'CONFIG_SCHEMA_FILE="${TEST_CONFIG_SCHEMA:-/etc/nexusnet/config.schema}"',
+        )
+        schema = tomllib.loads(SCHEMA_FILE.read_text(encoding="utf-8"))
+        text = text.replace("@CONFIG_SCHEMA@", str(schema["current"]))
+        text = text.replace("@BREAKING_BELOW@", str(schema["breaking_below"]))
         text = text.replace(". /usr/share/debconf/confmodule", DEBCONF_STUB)
         cls.script = root / "config.sh"
         cls.script.write_text(text, encoding="utf-8")
@@ -131,8 +140,6 @@ class NoninteractiveTest(unittest.TestCase):
         self.assertEqual(self.value("setup_mode"), "wizard")
         self.assertEqual(self.value("node_name"), "edge-01")
         self.assertEqual(self.value("port"), "6123")
-        self.assertEqual(self.value("pq_transport"), "true")
-        self.assertEqual(self.value("pq_identity"), "true")
         self.assertEqual(self.value("pq_required"), "true")
         self.assertEqual(self.value("local_services_enabled"), "false")
         self.assertEqual(self.value("auth_enabled"), "false")
@@ -171,14 +178,13 @@ class NoninteractiveTest(unittest.TestCase):
         self.assertIn("警告", result.stderr)
         self.assertEqual(self.value("node_name"), "NexusNet")
         self.assertEqual(self.value("port"), "5000")
-        self.assertEqual(self.value("pq_transport"), "true")
 
-    def test_seen_setup_mode_skips_wizard_fill(self):
+    def test_seen_wizard_fills_noninteractive_defaults(self):
         self.preseed("setup_mode", "wizard")
         self.run_config(FIXTURES / "existing.toml")
         self.assertEqual(self.value("setup_mode"), "wizard")
-        self.assertIsNone(self.value("node_name"))
-        self.assertIsNone(self.value("port"))
+        self.assertEqual(self.value("node_name"), "edge-01")
+        self.assertEqual(self.value("port"), "6123")
 
     def test_reconfigure_bypasses_seen_guard(self):
         self.preseed("setup_mode", "wizard")

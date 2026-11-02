@@ -46,7 +46,7 @@ pub fn run_from_args() -> Option<i32> {
     let mode = args.first()?.as_str();
     let rest = &args[1..];
     let result = match mode {
-        "--setup" => run_setup(rest),
+        "--write-config" => run_write_config(rest),
         "--defaults" => run_defaults(rest),
         "--check-config" => run_check(rest),
         _ => return None,
@@ -60,15 +60,11 @@ pub fn run_from_args() -> Option<i32> {
     })
 }
 
-fn run_setup(args: &[String]) -> SetupResult<()> {
-    let (basic, advanced, config_dir, backup) = parse_setup_args(args)?;
-    let mut value = read_json(&basic)?;
-    if let Some(advanced) = advanced {
-        let over = read_json(&advanced)?;
-        merge_json(&mut value, over);
-    }
+fn run_write_config(args: &[String]) -> SetupResult<()> {
+    let (answers, config_dir, backup) = parse_write_config_args(args)?;
+    let value = read_json(&answers)?;
     let config: NodeConfig = serde_json::from_value(value)
-        .map_err(|e| SetupError::usage(format!("invalid setup JSON: {e}")))?;
+        .map_err(|e| SetupError::usage(format!("invalid answers JSON: {e}")))?;
     validate(&config, true)?;
     let path = write_config(&config_dir, &config, backup)?;
     println!("setup: wrote {}", path.display());
@@ -105,25 +101,17 @@ fn run_check(args: &[String]) -> SetupResult<()> {
     Ok(())
 }
 
-fn parse_setup_args(args: &[String]) -> SetupResult<(PathBuf, Option<PathBuf>, PathBuf, bool)> {
-    let basic = args
+fn parse_write_config_args(args: &[String]) -> SetupResult<(PathBuf, PathBuf, bool)> {
+    let answers = args
         .first()
         .filter(|s| !s.starts_with("--"))
         .map(PathBuf::from)
-        .ok_or_else(|| SetupError::usage("--setup requires a JSON file"))?;
-    let mut advanced = None;
+        .ok_or_else(|| SetupError::usage("--write-config requires a JSON file"))?;
     let mut config_dir = None;
     let mut backup = false;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            "--advanced" => {
-                i += 1;
-                let path = args
-                    .get(i)
-                    .ok_or_else(|| SetupError::usage("--advanced requires a path"))?;
-                advanced = Some(PathBuf::from(path));
-            }
             "--config-dir" => {
                 i += 1;
                 let path = args
@@ -137,8 +125,7 @@ fn parse_setup_args(args: &[String]) -> SetupResult<(PathBuf, Option<PathBuf>, P
         i += 1;
     }
     Ok((
-        basic,
-        advanced,
+        answers,
         config_dir.unwrap_or_else(default_config_dir),
         backup,
     ))
@@ -200,22 +187,6 @@ fn read_text(path: &Path) -> SetupResult<String> {
     } else {
         String::from_utf8(bytes)
             .map_err(|e| SetupError::usage(format!("decode {}: {e}", path.display())))
-    }
-}
-
-fn merge_json(dst: &mut Value, src: Value) {
-    match (dst, src) {
-        (Value::Object(dst), Value::Object(src)) => {
-            for (key, value) in src {
-                match dst.get_mut(&key) {
-                    Some(slot) => merge_json(slot, value),
-                    None => {
-                        dst.insert(key, value);
-                    }
-                }
-            }
-        }
-        (dst, src) => *dst = src,
     }
 }
 
@@ -392,37 +363,28 @@ mod tests {
         assert_eq!(config.network.port, 5000);
         assert!(!config.network.ipv4_enabled);
         assert!(!config.network.ipv6_enabled);
+        assert!(config.crypto.pq_transport_enabled);
+        assert!(config.crypto.pq_identity_enabled);
         assert_eq!(config.node.name, "未设置的p2p节点");
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn setup_merges_partial_json_and_advanced() {
+    fn write_config_uses_defaults_for_missing_fields() {
         let dir = temp_dir("setup");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
-        let basic = dir.join("basic.json");
-        let advanced = dir.join("advanced.json");
+        let answers = dir.join("answers.json");
         let out = dir.join("config");
         let bootstrap = format!("/ip4/127.0.0.1/tcp/5000/ws/p2p/{}", peer());
         write(
-            &basic,
+            &answers,
             &format!(
-                r#"{{"node":{{"name":"win-node"}},"network":{{"port":6000}},"services":{{"kademlia":{{"bootstrap_nodes":["{bootstrap}"]}}}}}}"#
+                r#"{{"node":{{"name":"win-node"}},"network":{{"port":6000}},"services":{{"ping":{{"enabled":false}},"kademlia":{{"bootstrap_nodes":["{bootstrap}"]}}}}}}"#
             ),
         );
-        write(
-            &advanced,
-            r#"{"services":{"ping":{"enabled":false}}},"crypto":{"pq_transport_enabled":true}"#,
-        );
-        let adv =
-            r#"{"services":{"ping":{"enabled":false}},"crypto":{"pq_transport_enabled":true}}"#
-                .to_string();
-        write(&advanced, &adv);
-        run_setup(&[
-            basic.display().to_string(),
-            "--advanced".into(),
-            advanced.display().to_string(),
+        run_write_config(&[
+            answers.display().to_string(),
             "--config-dir".into(),
             out.display().to_string(),
         ])
@@ -432,7 +394,7 @@ mod tests {
         assert_eq!(config.node.name, "win-node");
         assert_eq!(config.network.port, 6000);
         assert!(!config.services.ping.enabled);
-        assert!(config.crypto.pq_transport_enabled);
+        assert_eq!(config.services.ping.interval_secs, 15);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -448,7 +410,7 @@ mod tests {
             &basic,
             &format!(r#"{{"services":{{"kademlia":{{"bootstrap_nodes":["{bootstrap}"]}}}}}}"#),
         );
-        let err = run_setup(&[
+        let err = run_write_config(&[
             basic.display().to_string(),
             "--config-dir".into(),
             out.display().to_string(),
@@ -484,10 +446,10 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         write(&dir.join("config.toml"), "old");
-        let basic = dir.join("basic.json");
-        write(&basic, r#"{"node":{"name":"backup"}}"#);
-        run_setup(&[
-            basic.display().to_string(),
+        let answers = dir.join("answers.json");
+        write(&answers, r#"{"node":{"name":"backup"}}"#);
+        run_write_config(&[
+            answers.display().to_string(),
             "--config-dir".into(),
             dir.display().to_string(),
             "--backup".into(),

@@ -17,8 +17,14 @@ jobs:
           for f in deb/config deb/postinst deb/prerm deb/postrm; do
             sh -n "$f"
           done
-      - name: 运行测试 | Run tests
+      - name: 运行 Rust 测试 | Run Rust tests
         run: cargo test --verbose
+      - name: 运行安装器测试 | Run installer tests
+        run: |
+          python3 deb/tests/prefill_test.py
+          python3 deb/tests/noninteractive_test.py
+          python3 deb/tests/interactive_test.py
+          python3 deb/tests/postinst_test.py
 
   fmt:
     runs-on: native

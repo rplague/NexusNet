@@ -19,7 +19,6 @@ use nexusnet::log::{LogLevel, LogStruct};
 use nexusnet::paths::{self, FailType};
 use nexusnet::runtime::{NodeHandle, NodeOptions};
 use nexusnet::setup;
-use nexusnet::sidecar_protocol::Message;
 use std::error::Error;
 
 #[tokio::main]
@@ -41,6 +40,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     handle.shutdown().await;
     Ok(())
 }
+
+#[cfg(unix)]
+use nexusnet::sidecar_protocol::Message;
 
 #[cfg(unix)]
 async fn wait_for_exit(handle: &NodeHandle) {

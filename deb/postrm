@@ -9,9 +9,30 @@
 set -e
 
 UNIT_NAME="@PKG@"
+PKG="@PKG@"
+CONFIG_DIR="/etc/${PKG}"
 
 case "$1" in
-    remove|upgrade|abort-install|abort-upgrade|disappear|purge)
+    remove|upgrade|abort-install|abort-upgrade|disappear)
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        ;;
+    purge)
+        if [ -f /usr/share/debconf/confmodule ]; then
+            . /usr/share/debconf/confmodule
+            db_purge >/dev/null 2>&1 || true
+            db_stop >/dev/null 2>&1 || true
+        fi
+        rm -f \
+            "${CONFIG_DIR}/config.toml" \
+            "${CONFIG_DIR}/config.schema" \
+            "${CONFIG_DIR}/config.toml.tmp"
+        if [ -d "${CONFIG_DIR}" ]; then
+            for _backup in "${CONFIG_DIR}"/config.toml.bak.*; do
+                [ -e "${_backup}" ] || continue
+                rm -f "${_backup}"
+            done
+            rmdir "${CONFIG_DIR}" 2>/dev/null || true
+        fi
         systemctl daemon-reload >/dev/null 2>&1 || true
         ;;
 esac

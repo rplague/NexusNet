@@ -5,6 +5,9 @@ set -e
 
 PKG="@PKG@"
 CONFIG="/etc/${PKG}/config.toml"
+CONFIG_SCHEMA_FILE="/etc/${PKG}/config.schema"
+CURRENT_SCHEMA=@CONFIG_SCHEMA@
+BREAKING_BELOW=@BREAKING_BELOW@
 
 db_version 2.0 || true
 
@@ -31,14 +34,17 @@ db_stop_safe() {
     db_stop 2>/dev/null || true
 }
 
-# dpkg may run this config script more than once (preconfigure + configure).
-# Only the first invocation should present the wizard; dpkg-reconfigure must
-# bypass the guard explicitly.
-db_fget "${PKG}/setup_mode" seen || true
-if [ "${RET:-false}" = "true" ] && [ "${DEBCONF_RECONFIGURE:-}" != "1" ]; then
-    db_stop_safe
-    exit 0
-fi
+read_installed_schema() {
+    if [ ! -f "${CONFIG_SCHEMA_FILE}" ]; then
+        printf '0'
+        return 0
+    fi
+    _value="$(cat "${CONFIG_SCHEMA_FILE}" 2>/dev/null || printf '0')"
+    case "${_value}" in
+        ''|*[!0-9]*) printf '0' ;;
+        *) printf '%s' "${_value}" ;;
+    esac
+}
 
 load_prefill() {
     NODE_NAME="NexusNet"
@@ -51,6 +57,7 @@ load_prefill() {
     PQ_TRANSPORT="false"
     PQ_IDENTITY="false"
     PQ_REQUIRED="false"
+    BOOTSTRAP_RAW="false"
     CONFIG_FOUND="false"
 
     if ! command -v python3 >/dev/null 2>&1; then
@@ -96,6 +103,7 @@ def load(path):
         "PQ_TRANSPORT": "false",
         "PQ_IDENTITY": "false",
         "PQ_REQUIRED": "false",
+        "BOOTSTRAP_RAW": "false",
         "CONFIG_FOUND": "false",
     }
     if not path:
@@ -163,9 +171,10 @@ def load(path):
 
     bootstrap = kademlia.get("bootstrap_nodes")
     if isinstance(bootstrap, list):
-        data["BOOTSTRAP"] = ",".join(
-            item for item in bootstrap if isinstance(item, str) and item
-        )
+        values = [item for item in bootstrap if isinstance(item, str) and item]
+        data["BOOTSTRAP"] = ",".join(values)
+        if any("/ws" not in item for item in values):
+            data["BOOTSTRAP_RAW"] = "true"
 
     data["PQ_TRANSPORT"] = "true" if _as_bool(crypto.get("pq_transport_enabled")) else "false"
     data["PQ_IDENTITY"] = "true" if _as_bool(crypto.get("pq_identity_enabled")) else "false"
@@ -279,8 +288,6 @@ noninteractive_configure() {
         esac
     fi
 
-    db_set_seen "${PKG}/pq_transport" true
-    db_set_seen "${PKG}/pq_identity" true
     db_stop_safe
     return 0
 }
@@ -1097,7 +1104,7 @@ page_summary() {
 WebSocket 端口：${PORT}
 本地服务：${_services_text}
 鉴权网络：${_auth_text}
-PQ 传输/身份：固定启用
+PQ 传输/身份：使用默认值或旧配置
 Bootstrap：${_bootstrap_text}
 
 写入配置？" 22 86
@@ -1133,9 +1140,6 @@ finalize_wizard() {
         "$( [ "${AUTH_ENABLED}" = "1" ] && printf '%s' "${AUTH_NETWORK_NAME}" || printf 'none' )"
     db_set_seen "${PKG}/auth_authority" \
         "$( [ "${AUTH_ENABLED}" = "1" ] && printf '%s' "${AUTH_AUTHORITY}" || printf '' )"
-    db_set_seen "${PKG}/pq_transport" true
-    db_set_seen "${PKG}/pq_identity" true
-    db_set_seen "${PKG}/pq_required" "${PQ_REQUIRED}"
     db_stop_safe
 }
 
@@ -1153,6 +1157,50 @@ if ! has_interactive_tty; then
     echo "NexusNet 警告：未找到 whiptail 或可用的 /dev/tty，跳过交互向导。" >&2
     db_stop_safe
     exit 0
+fi
+
+# dpkg may invoke the config script more than once before postinst creates the
+# config. Keep the answers from the first invocation instead of re-asking.
+if [ ! -f "${CONFIG}" ] && [ "${DEBCONF_RECONFIGURE:-}" != "1" ] \
+    && db_seen "${PKG}/setup_mode"; then
+    db_stop_safe
+    exit 0
+fi
+
+CONFIG_EXISTS=0
+[ -f "${CONFIG}" ] && CONFIG_EXISTS=1
+CONFIG_PARSE_FAILED=0
+if [ "${CONFIG_EXISTS}" = 1 ] && [ "${CONFIG_FOUND:-false}" != "true" ]; then
+    CONFIG_PARSE_FAILED=1
+fi
+INSTALLED_SCHEMA="$(read_installed_schema)"
+
+FORCE_WIZARD=0
+[ "${DEBCONF_RECONFIGURE:-}" = "1" ] && FORCE_WIZARD=1
+
+if [ "${CONFIG_EXISTS}" = 1 ]; then
+    if [ "${INSTALLED_SCHEMA}" -gt "${CURRENT_SCHEMA}" ]; then
+        wt_msg "检测到 config.schema=${INSTALLED_SCHEMA}，高于当前程序支持的 ${CURRENT_SCHEMA}。
+将保留旧配置并禁用服务，请升级 NexusNet 或手动处理。" 12 78
+        finalize_skip
+        exit 0
+    fi
+    if [ "${CONFIG_PARSE_FAILED}" = 1 ]; then
+        FORCE_WIZARD=1
+        wt_msg "现有 config.toml 无法解析，将备份旧配置后进入向导。" 10 74
+    elif [ "${INSTALLED_SCHEMA}" -lt "${BREAKING_BELOW}" ]; then
+        FORCE_WIZARD=1
+        wt_msg "配置版本 ${INSTALLED_SCHEMA} 低于最低兼容版本 ${BREAKING_BELOW}，
+将备份旧配置后进入向导。" 11 76
+    elif [ "${BOOTSTRAP_RAW:-false}" = "true" ]; then
+        FORCE_WIZARD=1
+        wt_msg "现有 bootstrap 地址缺少 /ws（旧版 raw TCP），
+将备份旧配置后进入向导。" 11 76
+    fi
+    if [ "${FORCE_WIZARD}" != "1" ]; then
+        finalize_skip
+        exit 0
+    fi
 fi
 
 # Interactive defaults: existing config.toml wins over stale debconf values.

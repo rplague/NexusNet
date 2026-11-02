@@ -1,4 +1,10 @@
 Function ModePageCreate
+  ${If} $SkipModePage == "1"
+    Abort
+  ${EndIf}
+  ${If} $CfgAction == "skip"
+    Abort
+  ${EndIf}
   nsDialogs::Create 1018
   Pop $Dialog
   ${If} $Dialog == error
@@ -542,7 +548,7 @@ Function SummaryPageCreate
   StrCpy $R0 "$R0WebSocket 端口：$Port$\r$\n"
   StrCpy $R0 "$R0本地服务：$SvcSummary$\r$\n"
   StrCpy $R0 "$R0鉴权网络：$R1$\r$\n"
-  StrCpy $R0 "$R0PQ 传输/身份：固定启用$\r$\n"
+  StrCpy $R0 "$R0PQ 传输/身份：使用默认值或旧配置$\r$\n"
   StrCpy $R0 "$R0Bootstrap：$R2"
   ${NSD_CreateMLText} 10 10 270 210 "$R0"
   Pop $hSummary

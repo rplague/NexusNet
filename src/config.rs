@@ -113,7 +113,7 @@ pub struct NodeConfig {
     pub network: NetworkConfig,
     #[serde(default)]
     pub services: ServicesConfig,
-    #[serde(default)]
+    #[serde(default = "legacy_crypto_config")]
     pub crypto: CryptoConfig,
     #[serde(default)]
     pub auth: AuthConfig,
@@ -682,7 +682,7 @@ impl Default for DispatcherConfig {
     }
 }
 
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, Default)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct CryptoConfig {
     #[serde(default = "bool_false")]
     pub pq_transport_enabled: bool,
@@ -690,6 +690,26 @@ pub struct CryptoConfig {
     pub pq_identity_enabled: bool,
     #[serde(default = "bool_false")]
     pub pq_required: bool,
+}
+
+/// Missing `[crypto]` sections in older configs keep the historical
+/// PQ-disabled behavior. New configs use `CryptoConfig::default()`.
+fn legacy_crypto_config() -> CryptoConfig {
+    CryptoConfig {
+        pq_transport_enabled: false,
+        pq_identity_enabled: false,
+        pq_required: false,
+    }
+}
+
+impl Default for CryptoConfig {
+    fn default() -> Self {
+        Self {
+            pq_transport_enabled: true,
+            pq_identity_enabled: true,
+            pq_required: false,
+        }
+    }
 }
 
 /// Node-level authentication configuration.
@@ -1211,6 +1231,8 @@ mod tests {
     #[test]
     fn rejects_pq_required_without_transport() {
         let mut config = NodeConfig::default();
+        config.crypto.pq_transport_enabled = false;
+        config.crypto.pq_identity_enabled = false;
         config.crypto.pq_required = true;
         assert!(config.validate().is_err());
     }
@@ -1218,8 +1240,20 @@ mod tests {
     #[test]
     fn rejects_pq_identity_without_transport() {
         let mut config = NodeConfig::default();
+        config.crypto.pq_transport_enabled = false;
         config.crypto.pq_identity_enabled = true;
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn new_config_enables_pq_but_legacy_section_stays_disabled() {
+        let config = NodeConfig::default();
+        assert!(config.crypto.pq_transport_enabled);
+        assert!(config.crypto.pq_identity_enabled);
+
+        let legacy: NodeConfig = toml::from_str("[node]\nname = \"old\"\n").unwrap();
+        assert!(!legacy.crypto.pq_transport_enabled);
+        assert!(!legacy.crypto.pq_identity_enabled);
     }
 
     #[test]

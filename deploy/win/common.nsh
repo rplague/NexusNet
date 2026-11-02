@@ -11,6 +11,9 @@ ${Using:StrFunc} StrTrimNewLines
 
 Var DataDir
 Var ConfigExists
+Var ConfigSchema
+Var SkipModePage
+Var Reconfigure
 Var CfgAction
 Var SetupFile
 Var DoBackup
@@ -70,6 +73,33 @@ Var hAuthAuthority
 Var hBootstrap
 Var hSummary
 
+Function ReadConfigSchema
+  StrCpy $ConfigSchema "0"
+  IfFileExists "$DataDir\config.schema" 0 ReadConfigSchema_done
+  FileOpen $0 "$DataDir\config.schema" r
+  IfErrors ReadConfigSchema_done
+  FileRead $0 $1
+  FileClose $0
+  ${StrTrimNewLines} $1 $1
+  StrCmp $1 "" ReadConfigSchema_done
+  StrCpy $ConfigSchema "$1"
+  IntOp $ConfigSchema $ConfigSchema + 0
+  ReadConfigSchema_done:
+FunctionEnd
+
+Function WriteConfigSchema
+  FileOpen $0 "$DataDir\config.schema" w
+  IfErrors WriteConfigSchema_error
+  FileWrite $0 "${CONFIG_SCHEMA}"
+  FileClose $0
+  Return
+  WriteConfigSchema_error:
+    IfSilent +2 0
+      MessageBox MB_ICONSTOP "无法写入 config.schema，安装已中止。"
+    SetErrorLevel 2
+    Abort
+FunctionEnd
+
 Function InitDefaults
   StrCpy $NodeName "NexusNet"
   StrCpy $NodeDescription "NexusNet P2P node"
@@ -81,6 +111,9 @@ Function InitDefaults
   StrCpy $AuthEnabled "0"
 
   StrCpy $ConfigExists "0"
+  StrCpy $ConfigSchema "0"
+  StrCpy $SkipModePage "0"
+  StrCpy $Reconfigure "0"
   StrCpy $CfgAction "wizard"
   StrCpy $SetupFile ""
   StrCpy $DoBackup "0"
@@ -620,7 +653,7 @@ Function WriteServicesJson
 FunctionEnd
 
 Function WriteBasicJson
-  FileOpen $R9 "$PLUGINSDIR\setup-basic.json" w
+  FileOpen $R9 "$PLUGINSDIR\setup.json" w
   IfErrors WriteBasicJson_error
   FileWriteByte $R9 255
   FileWriteByte $R9 254
@@ -632,14 +665,14 @@ Function WriteBasicJson
   StrCpy $R0 "$NodeDescription"
   Call JsonEscape
   FileWriteUTF16LE $R9 "$R1"
-  FileWriteUTF16LE $R9 '","allow_bootstrap":true,"accept_bootstrap_providers":false},"network":{"port":'
+  FileWriteUTF16LE $R9 '"},"network":{"port":'
   FileWriteUTF16LE $R9 "$Port"
   FileWriteUTF16LE $R9 '},"services":{"kademlia":{"bootstrap_nodes":'
   StrCpy $R0 "$Bootstrap"
   Call WriteStringArray
   FileWriteUTF16LE $R9 '},"dispatcher":{"local_services":'
   Call WriteServicesJson
-  FileWriteUTF16LE $R9 '}},"crypto":{"pq_transport_enabled":true,"pq_identity_enabled":true,"pq_required":false},"auth":{"network":"'
+  FileWriteUTF16LE $R9 '}},"auth":{"network":"'
   StrCpy $R0 "$AuthNetwork"
   Call JsonEscape
   StrCpy $Escaped "$R1"
@@ -661,19 +694,6 @@ Function WriteBasicJson
   Return
   WriteBasicJson_error:
     MessageBox MB_ICONSTOP "无法创建临时配置文件。"
-    Abort
-FunctionEnd
-
-Function WriteAdvancedJson
-  FileOpen $R9 "$PLUGINSDIR\setup-advanced.json" w
-  IfErrors WriteAdvancedJson_error
-  FileWriteByte $R9 255
-  FileWriteByte $R9 254
-  FileWriteUTF16LE $R9 '{"services":{"ping":{"enabled":true,"interval_secs":15,"with_timeout":10,"max_failures":2},"kademlia":{"enabled":true,"record_ttl_seconds":3600,"replication_factor":20,"query_timeout_seconds":60},"dispatcher":{"enabled":true,"query_timeout_secs":60,"types_sync_secs":300,"max_inflight_dht":4,"max_request_bytes":16777216,"max_response_bytes":16777216},"registry":{"max_inflight_dht":4},"relay":{"retry_interval_secs":60,"max_failures":3}},"compat":{"max_record_bytes":14336}}'
-  FileClose $R9
-  Return
-  WriteAdvancedJson_error:
-    MessageBox MB_ICONSTOP "无法创建高级配置文件。"
     Abort
 FunctionEnd
 

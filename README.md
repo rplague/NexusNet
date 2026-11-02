@@ -56,7 +56,7 @@ cargo run
 ### 配置
 
 监听端口、bootstrap 节点等均通过 `config.toml` 配置。正常服务不解析命令行参数；
-安装器使用内部的 `--setup` / `--defaults` / `--check-config` 模式生成和检查配置。
+安装器使用内部的 `--write-config` / `--defaults` / `--check-config` 模式生成和检查配置。
 
 ## 部署（systemd / deb）
 
@@ -93,10 +93,11 @@ allow_bootstrap = true
 accept_bootstrap_providers = false   # 是否自动采纳 Identify 发现的 bootstrap 节点
 
 [network]
+# 启动时会探测公网地址并写回；ipv4_enabled/ipv6_enabled 随之更新
 ipv4_enabled = false
-ipv4_address = "x.x.x.x"       # 可选，不设则自动检测
+ipv4_address = "x.x.x.x"       # 可选，但会被自动探测覆盖
 ipv6_enabled = false
-ipv6_address = "x:x::x"         # 可选
+ipv6_address = "x:x::x"         # 可选，但会被自动探测覆盖
 port = 5000                     # WebSocket TCP 端口
 
 [services.ping]
@@ -139,15 +140,15 @@ max_failures = 3
 max_record_bytes = 14336     # 默认适配旧版 16 KiB Kademlia 包
 
 [crypto]
-pq_transport_enabled = false
-pq_identity_enabled = false
+pq_transport_enabled = true
+pq_identity_enabled = true
 pq_required = false
 
 [auth]
-network = "none"                 # "none" = 不鉴权
+network = "none"                 # "none" = 不鉴权；启用时改为 myorg
 
-[auth.networks.myorg]            # 每个鉴权网络的信任锚
-authority = "<base64 ed25519 公钥>"
+# [auth.networks.myorg]          # 每个鉴权网络的信任锚
+# authority = "<base64 ed25519 公钥>"
 ```
 
 可选字段省略即取默认值；`local_services[].name` 与 `port` 必填。节点固定连接

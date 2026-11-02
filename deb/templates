@@ -50,12 +50,12 @@ Description: 是否启用鉴权网络 / Enable authentication network:
 Template: @PKG@/pq_transport
 Type: boolean
 Default: true
-Description: PQ 传输由安装器固定启用 / PQ transport is forced on:
+Description: 启用 PQ 传输 / Enable PQ transport:
 
 Template: @PKG@/pq_identity
 Type: boolean
 Default: true
-Description: PQ 身份由安装器固定启用 / PQ identity is forced on:
+Description: 要求并校验 PQ 身份签名 / Require PQ identity signatures:
 
 Template: @PKG@/pq_required
 Type: boolean
@@ -157,6 +157,12 @@ Template: @PKG@/registry_inflight
 Type: string
 Default: 4
 Description: Registry DHT 并发上限 / Registry max inflight DHT:
+
+Template: @PKG@/registry_type_ttl
+Type: string
+Default: 1800
+Description: Registry 服务类型租约秒数 / Registry type TTL seconds:
+ 必须大于 2 * types_sync；未显式设置时会自动取满足条件的最小值。
 
 Template: @PKG@/relay_retry
 Type: string

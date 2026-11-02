@@ -1,0 +1,8 @@
+# Installer-facing configuration schema version.
+#
+# `current` is written to <config-dir>/config.schema after a successful setup.
+# `breaking_below` is the minimum schema this package can keep without asking
+# the operator to reconfigure. Bump both together for a breaking config change;
+# bump only `current` for a non-breaking schema addition.
+current = 1
+breaking_below = 0

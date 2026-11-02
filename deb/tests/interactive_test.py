@@ -7,6 +7,7 @@ import os
 import pty
 import struct
 import tempfile
+import tomllib
 import termios
 import unittest
 from pathlib import Path
@@ -14,6 +15,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 CONFIG_SCRIPT = ROOT / "deb" / "config"
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
+SCHEMA_FILE = ROOT / "config-schema.toml"
 
 DEBCONF_STUB = r'''
 DB_STORE="${TEST_DB_STORE:?}"
@@ -100,6 +102,13 @@ class InteractiveTest(unittest.TestCase):
             'CONFIG="/etc/${PKG}/config.toml"',
             'CONFIG="${TEST_CONFIG:-/etc/nexusnet/config.toml}"',
         )
+        text = text.replace(
+            'CONFIG_SCHEMA_FILE="/etc/${PKG}/config.schema"',
+            'CONFIG_SCHEMA_FILE="${TEST_CONFIG_SCHEMA:-/etc/nexusnet/config.schema}"',
+        )
+        schema = tomllib.loads(SCHEMA_FILE.read_text(encoding="utf-8"))
+        text = text.replace("@CONFIG_SCHEMA@", str(schema["current"]))
+        text = text.replace("@BREAKING_BELOW@", str(schema["breaking_below"]))
         text = text.replace(". /usr/share/debconf/confmodule", DEBCONF_STUB)
         cls.script = root / "config.sh"
         cls.script.write_text(text, encoding="utf-8")
@@ -133,15 +142,16 @@ class InteractiveTest(unittest.TestCase):
             encoding="utf-8",
         )
 
-    def run_config(self, config_path=None):
+    def run_config(self, config_path=None, reconfigure=False):
         env = os.environ.copy()
         env.update(
             {
                 "DEBIAN_FRONTEND": "dialog",
-                "DEBCONF_RECONFIGURE": "",
+                "DEBCONF_RECONFIGURE": "1" if reconfigure else "",
                 "PATH": str(self.bin) + ":" + env.get("PATH", ""),
                 "TEST_DB_STORE": str(self.db),
                 "TEST_CONFIG": str(config_path or (self.dir / "config.toml")),
+                "TEST_CONFIG_SCHEMA": str(self.dir / "config.schema"),
                 "FAKE_WT_RESPONSES": str(self.responses),
                 "FAKE_WT_COUNTER": str(self.counter),
                 "FAKE_WT_LOG": str(self.dir / "calls.jsonl"),
@@ -246,6 +256,9 @@ class InteractiveTest(unittest.TestCase):
         default_index = auth_menus[1].index("--default-item")
         self.assertEqual(auth_menus[1][default_index + 1], "svc:ocr")
 
+        (self.dir / "config.toml").write_text(
+            '[node]\nname = "node-a"\n', encoding="utf-8"
+        )
         status, output = self.run_config()
         self.assertEqual(status, 0, output)
         self.assertEqual(self.calls(), 18)
@@ -270,7 +283,7 @@ class InteractiveTest(unittest.TestCase):
             ]
         )
 
-        status, output = self.run_config(FIXTURES / "existing.toml")
+        status, output = self.run_config(FIXTURES / "existing.toml", reconfigure=True)
         self.assertEqual(status, 0, output)
         self.assertEqual(self.calls(), 9)
         self.assertEqual(
@@ -353,6 +366,25 @@ class InteractiveTest(unittest.TestCase):
             self.value("bootstrap"),
             "/ip4/3.3.3.3/tcp/5000/ws/p2p/PeerCCC",
         )
+
+    def test_repeated_preconfigure_keeps_first_answers(self):
+        self.set_responses(
+            [
+                {"kind": "menu", "value": "wizard"},
+                {"kind": "inputbox", "value": "node-r"},
+                {"kind": "inputbox", "value": "desc"},
+                {"kind": "menu", "value": "next"},
+                {"kind": "menu", "value": "__save__"},
+                {"kind": "yesno", "status": 0},
+            ]
+        )
+        status, output = self.run_config()
+        self.assertEqual(status, 0, output)
+        self.assertEqual(self.calls(), 6)
+        status, output = self.run_config()
+        self.assertEqual(status, 0, output)
+        self.assertEqual(self.calls(), 6)
+        self.assertEqual(self.value("node_name"), "node-r")
 
     def test_long_bootstrap_is_truncated_in_menu(self):
         address = (

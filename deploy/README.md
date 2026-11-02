@@ -17,7 +17,8 @@ NexusNet 以原生的 Debian 打包（`.deb`）分发，由 `dpkg`/`apt` 管理�
 
 | 文件 | 路径 | 属主/权限 | 说明 |
 |---|---|---|---|
-| 配置 | `/etc/<pkg>/config.toml` | `nexusnet:nexusnet 0755` | whiptail 向导生成；跳过向导时保留现有配置或生成默认配置 |
+| 配置 | `/etc/<pkg>/config.toml` | `nexusnet:nexusnet 0644` | 向导生成；兼容升级时保留现有配置 |
+| 配置 schema | `/etc/<pkg>/config.schema` | `nexusnet:nexusnet 0644` | 安装器升级决策；成功写入后更新 |
 | 数据 | `/var/lib/<pkg>/keypair.bin` | `nexusnet:nexusnet 0700` | 节点身份，不可丢失 |
 | 日志 | journald | — | 由 systemd 采集/轮转/压缩/保留 |
 | 二进制 | `/usr/bin/<bin>` | `root:root 0755` | 主程序 |
@@ -51,7 +52,7 @@ apt install -y ./<pkg>_<version>_amd64.deb
 ```
 
 安装过程（postinst）自动：确保专用用户 `nexusnet` 存在、创建数据目录、确保 journald 持久化
-（创建 `/var/log/journal`），然后读取 whiptail 向导写入 debconf 的结果并处理配置与服务状态。
+（创建 `/var/log/journal`），然后根据 `config.schema` 决定是否进入向导，并处理配置与服务状态。
 
 ### 配置向导（whiptail）
 
@@ -60,7 +61,7 @@ preseed 和非交互兼容。依赖 `whiptail` 与 `python3 (>= 3.11)`，目标�
 
 向导页面：
 
-- 配置方式：向导 / 跳过
+- 配置方式：向导 / 跳过（仅首次安装或破坏性升级）
 - 节点名称、描述（不再询问角色和 IPv4/IPv6 监听；启动时自动检测地址族）
 - WebSocket 端口（1..65535）
 - 本地服务动态编辑器（添加/编辑/删除/保存/取消；可关闭并清空本地服务）
@@ -68,14 +69,23 @@ preseed 和非交互兼容。依赖 `whiptail` 与 `python3 (>= 3.11)`，目标�
 - Bootstrap 编辑器（添加/编辑/删除单条地址；列表中长地址中间截断，编辑时显示完整值；每项必须包含 `/ws` 和 `/p2p/<PeerId>`；可留空）
 - 汇总确认后写入配置
 
-PQ 传输和 PQ 身份固定启用，不在页面中显示；`pq_required` 仍可通过 preseed 设置。
-已有 `/etc/<pkg>/config.toml` 时会预填节点、端口、bootstrap、本地服务和鉴权信息；
-解析失败只告警并回退默认值。
+PQ 传输和 PQ 身份使用程序默认值（新安装默认启用），不在页面中显示；`pq_required`
+仍可通过 preseed 设置。已有 `/etc/<pkg>/config.toml` 时会预填节点、端口、bootstrap、
+本地服务和鉴权信息；解析失败只告警并回退默认值。
+
+升级决策：
+
+- 没有配置：生成默认配置并进入向导。
+- `config.schema` 低于 `BREAKING_BELOW`：备份旧配置后进入向导。
+- `config.schema` 在兼容范围内：不进入向导，保留配置和服务原有状态。
+- `config.schema` 高于当前程序：禁用服务并提示降级/升级。
+- `dpkg-reconfigure <pkg>`：进入向导；旧配置会先备份，未显示字段会回到默认值。
 
 “跳过”语义：
 
 - 已有配置：保留原配置，不重新询问，保持服务原有 enabled/disabled 状态。
 - 没有配置：生成默认配置，服务不自动启动，手动 `systemctl enable --now <pkg>`。
+- 破坏性升级时取消向导：保留旧配置，禁用服务并提示。
 
 DHT、Ping、Dispatcher、Registry、Relay、Compat 等高级项仍保存在 debconf 中，可用
 preseed 设置；向导不再逐项询问。
@@ -101,9 +111,12 @@ DEBIAN_FRONTEND=noninteractive apt install -y ./<pkg>_<version>_amd64.deb
 <pkg> <pkg>/auth_enabled boolean true
 <pkg> <pkg>/auth_network string corp
 <pkg> <pkg>/auth_authority string <base64-ed25519-public-key>
+# 可选：覆盖 registry 租约；未设置时按 2 * types_sync + 1 自动派生
+<pkg> <pkg>/registry_type_ttl string 1800
 ```
 
-preseed 值优先；设置 `setup_mode seen true` 后 config 脚本不再运行，未预置字段由 `postinst` 使用默认值补齐。
+preseed 值优先。config 脚本仍会运行，但兼容的 `config.schema` 会自动跳过向导；
+`setup_mode=wizard` 时未预置字段由 `postinst` 使用默认值补齐。
 
 跳过向导后手动启用：
 
@@ -134,8 +147,9 @@ journalctl -u <pkg> -f        # 查看运行日志（单行、带日志级别，
 apt install -y ./<pkg>_<新版本>.deb
 ```
 
-升级时 prerm 停止服务；postinst 保留 `keypair.bin` 和现有 `config.toml`，并根据服务原有
-enabled 状态决定是否启动。0.6.x 检测到旧版 raw TCP bootstrap 时会禁用服务并提示重新配置。
+升级时 prerm 停止服务；postinst 保留 `keypair.bin`。`config.schema` 兼容时保留现有
+`config.toml`，并按服务原有 enabled 状态决定是否启动；低于 `BREAKING_BELOW` 时先备份再
+进入向导。0.6.x 检测到旧版 raw TCP bootstrap 时会禁用服务并提示重新配置。
 
 ## 卸载
 
@@ -143,6 +157,9 @@ enabled 状态决定是否启动。0.6.x 检测到旧版 raw TCP bootstrap 时�
 apt remove <pkg>             # 移除包、停服务
 apt purge <pkg>              # 彻底清除包配置
 ```
+
+`remove` 保留 `/etc/<pkg>/config.toml` 和 `config.schema`。`purge` 会清除 debconf 答案、
+`config.toml`、`config.schema` 及 `config.toml.bak.*`。
 
 无论 `remove` 还是 `purge`，**都不会删除** `/var/lib/<pkg>/keypair.bin`，也**不会删除 `nexusnet` 用户**
 （该账号由 NexusNet 后端服务共享）。
@@ -167,6 +184,7 @@ apt purge <pkg>              # 彻底清除包配置
 | `service.tmpfiles.conf` | 预建目录与属主（打包素材） |
 | `../deb/{postinst,prerm,postrm}` | Debian 维护脚本（打包素材） |
 | `../deb/{config,templates}` | whiptail 配置向导 / debconf 数据模板（打包素材） |
+| `../config-schema.toml` | `current` / `breaking_below` 单一来源；构建时注入 deb 和 NSIS |
 | `../deb/tests` | 配置预填与非交互 preseed 测试 |
 | `build-win.sh` | 交叉编译产物 + NSIS 组装 Windows 安装器与便携 zip，自动派生命名 |
 | `win/service.nsi` | NSIS 安装脚本（含 `@PKG@`/`@BIN@`/`@VERSION@` 等占位符） |
@@ -179,16 +197,17 @@ apt purge <pkg>              # 彻底清除包配置
 Windows 和 Debian 安装器共用同一个配置写入器：
 
 ```bash
-NexusNet --setup <basic.json> [--advanced <advanced.json>] --config-dir <dir> [--backup]
+NexusNet --write-config <answers.json> --config-dir <dir> [--backup]
 NexusNet --defaults --config-dir <dir>
 NexusNet --check-config --config-dir <dir>
 ```
 
-- `--setup`：JSON 可只包含需要覆盖的字段，缺失字段使用 Rust 默认值；`--backup`
-  会把旧 `config.toml` 备份为 `config.toml.bak.<timestamp>`。
+- `--write-config`：从一个 answers JSON 生成完整配置；缺失字段使用 Rust 默认值；
+  `--backup` 会把旧 `config.toml` 备份为 `config.toml.bak.<timestamp>`。
 - `--defaults`：仅在配置不存在时生成默认配置；已存在时保持不动。
 - `--check-config`：只读检查；退出码 `0` 有效、`2` 配置非法、`3` 旧版 raw TCP
   bootstrap、`4` IO 错误。
+- 安装器在成功写入后同时写入 `config.schema`。
 - Windows NSIS 写入 UTF-16LE JSON；Debian postinst 写入 UTF-8 JSON；两者都支持中文。
 
 正常服务启动不会解析这些参数。
@@ -240,7 +259,8 @@ NSSM 由脚本按固定版本（2.24）+ SHA256 下载缓存到 `target/nssm-cac
 |---|---|---|
 | 二进制 | `%ProgramFiles%\<pkg>\<bin>.exe` | 主程序 |
 | 包装器 | `%ProgramFiles%\<pkg>\nssm.exe` | NSSM，服务 ImagePath |
-| 配置 | `%ProgramData%\<pkg>\config.toml` | 向导生成；跳过时保留现有配置或生成默认配置 |
+| 配置 | `%ProgramData%\<pkg>\config.toml` | 向导生成；兼容升级时保留现有配置 |
+| 配置 schema | `%ProgramData%\<pkg>\config.schema` | 安装器升级决策；成功写入后更新 |
 | 数据/日志 | `%ProgramData%\<pkg>` | 身份/日志文件 `log` 与轮转 `.gz` 同目录 |
 
 路径经 `NEXUSNET_CONFIG_PATH` / `NEXUSNET_KEYPAIR_PATH` / `NEXUSNET_LOG_PATH` 与
@@ -260,10 +280,16 @@ NSSM 由脚本按固定版本（2.24）+ SHA256 下载缓存到 `target/nssm-cac
 - 摘要确认
 
 不再询问角色、IPv4/IPv6 监听和防火墙；程序启动时自动探测地址族。
-PQ 传输和 PQ 身份固定启用，`pq_required` 使用默认值。
+PQ 传输和 PQ 身份使用程序默认值；`pq_required` 使用默认值。
 Ping/Kademlia、Dispatcher/Registry、Relay/Compat 等高级项使用默认值，不在页面中逐项询问。
 Windows 不预填旧 `config.toml`；重新配置从默认值开始，旧配置会备份为
 `config.toml.bak.<timestamp>`。
+
+兼容升级不会显示向导。需要强制重新配置时运行：
+
+```bat
+setup.exe /RECONFIGURE
+```
 
 跳过语义：
 
@@ -295,8 +321,9 @@ setup.exe /S /SETUPFILE=C:\deploy\nexusnet-setup.json
 ### 安装 / 升级 / 卸载
 
 以管理员运行 `setup.exe`。安装过程：停删旧服务（升级场景）→ 释放文件 → 建数据目录 →
-按向导写入配置并对 `NT SERVICE\<pkg>` 授予写权限 → 按模式配置 NSSM 服务
-（向导：自动启动并启动；跳过且无配置：手动；跳过且已有配置：保持原状态）→ 写卸载项。
+安装服务并配置虚拟账号 → 对 `NT SERVICE\<pkg>` 授予数据目录写权限 → 按模式配置 NSSM
+服务（向导：自动启动并启动；跳过且无配置：手动；跳过且已有配置：保持原状态）→ 写卸载项。
+关键步骤（`nssm install`、`sc.exe config`、`icacls`、环境变量）失败会中止安装。
 
 - 服务账号：虚拟账号 `NT SERVICE\<pkg>`（无需密码），配置/日志目录已 ACL 放行。
 - 升级：运行新版本 `setup.exe`，`%ProgramData%\<pkg>` 保留；原有服务启动方式（自动/手动）保持。
@@ -328,21 +355,24 @@ sc.exe stop <pkg>; sc.exe start <pkg>
 
 ### 日志
 
-Windows 下无 journald，程序自动切换为**文件模式**，写入 `%ProgramData%\<pkg>\`：
+Windows 下无 journald。安装器设置 `NEXUSNET_LOG_MODE=nssm`，程序把日志写到
+stdout/stderr，由 NSSM 捕获并按大小轮转：
 
 | 项 | 路径 |
 |---|---|
-| 当前日志（追加，**无扩展名**） | `%ProgramData%\<pkg>\log` |
-| 轮转归档（>10MB 触发，gzip） | `%ProgramData%\<pkg>\<MMDD_HHMM>-<MMDD_HHMM>-<nanos>.gz` |
-| NSSM 捕获的 stdout/stderr（兜底） | `%ProgramData%\<pkg>\service.out.log` / `service.err.log` |
+| stdout | `%ProgramData%\<pkg>\service.out.log` |
+| stderr（Warning/Error/Critical） | `%ProgramData%\<pkg>\service.err.log` |
 | NSSM 服务级事件（启停/重启） | Windows「应用程序」事件日志，来源 `nssm` |
+| 程序自身文件模式（仅 `NEXUSNET_LOG_MODE=file`） | `%ProgramData%\<pkg>\log` |
 
 ```powershell
-$log = "$env:ProgramData\<pkg>\log"
-Get-Content $log -Tail 50                 # 最近 50 行
-Get-Content $log -Wait -Tail 50           # 实时跟踪（等价 journalctl -f）
-Get-Content $log | Select-String '\[!\]|\[CRITICAL\]'   # 只看错误/严重
-Get-WinEvent -ProviderName nssm -MaxEvents 50            # NSSM 服务级事件
+$out = "$env:ProgramData\<pkg>\service.out.log"
+$err = "$env:ProgramData\<pkg>\service.err.log"
+Get-Content $out -Tail 50
+Get-Content $err -Tail 50
+Get-Content $out -Wait -Tail 50           # 实时跟踪（等价 journalctl -f）
+Get-Content $err | Select-String '\[!\]|\[CRITICAL\]'
+Get-WinEvent -ProviderName nssm -MaxEvents 50
 ```
 
 日志级别前缀：`[IMPORTANT] [+] [-] [*] [!] [CRITICAL]`。

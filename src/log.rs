@@ -112,12 +112,14 @@ enum LogMode {
 }
 
 impl LogMode {
-    /// Parse `NEXUSNET_LOG_MODE`; unset or unknown values fall back to
-    /// [`LogMode::File`].
+    /// Parse `NEXUSNET_LOG_MODE`; unset values fall back to journald when the
+    /// process is managed by systemd, otherwise to [`LogMode::File`].
     fn from_env() -> Self {
         match std::env::var("NEXUSNET_LOG_MODE").as_deref() {
             Ok(v) if v.eq_ignore_ascii_case("journald") => Self::Journald,
             Ok(v) if v.eq_ignore_ascii_case("nssm") => Self::Nssm,
+            Ok(v) if v.eq_ignore_ascii_case("file") => Self::File,
+            _ if std::env::var_os("JOURNAL_STREAM").is_some() => Self::Journald,
             _ => Self::File,
         }
     }
