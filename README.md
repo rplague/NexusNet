@@ -4,7 +4,6 @@
 
 NexusNet joins a machine to a decentralized P2P network: Kademlia DHT for discovery and service registration, WebSocket transport, NAT traversal through Circuit Relay v2, and a small sidecar protocol so the business process can stay in any language.
 
-It is the networking layer of the OAHD project, packaged as a reusable binary and Rust library.
 
 [Why](#why-nexusnet) · [Quickstart](#quickstart) · [Architecture](#architecture) · [Features](#features) · [Compatibility](#compatibility) · [Documentation](#documentation)
 
@@ -132,6 +131,8 @@ NexusNet is at **0.6.2-11020** and roughly **6/10** completeness. Treat the inte
 - **Toolchain.** `edition = "2024"` requires Rust 1.85+.
 
 ## Documentation
+
+Every document under `docs/` is bilingual; each one starts with 中文 / English links.
 
 - [Architecture and internals](./docs/architecture.md)
 - [Service registry state machine](./docs/service-registry.md)
