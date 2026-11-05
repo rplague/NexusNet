@@ -1,28 +1,64 @@
 # NexusNet
 
-**OAHD 计划的核心网络层** — 基于 libp2p 的去中心化 P2P 节点网络。
+**A language-agnostic libp2p networking layer for services that need to find and call each other without a central server.**
 
-NexusNet 将一台机器接入 P2P 覆盖网络，通过 Kademlia DHT 实现节点自动发现与服务注册查询；利用边车（sidecar）模式，将远程服务请求经 TCP 转发到本地业务进程，业务端语言无关。
+NexusNet joins a machine to a decentralized P2P network: Kademlia DHT for discovery and service registration, WebSocket transport, NAT traversal through Circuit Relay v2, and a small sidecar protocol so the business process can stay in any language.
 
-## 架构总览
+It is the networking layer of the OAHD project, packaged as a reusable binary and Rust library.
+
+[Why](#why-nexusnet) · [Quickstart](#quickstart) · [Architecture](#architecture) · [Features](#features) · [Compatibility](#compatibility) · [Documentation](#documentation)
+
+## Why NexusNet
+
+- **No central directory.** Nodes discover each other through a Kademlia DHT; service providers publish provider records and callers resolve them at call time.
+- **Backend stays yours.** NexusNet runs as a sidecar and talks to a local process over a persistent TCP connection using a small CBOR protocol. The backend can be Go, Python, Rust, or anything that can frame CBOR.
+- **Works without a public IP.** Circuit Relay v2 lets single-stack or NATed nodes join and serve traffic through a dual-stack bootstrap node.
+- **Security is built in, not bolted on.** Optional COSE_Sign1 service authorization and hybrid post-quantum encryption (ML-KEM-768 + X25519, optional ML-DSA-65 identity).
+- **Operable.** Native Debian package with systemd and a setup wizard, plus a Windows service installer.
+
+## Quickstart
+
+Requires Rust 1.85 or newer (`edition = "2024"`). `rust-toolchain.toml` pins a stable toolchain with `rustfmt` and `clippy`.
+
+```bash
+git clone https://git.oahd.cn/git/rplague/NexusNet.git
+cd NexusNet
+
+# one node, prints its PeerId, runs until Ctrl-C
+cargo run --example basic_node
+
+# two nodes in one process: a provider with an echo backend and a caller
+cargo run --example two_nodes
+```
+
+The examples use loopback addresses and temporary directories, so they do not need a public IP or any global configuration. `two_nodes` prints the provider PeerId, the caller PeerId, and the echoed payload.
+
+To run the daemon itself:
+
+```bash
+cargo run
+```
+
+On first run it creates `./config.toml` and `./keypair.bin` in the working directory. Environment variables (`NEXUSNET_CONFIG_PATH`, `NEXUSNET_KEYPAIR_PATH`, `NEXUSNET_LOG_PATH`, `NEXUSNET_LOG_MODE`) let a host relocate them.
+
+## Architecture
 
 ```mermaid
 graph TD
-    subgraph N["NexusNet 节点"]
-        subgraph SW["网络层 (Swarm)"]
-            PING["Ping<br/>保活检测"]
-            ID["Identify<br/>协议/版本握手"]
-            KAD["Kademlia<br/>DHT 路由与存储"]
-            RR["Request-Response<br/>CBOR 服务调用"]
+    subgraph N["NexusNet node"]
+        subgraph SW["Network layer (Swarm)"]
+            PING["Ping"]
+            ID["Identify"]
+            KAD["Kademlia DHT"]
+            RR["Request-Response (CBOR)"]
         end
-
-        NC["NodeController<br/>tokio::select! 事件循环"]
-        SD["ServiceDispatcher<br/>UUID 帧协议 · 30s 超时 · 控制指令"]
+        NC["NodeController<br/>tokio::select! event loop"]
+        SD["ServiceDispatcher<br/>UUID frames · timeouts · control ops"]
     end
 
-    CLI["CLI 边车 :5014"]
-    OCR["OCR 服务 :5013"]
-    MORE["... 其他后端"]
+    CLI["CLI sidecar :5014"]
+    OCR["OCR service :5013"]
+    MORE["... other backends"]
 
     PING --> NC
     ID --> NC
@@ -30,381 +66,87 @@ graph TD
     RR --> NC
     NC -->|inbound_req_tx| SD
     SD -->|cmd_tx| NC
-    SD -->|TCP UUID 帧| CLI
-    SD -->|TCP UUID 帧| OCR
-    SD -->|TCP UUID 帧| MORE
+    SD -->|TCP UUID frames| CLI
+    SD -->|TCP UUID frames| OCR
+    SD -->|TCP UUID frames| MORE
 ```
 
-### 微内核 + 边车
+The node is a microkernel plus sidecars:
 
-- **NodeController** — 单一异步事件循环，集成所有 libp2p 事件处理（Ping/Identify/Kademlia/Request-Response）和后端命令路由。
-- **ServiceDispatcher** — 独立后台任务。节点启动时主动连接所有配置的本地后端，断线后按 1–60 秒指数退避重连，维持持久 TCP 连接。P2P 入站请求经 `inbound_req_tx` 转发到此处，再由对应后端任务通过 UUID 帧协议发送给后端进程，等待响应后返回。
-- **后端透明** — 后端只需要理解 UUID 帧协议即可接入，语言/框架无关。后端也可主动发起控制指令。
-- **CBOR 协议** — P2P 层使用 libp2p CBOR 协议，`Request { service, payload }` / `Response { success, data }`。
-- **背压** — 鉴权队列（4×32）、dispatcher 入站队列（256）、控制队列（128）、每后端命令/事件队列（各 64）均有界；过载时请求立即返回 `authentication overloaded` / `backend overloaded`，不会无限堆积。
+- **`NodeController`** owns one async event loop that handles Ping, Identify, Kademlia, request-response and backend control commands.
+- **`ServiceDispatcher`** keeps persistent TCP connections to every configured local backend, reconnects with exponential backoff, and forwards inbound P2P requests to the matching backend.
+- **Service registry** runs as a separate actor: announcements, withdrawals and the `/oahd/service/types` lease are reconciled without blocking the controller.
+- **Backpressure everywhere.** Bounded queues mean overload returns an explicit error instead of growing without limit. Sizes and details are in [docs/architecture.md](./docs/architecture.md).
 
-## 快速开始
+## Features
 
-### 编译与运行（开发）
-
-```bash
-cargo run
-```
-
-未设置任何环境变量时，运行回退当前目录，首次运行自动生成 `./config.toml` 和 `./keypair.bin`。
-
-### 配置
-
-监听端口、bootstrap 节点等均通过 `config.toml` 配置。正常服务不解析命令行参数；
-安装器使用内部的 `--write-config` / `--defaults` / `--check-config` 模式生成和检查配置。
-
-## 部署（systemd / deb）
-
-生产环境以原生的 Debian 包（`.deb`）分发，由 `dpkg`/`apt` 管理生命周期：
-
-```bash
-apt install -y ./nexusnet_<version>_amd64.deb
-```
-
-安装时通过 whiptail 向导配置节点；安装后服务按向导结果启用。
-`postinst` 创建专用用户 `nexusnet`、目录并写入 `/etc/nexusnet/config.toml`。
-配置与数据落位到标准目录：
-
-| 文件 | 路径 | 说明 |
+| Capability | What you get | Details |
 |---|---|---|
-| 配置 | `/etc/nexusnet/config.toml` | whiptail 向导生成；跳过向导时保留现有配置或生成默认配置 |
-| 节点身份 | `/var/lib/nexusnet/keypair.bin` | 不可丢失，升级/卸载保留 |
-| 日志 | journald | systemd 采集/轮转/压缩/保留 |
+| Discovery | Kademlia provider records, RTT-ranked provider selection | [docs/service-registry.md](./docs/service-registry.md) |
+| Service registry | Type index with leases, automatic re-announce, relay gating | [docs/service-registry.md](./docs/service-registry.md) |
+| Backend protocol | Persistent TCP, CBOR messages, UUID correlation, 30 s default timeout | [docs/sidecar.cddl](./docs/sidecar.cddl) |
+| NAT traversal | Circuit Relay v2, reservations, relay-aware announcements | [docs/nat-relay.md](./docs/nat-relay.md) |
+| Authorization | COSE_Sign1 whitelists, TUF-lite rollback/freeze/mix-and-match checks | [docs/auth.md](./docs/auth.md) |
+| Post-quantum | ML-KEM-768 + X25519 hybrid KEM, ChaCha20-Poly1305, optional ML-DSA-65 | [docs/architecture.md](./docs/architecture.md#post-quantum-layer) |
+| Transport | WebSocket over HTTP, TLS with Noise fallback, Yamux | this file |
+| Packaging | Debian package + systemd + whiptail wizard, Windows service installer | [deploy/README.md](./deploy/README.md) |
 
-查看运行状态：`systemctl status nexusnet`；日志：`journalctl -u nexusnet -f`。
+## Configuration
 
-Windows 侧提供带配置向导的 NSIS 安装器与便携 zip（NSSM 托管为系统服务，
-以虚拟账号 `NT SERVICE\nexusnet` 运行），构建与安装见 [deploy/README.md](./deploy/README.md)。
-
-构建、升级、卸载等详见 [deploy/README.md](./deploy/README.md)。
-
-## 配置（config.toml）
+`config.toml` is TOML. Missing fields are filled with defaults and written back atomically on startup.
 
 ```toml
 [node]
-name = "未设置的p2p节点"
-description = "无详细描述"
-allow_bootstrap = true
-accept_bootstrap_providers = false   # 是否自动采纳 Identify 发现的 bootstrap 节点
+name = "my-node"
+description = "my service node"
 
 [network]
-# 启动时会探测公网地址并写回；ipv4_enabled/ipv6_enabled 随之更新
-ipv4_enabled = false
-ipv4_address = "x.x.x.x"       # 可选，但会被自动探测覆盖
-ipv6_enabled = false
-ipv6_address = "x:x::x"         # 可选，但会被自动探测覆盖
-port = 5000                     # WebSocket TCP 端口
-
-[services.ping]
-enabled = true
-interval_secs = 15
-with_timeout = 10
-max_failures = 2
-
-[services.kademlia]
-enabled = true
-record_ttl_seconds = 3600
-provider_record_ttl_seconds = 3600       # provider 记录 TTL；必须 >= 2 * 发布间隔
-provider_publication_interval_seconds = 1800  # 活跃 provider 重发间隔
-replication_factor = 20
-query_timeout_seconds = 60
-bootstrap_nodes = []
-
-[services.dispatcher]
-enabled = true
-query_timeout_secs = 60
-types_sync_secs = 300
-max_inflight_dht = 4             # 1..=16，DHT 控制命令并发上限
-max_request_bytes = 16777216     # P2P 服务请求上限，默认 16 MiB，范围 1..=64 MiB
-max_response_bytes = 16777216    # P2P 服务响应上限，默认 16 MiB，范围 1..=64 MiB
+ipv4_enabled = true
+port = 5000
 
 [[services.dispatcher.local_services]]
 name = "cmd"
 port = 5014
 require_auth = false
-
-[services.registry]
-max_inflight_dht = 4             # 1..=16，registry DHT job 并发上限
-type_ttl_secs = 1800             # 服务类型租约；必须 > 2 * types_sync_secs
-
-[services.relay]
-retry_interval_secs = 60
-max_failures = 3
-
-[compat]
-max_record_bytes = 14336     # 默认适配旧版 16 KiB Kademlia 包
-
-[crypto]
-pq_transport_enabled = true
-pq_identity_enabled = true
-pq_required = false
-
-[auth]
-network = "none"                 # "none" = 不鉴权；启用时改为 myorg
-
-# [auth.networks.myorg]          # 每个鉴权网络的信任锚
-# authority = "<base64 ed25519 公钥>"
 ```
 
-可选字段省略即取默认值；`local_services[].name` 与 `port` 必填。节点固定连接
-`127.0.0.1:<port>`，不支持自定义 host。
+The node always connects to `127.0.0.1:<port>` for local backends. Bootstrap addresses must use the WebSocket form, for example `/ip6/2001:db8::1/tcp/5000/ws/p2p/<PeerId>`.
 
-`services.dispatcher.query_timeout_secs` 是控制指令的基础超时；涉及 DHT 查询的命令会按
-实际需要自动延长。
+## Backend protocol
 
-`services.dispatcher.max_request_bytes` / `max_response_bytes` 限制单个 P2P 服务报文
-（CBOR 编码后）的大小，默认 16 MiB。启用 PQ 时，请求还会附带 KEM/nonce/可选身份签名，
-约增加 8 KiB 开销；接近上限时需适当调大。发送端会在本地先检查大小并直接返回明确错误；
-两端都需升级并配置足够的上限，旧版本对端仍按 1 MiB 拒绝大请求。
-
-启动读取配置时，文件中缺失的字段会自动补全并原子写回；已有值、未知字段、注释和数组表
-条目保持不变。补全写回失败会记录 Critical 并退出。注意 `network` 公网 IP 自动更新仍会
-按规范格式整体重写配置文件。
-
-配置路径由环境变量决定（见 `src/paths.rs`）：`NEXUSNET_CONFIG_PATH`、
-`NEXUSNET_KEYPAIR_PATH`、`NEXUSNET_LOG_PATH`（均为目录；`NEXUSNET_LOG_PATH` 仅文件输出
-模式使用，systemd 下日志走 journald）、`NEXUSNET_LOG_MODE`；未设置时回退当前目录。
-
-## 启动流程
-
-```
-main()
-  ├─ 读取 config.toml（损坏/不存在 → 创建默认）
-  ├─ 更新公网 IP 到配置
-  ├─ 加载/生成 keypair.bin（ED25519 节点身份）
-  ├─ 尝试加载 keypair.pq.bin（PQ 密钥，可选，不存在则跳过）
-  ├─ Network::start() → 构建 Swarm 并启动 SwarmActor
-  ├─ 拨号所有 bootstrap 节点
-  ├─ 启动 ServiceDispatcher（后台 tokio::spawn）
-  ├─ 启动鉴权 worker 池（4 个 worker，每个队列 32）
-   └─ NodeController::run()（主协程）
-        tokio::select! {
-            event_rx          → 网络事件
-            to_controller_rx  → 后端命令/就绪状态
-            service_tick      → 到期撤销服务宣告（1s）
-            relay_tick        → 中继补约
-            shutdown          → SIGTERM/Ctrl-C 优雅退出
-        }
-```
-
-## 模块清单
-
-| 模块 | 职责 |
-|------|------|
-| **main** | 程序入口与启动编排 |
-| **paths** | 统一路径解析（环境变量锚定，本地回退当前目录） |
-| **node_controller** | 事件循环统一处理、服务自动宣告（后端就绪门控）、处理远程查询和内部命令 |
-| **service_dispatcher** | 后端连接管理与就绪状态上报 |
-| **network** | 网络层门面：身份、地址探测、行为装配、Swarm Actor（`network/identity`、`network/addr`、`network/behaviour`、`network/builder`、`network/actor`） |
-| **config** | 提供ConfigHandle |
-| **dht_cache** | read-through + 每 key 单飞的 DHT 读缓存 |
-| **cose** | 共享的 COSE_Sign1 EdDSA 签名/验签 |
-| **limits** | DHT 记录与 Kademlia 包大小上限 |
-| **service_protocol** | 提供通讯协议 |
-| **auth** | 鉴权记录层：COSE_Sign1 验签、TUF-lite 一致性防护、内存缓存与判定 |
-| **log** | 自动检测输出模式：systemd 下交 journald，其余终端+文件轮转 |
-
-## 后端协议（TCP，v2）
-
-NexusNet 与后端进程之间使用**持久 TCP 连接**，由节点主动发起连接。协议为 **CBOR + CDDL** 契约，规范见 [docs/sidecar.cddl](./docs/sidecar.cddl)。
-
-### 帧
+The node and backend exchange length-prefixed CBOR over a persistent TCP connection:
 
 ```text
 u32_be(len) || cbor(message)      # len <= 16 MiB
 ```
 
-连接建立后双方首帧必须是 `hello { version }`，版本不兼容则断开。
+The first frame in both directions is `hello { version }`. Requests use `request { id, service, payload }` and replies use `reply { id, ok, result?, error? }`; correlation ids are UUIDs. The full CDDL contract is in [docs/sidecar.cddl](./docs/sidecar.cddl).
 
-### 消息
+## Compatibility
 
-判别字段为文本 `t`：
+NexusNet is at **0.6.2-11020** and roughly **6/10** completeness. Treat the interfaces as stabilizing, not frozen.
 
-| `t` | 方向 | 说明 |
-|---|---|---|
-| `hello` | 双向 | 握手与版本协商 |
-| `request` | 节点→后端 | 转发入站服务请求 `{ id, service, payload }` |
-| `reply` | 双向 | 关联回复 `{ id, ok, result?, error? }` |
-| `list_services` / `discover_providers` / `query_public_ip` / `whoami` / `reconnect_bootstrap` / `reannounce_services` / `reload_config` / `refresh_cache` / `relay_status` / `pq_status` / `auth_status` / `query_key` / `add_key` / `remove_key` / `service_request` / `service_request_to` | 后端→节点 | 控制指令，节点以 `reply` 应答 |
+- **WebSocket-only since 0.6.x.** Raw TCP peers from older versions cannot connect; upgrade every node together.
+- **`/oahd/service/types` changed format without a version bump.** New nodes read both formats but always write the tuple form. Stop old writers before upgrading the rest of the network; there is no rolling compatibility.
+- **Record size limit.** `compat.max_record_bytes` defaults to 14 KiB so records still fit older 16 KiB Kademlia packets. Raise it only after every node is upgraded.
+- **Toolchain.** `edition = "2024"` requires Rust 1.85+.
 
-- 关联 id 为 UUID；`reply.result` 是该 op 自定的 **CBOR** 字节。
-- `add_key` 的 `value` 为 `bstr`，二进制安全（无需 base64）。
-- `remove_key`：撤销 provider 宣告 / 删除本地记录，`{ key, ? providing=true, ? record=false }`。两项均为**本地操作**——远端 provider 记录需待对端 provider TTL（`services.kademlia.provider_record_ttl_seconds`，默认 3600s）过期才消失，远端 value 副本按 `services.kademlia.record_ttl_seconds` 过期；撤销只影响发现，不阻止直接 `service_request_to` 调用。
-- `add_key` / `remove_key` 仅允许 `/oahd/service/<name>` 与 `/oahd/auth/...`；`/oahd/service/types` 和 `/oahd/bootstrap` 由节点自身维护，后端不可写。
-- `refresh_cache`：清空应用层 DHT 缓存，并删除 Kademlia 本地 store 中非本节点发布的副本；本节点自己发布的记录保留。
-- 默认超时 30 秒，超时以 `error{code:"timeout"}` 应答。
+## Documentation
 
-## P2P 服务调用流程
+- [Architecture and internals](./docs/architecture.md)
+- [Service registry state machine](./docs/service-registry.md)
+- [NAT and relay behavior](./docs/nat-relay.md)
+- [Authorization contract](./docs/auth.md)
+- [Sidecar protocol CDDL](./docs/sidecar.cddl)
+- [Deployment and packaging](./deploy/README.md)
+- [中文说明](./README.zh-CN.md)
 
-```text
-后端进程 → 控制消息(service_request, CBOR)
-  → ServiceDispatcher.backend_read_loop
-  → ControlRequest(cmd_tx) → NodeController.handle_command()
-  → discover_providers(service) → DHT get_providers
-  → RTT 排序选最优点
-  → send_request_to_peer(peer, service, payload)
-  → 无已知地址时 get_closest_peers(peer) 解析 relay 地址后重试
-  → CBOR Request-Response (libp2p)
-  → 远程 NodeController → InboundServiceRequest(to_dispatcher_tx)
-  → 远程 ServiceDispatcher → backend_task
-  → request 帧 → 远程后端进程
-  → reply 沿原路返回
-```
+## Contributing and security
 
-## 服务注册与发现
+See [CONTRIBUTING.md](./CONTRIBUTING.md) for the local development workflow and [SECURITY.md](./SECURITY.md) for how security issues are handled and disclosed.
 
-- 本地服务列表由 `config.services.dispatcher.local_services` 定义
-- `ServiceDispatcher` 持有唯一一份 `backend_ready`（后端 `hello` 握手成功），并通过 watch 发布；ServiceRegistry 订阅该状态，不再由 NodeController 转发
-- 服务注册、撤销和类型索引 reconcile 在独立的异步 registry actor 中执行；NodeController 不再等待这些 DHT 操作。并发由 `services.registry.max_inflight_dht` 控制（默认 4，范围 1–16）
-- 仅当 DHT bootstrap 完成**且**对应后端 TCP 握手（`hello`）成功后，才自动调用 `start_providing`，key 为 `/oahd/service/<name>`——避免提前宣告尚不可用的服务
-- 后端连接断开后进入 3 秒宽限期（由 1 秒 tick 检查，实际撤销窗口约 3–4 秒）：期间重连则不撤销；超时仍未恢复则 `stop_providing` 撤销宣告
-- 撤销为本地行为，远端 provider 记录需待 provider TTL 过期才会消失
-- provider 记录 TTL 由 `services.kademlia.provider_record_ttl_seconds`（默认 3600s）控制，活跃 provider 按 `services.kademlia.provider_publication_interval_seconds`（默认 1800s）周期重发；停止或崩溃的 provider 最迟约一个 TTL 后从 `discover_providers` 中消失。两者必须大于 0，且 TTL 不能小于 2 倍发布间隔
-- 双栈节点在 `allow_bootstrap = true` 时声明为 `/oahd/bootstrap` provider；其他节点仅在 `accept_bootstrap_providers = true` 时才会把 Identify 发现的 provider 自动写入 bootstrap 列表
-- Kademlia 成员准入：启动时把配置 bootstrap 地址中的 PeerId 直接视为已识别；其他 peer 只有 Identify 的 `agent_version` 以 `/nexusnet` 开头才加入路由表。进入路由表的未识别 PeerId 会被移除；Kademlia 查询仍可能短暂拨号，但不会保留。
-- 同步 `/oahd/service/types` 全局服务类型记录（**带租约、会清理**）：DHT 值为无版本 tuple 数组 `[["ocr",1700003600], ...]`。本地按 `name -> expires_at` 维护，周期（`services.dispatcher.types_sync_secs`，默认 300s）从 DHT 对端读取（绕过本地 store 副本与缓存，避免自我遮蔽）后合并未过期条目并取 `max(expires_at)`，删除已过期条目并写回；本地 `announced` 服务每次 reconcile 续期为 `now + services.registry.type_ttl_secs`（默认 1800s），没有本地 provider 的节点不能延长远端过期时间。读取/写入由 registry actor 异步完成，单飞并带 dirty 重跑
-- `/oahd/service/types` 采用**无版本格式变更**：旧节点写入的 `["ocr","cmd"]` 仍可被新节点读取，旧字符串条目获得一次迁移期过期时间（`now + type_ttl_secs`），随后必须由本地 provider 续期。新节点一律写回 tuple 格式；本版本**不做旧节点滚动兼容**，升级时应先停止旧节点写入，再升级全部节点
-- `compat.max_record_bytes` 默认 14 KiB，确保旧版 Kademlia 16 KiB 包能承载 DHT 写入；超过上限的 auth/service 写入直接拒绝。全量升级后再调大。
-- `BootstrapCompleted` / `reannounce_services` 会清空本地 `announced` 状态并重新宣告，避免 DHT 重建后停留在旧状态。
-- `list_services` → 立即返回本地快照，并在后台触发一次类型索引刷新（最终一致）
-- `reannounce_services` → 清空本地 `announced` 缓存并重新 `start_providing`，立即返回 accepted
-- DHT 控制命令（`query_key`、`discover_providers`、`service_request`、`service_request_to`，以及 `providing=false` 的 `add_key`）在独立有界 worker 中执行；并发由 `services.dispatcher.max_inflight_dht` 控制（默认 4，范围 1–16）。`whoami`/`relay_status`/`pq_status`/`auth_status`/`list_services` 不等待 DHT
-- `add_key` 的 `providing=true` 由 NodeController 直接调用 `start_providing`；ServiceRegistry 仍独立维护自动宣告状态
-- 本地调用优先：`service_request` 命中已就绪的本地服务时直接走 `ServiceDispatcher`，不查 DHT、不使用 PQ、不经过 AuthGate；`service_request_to(self, service)` 同样走本地。本地未就绪时，`service_request` 回退远端，`service_request_to(self)` 返回 `backend_not_ready`
-- `discover_providers` → DHT get_providers 获取提供者列表
-- `service_request` → 本地就绪优先；否则查询 provider，RTT 排序选优；直连失败时通过 `get_closest_peers(peer)` 获取 provider 的 relay 地址后重试
+## License
 
-## 无公网 IP 接入（中继）
+GNU General Public License v3.0. See [LICENSE](./LICENSE).
 
-单栈或没有公网地址的节点仍可加入网络并提供服务，但必须有至少一台**双栈公网节点**作为 bootstrap/relay。
-
-- 公网 bootstrap 必须是双栈节点；双栈节点会自动开启 relay server（最多 16 个预约）。
-- NAT 节点把该 bootstrap 写入 `services.kademlia.bootstrap_nodes`，无需公网 IP；地址必须带 `/ws`，例如 `/ip6/.../tcp/5000/ws/p2p/<PeerId>`。
-- NAT 节点在获得第一个 relay circuit 前**不会宣告服务**；第一个 relay 就绪后才 `start_providing`。
-- 后续 relay 增加/失效只更新本地地址状态；只要还有 active relay，服务保持宣告。
-- `active_relays` 降到 0 时，NAT 节点执行 `stop_providing`，等新 relay 就绪后重新宣告。
-- 调用方通过 `get_providers` 取得 provider 的 PeerId，再用 `get_closest_peers(peer)` 取得 `PeerInfo.addrs`（包含 `<relay>/p2p-circuit`），随后经中继调用。
-- relay server 的 `max_circuit_bytes` 自动等于本节点 `max_request_bytes + max_response_bytes`；bootstrap 的这两个上限应不小于客户端，否则大报文仍会被中继拒绝。
-
-`relay_status` 返回：
-
-| 字段 | 含义 |
-|---|---|
-| `need_relay` | 单栈或无公网地址时为 true |
-| `reachability` | `public` / `relay` / `none` |
-| `active_relays` | 已就绪的 relay PeerId |
-| `pending_relays` | 预约中的 relay PeerId |
-
-完整流程与失效语义见 [docs/nat-relay.md](./docs/nat-relay.md)。
-
-## WebSocket-only 传输
-
-本版本使用 WebSocket over HTTP 作为唯一传输：
-
-```text
-TCP → HTTP WebSocket → multistream-select → TLS/Noise → Yamux → 应用协议
-```
-
-- DPI/防火墙看到的是普通 HTTP WebSocket，而不是明文 multistream-select；
-- `network.port` 是 WebSocket 的 TCP 端口，默认 `5000`；
-- bootstrap 地址必须带 `/ws`：
-  `/ip6/.../tcp/5000/ws/p2p/<PeerId>`；
-- relay 预约、provider 发现和服务调用全部经 WebSocket；
-- 内层仍优先 TLS，Noise 作为兼容回退；
-- PeerId、keypair、服务协议、Kademlia、relay 和 PQ 均不变。
-
-这是**破坏性变更**：新节点只支持 WebSocket，旧版 raw TCP 节点无法连接。  
-所有节点必须升级到本版本。
-
-如果网络连明文 WebSocket 也阻断，需要 WSS（443 反代 + 证书），当前版本不包含。
-
-## DHT 读缓存
-
-应用层 DHT 读缓存只做 read-through + 每 key 单飞刷新：
-
-- 有上一次结果时立即返回，同时如果该 key 没有正在进行的查询，就在后台启动一次 DHT 查询。
-- 后台查询完成后覆盖缓存；成功查到“不存在”也会覆盖为空结果。
-- 冷启动没有旧结果时，等待第一次查询完成，并返回其结果或真实错误。
-- 后台刷新失败时保留旧结果，只记录错误；下一次查询会再次触发刷新。
-- 没有 fresh/stale 窗口、全局 permit、缓存层 timeout 或失败退避。
-- auth 缓存仍由 `AuthGate` 检查 `expires_at` 与 `version`；文档过期或 rollback 仍然拒绝。
-- `/oahd/service/types` 由服务类型租约逻辑直接读写，不进入这个缓存。
-
-`refresh_cache` 清空上述应用缓存，并删除 Kademlia 本地 store 中非本节点发布的副本。
-
-## 抗量子加密
-
-应用层混合 PQ 加密，用于服务请求/响应的机密性。关闭时协议不注册、行为与旧版本完全一致。
-
-- **算法**：ML-KEM-768+ X25519 混合 KEM、ChaCha20-Poly1305 AEAD、可选 ML-DSA-65（FIPS 204）签名。
-- **协议**：`/oahd/service_req/2.0.0`与 `/oahd/pq_identity/1.0.0`，仅在启用时注册。
-- **流程**：请求方 encaps 到响应方 KEM 公钥，响应方 decaps 后双方共享同一密钥，响应复用该密钥加密——无需第二次 KEM，也不在请求里携带请求方公钥。
-- **回退**：仅当已确认对端不支持 PQ 时回退明文 `/oahd/service_req/1.0.0`；对端能力未知或身份尚未就绪时返回可重试错误，不会静默降级。`crypto.pq_required = true` 则拒绝非 PQ 对端。
-- **身份**：`pq_identity_enabled` 要求入站请求携带 ML-DSA 签名，并把签名身份绑定到传输层 PeerId；该选项需要 `pq_transport_enabled = true`。
-- **密钥**：`keypair.pq.bin`。
-- `@pq_status` → 查看启用状态。
-
-| 配置 | 含义 |
-|---|---|
-| `crypto.pq_transport_enabled` | 启用加密服务调用 |
-| `crypto.pq_identity_enabled` | 要求并校验 ML-DSA 签名（需启用 transport） |
-| `crypto.pq_required` | 强制 PQ，拒绝非 PQ 对端 |
-
-## 鉴权
-
-可选的服务级访问控制。节点加入一个**鉴权网络**，权威方（边车）把签名白名单发布到 DHT；
-节点收到服务请求时按「DHT 为准 + fail-closed」判定，通过才转发给本地后端。
-
-- **信任模型**：记录由权威 ed25519 私钥签名，DHT 仅作传输；接收方验签后才信任（防伪造、防回滚与重放）。
-- **记录**：`/oahd/auth/<net_hash>/service`（索引）与 `/oahd/auth/<net_hash>/<service>`（白名单），
-  值为 COSE_Sign1；`net_hash = base64url_nopad(SHA-256(network))`。
-- **服务开关**：`services.dispatcher.local_services[].require_auth`。
-- **判定**：鉴权关闭或服务未要求鉴权 → 放行；索引/白名单缺失、过期、验签失败 → 拒绝；
-  服务不在索引 → 本次放行并记录 Warning，不修改本地 `require_auth`；索引恢复后自动重新生效。
-- **边车发布**：签名记录经本地后端控制消息 `add_key { key, value }` 发布（`value` 为 `bstr`，二进制安全）；
-  在 `expires_at` 前重发续期。
-- **状态查询**：`auth_status`。
-- **并发**：鉴权查询在独立 worker 池中执行，不阻塞 NodeController；队列满时入站请求立即返回 `authentication overloaded`。
-
-完整记录格式、发布流程与验证算法见 [docs/auth.md](./docs/auth.md)。
-
-| 配置 | 含义 |
-|---|---|
-| `auth.network` | 鉴权网络名；`"none"` 表示不鉴权 |
-| `auth.networks.<name>.authority` | 该网络权威 ed25519 公钥（base64） |
-| `require_auth` | 单个本地服务是否要求鉴权 |
-
-鉴权记录通过统一缓存读取：有旧结果立即返回并后台刷新；冷启动等待第一次查询；`expires_at` 过期或 rollback 仍拒绝。auth 写入使用 `Quorum::One`，并受 `compat.max_record_bytes` 限制，旧节点仍可存储与验证小文档。
-
-## 日志
-
-输出模式**自动检测**：
-
-- **systemd**：只写 stdout/stderr，**不写文件**；轮转、压缩、保留、检索全部交给 journald。输出为**单行**并带 syslog 级别前缀，可用 `journalctl -u nexusnet -p err` 过滤。
-- **其他**：终端 + 文本文件双输出，文件 10MB 触发 gz 轮转。
-- 等级：`Critical | Error | Warning | Important | Preset | Debug`；非 TTY 自动去彩色。
-
-## 节点身份
-
-- **ED25519 主身份** — `keypair.bin`，Protobuf 编码，派生 `PeerId`
-- **PQ 辅助密钥**— `keypair.pq.bin`
-- **keypair.bin 不可丢失** — 丢失后节点身份变更
-
-## 开发状态
-
-当前版本：**0.6.2-11020** — 完成度 **6/10**
-
-## 许可
-
-GNU General Public License v3.0
-
-本程序是自由软件：你可以再分发之和/或依照由自由软件基金会发布的 GNU 通用公共许可证修改之，无论是版本 3 许可证，还是（按你的决定）任何以后版。
-
-本程序分发时希望它有用，但**不提供任何保证**；甚至不保证适销性或特定用途的适用性。详情请参见 GNU General Public License。
-
-完整的许可证文本见 [LICENSE](./LICENSE) 文件。
+This program is distributed in the hope that it will be useful, but **without any warranty**; without even the implied warranty of merchantability or fitness for a particular purpose.
