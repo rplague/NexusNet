@@ -31,7 +31,14 @@ jobs:
     needs: [test]
     steps:
       - name: 格式化检查 | Check formatting
-        run: cargo fmt -- --check
+        run: cargo fmt --check
+
+  clippy:
+    runs-on: native
+    needs: [test]
+    steps:
+      - name: 静态检查 | Run clippy
+        run: cargo clippy --all-targets -- -D warnings
 
   build-linux:
     runs-on: native
