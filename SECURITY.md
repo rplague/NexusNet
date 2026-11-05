@@ -36,8 +36,7 @@ A useful report contains:
 - A minimal reproduction or a clear description of the attack path.
 - The impact you believe the issue has.
 
-Never include `keypair.bin`, `keypair.pq.bin`, authority private keys or other
-secret material in a report.
+Never include any secret material in a report!
 
 ## Scope
 
