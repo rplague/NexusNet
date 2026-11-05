@@ -1,4 +1,4 @@
-; NexusNet 节点 <-> 边车/后端 协议 v2（CBOR 契约）
+; NexusNet 边车协议 v2（节点 <-> 后端，CBOR 契约）
 ;
 ; 线上格式:  u32_be(len) || cbor(message)      len <= 16 MiB
 ; 连接建立后双方首帧必须是 hello，据此协商版本。

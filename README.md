@@ -1,6 +1,6 @@
 # NexusNet
 
-**A language-agnostic libp2p networking layer for services that need to find and call each other without a central server.**
+A language-agnostic libp2p networking layer for services that need to find and call each other without a central server.
 
 NexusNet joins a machine to a decentralized P2P network: Kademlia DHT for discovery and service registration, WebSocket transport, NAT traversal through Circuit Relay v2, and a small sidecar protocol so the business process can stay in any language.
 
@@ -52,10 +52,10 @@ graph TD
             RR["Request-Response (CBOR)"]
         end
         NC["NodeController<br/>tokio::select! event loop"]
-        SD["ServiceDispatcher<br/>UUID frames · timeouts · control ops"]
+        SD["ServiceDispatcher<br/>UUID frames · timeouts · control commands"]
     end
 
-    CLI["CLI sidecar :5014"]
+    CLI["CLI backend :5014"]
     OCR["OCR service :5013"]
     MORE["... other backends"]
 
@@ -70,7 +70,7 @@ graph TD
     SD -->|TCP UUID frames| MORE
 ```
 
-The node is a microkernel plus sidecars:
+The node is a microkernel plus local backends (the sidecar pattern):
 
 - **`NodeController`** owns one async event loop that handles Ping, Identify, Kademlia, request-response and backend control commands.
 - **`ServiceDispatcher`** keeps persistent TCP connections to every configured local backend, reconnects with exponential backoff, and forwards inbound P2P requests to the matching backend.
@@ -83,7 +83,7 @@ The node is a microkernel plus sidecars:
 |---|---|---|
 | Discovery | Kademlia provider records, RTT-ranked provider selection | [docs/service-registry.md](./docs/service-registry.md) |
 | Service registry | Type index with leases, automatic re-announce, relay gating | [docs/service-registry.md](./docs/service-registry.md) |
-| Backend protocol | Persistent TCP, CBOR messages, UUID correlation, 30 s default timeout | [docs/sidecar.cddl](./docs/sidecar.cddl) |
+| Sidecar protocol | Persistent TCP, CBOR messages, UUID correlation, 30 s default timeout | [docs/sidecar.cddl](./docs/sidecar.cddl) |
 | NAT traversal | Circuit Relay v2, reservations, relay-aware announcements | [docs/nat-relay.md](./docs/nat-relay.md) |
 | Authorization | COSE_Sign1 whitelists, TUF-lite rollback/freeze/mix-and-match checks | [docs/auth.md](./docs/auth.md) |
 | Post-quantum | ML-KEM-768 + X25519 hybrid KEM, ChaCha20-Poly1305, optional ML-DSA-65 | [docs/architecture.md](./docs/architecture.md#post-quantum-layer) |
@@ -111,7 +111,7 @@ require_auth = false
 
 The node always connects to `127.0.0.1:<port>` for local backends. Bootstrap addresses must use the WebSocket form, for example `/ip6/2001:db8::1/tcp/5000/ws/p2p/<PeerId>`.
 
-## Backend protocol
+## Sidecar protocol
 
 The node and backend exchange length-prefixed CBOR over a persistent TCP connection:
 

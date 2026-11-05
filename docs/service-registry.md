@@ -1,4 +1,4 @@
-# Service Registry 异步设计 / Service registry asynchronous design
+# 服务注册异步设计 / Service registry asynchronous design
 
 **语言 / Language:** [中文](#中文) · [English](#english)
 
@@ -7,8 +7,8 @@
 
 ### 目标
 
-- NodeController 不等待任何 service-registry DHT 操作。
-- registry actor 不被单个 DHT 查询阻塞；DHT 调用作为受控 job 执行。
+- NodeController 不等待任何服务注册（service registry）DHT 操作。
+- 服务注册 actor（registry actor）不被单个 DHT 查询阻塞；DHT 调用作为受控作业执行。
 - `list_services` 通过 watch 快照立即返回，后台刷新类型索引。
 
 ### 结构
@@ -44,37 +44,37 @@ registry actor 订阅该 watch，用完整集合差分处理就绪/断开，不�
 |---|---|---|
 | `BootstrapCompleted` | controller | 启动 announce 与 reconcile |
 | `Tick` | controller（1s） | 处理到期撤销/重试 |
-| `Reannounce` | 控制命令 | 后台重新调度 |
+| `Reannounce` | 控制指令 | 后台重新调度 |
 | `RefreshTypes` | `list_services` | 后台刷新类型索引 |
 | `Reset` | reload | generation +1，清空临时状态，保留 known_types |
-| `RelayStateChanged` | controller | relay 就绪/失效；控制 announce 门控与撤销 |
+| `RelayStateChanged` | controller | 中继就绪/失效；控制 announce 门控与撤销 |
 
 ### 状态机
 
 `RegistryState::plan(now, slots)` 返回需要启动的 `JobSpec`；
-`RegistryState::apply(result, now)` 处理 job 结果。actor 每次处理命令或结果后调用
+`RegistryState::apply(result, now)` 处理作业结果。actor 每次处理命令或结果后调用
 `plan`。
 
 调度优先级：
 
-1. 到期撤销（含 relay 丢失后的强制撤销）
+1. 到期撤销（含中继丢失后的强制撤销）
 2. 到期 announce 重试
 3. 新 announce
 4. types reconcile
 
-#### relay 门控
+#### 中继门控
 
 - `need_relay = true` 且 `active_relays == 0` 时，不调度任何新 announce。
-- 第一个 relay 就绪：清空 `announced`，重新 `start_providing`。
-- relay 数量变化但仍大于 0：不重新宣告。
-- 最后一个 relay 失效：把已宣告/正在宣告的服务加入强制撤销集合，
-  逐个 `stop_providing`；在 relay 恢复前不再宣告。
+- 第一个中继就绪：清空 `announced`，重新 `start_providing`。
+- 中继数量变化但仍大于 0：不重新宣告。
+- 最后一个中继失效：把已宣告/正在宣告的服务加入强制撤销集合，
+  逐个 `stop_providing`；在中继恢复前不再宣告。
 - `need_relay = false` 的公网双栈节点不受影响。
 
 #### announce
 
 - 成功且后端仍 ready：记入 `announced`。
-- 成功但 relay 已不可用：记入 `announced`，并加入强制撤销集合。
+- 成功但中继已不可用：记入 `announced`，并加入强制撤销集合。
 - 成功但后端已 down：记入 `announced` 并立即调度撤销。
 - 失败且仍 ready：指数退避重试（5s → 60s）。
 - 失败且已 down：不再重试。
@@ -86,7 +86,7 @@ registry actor 订阅该 watch，用完整集合差分处理就绪/断开，不�
 
 #### provider 记录生命周期
 
-- provider 记录由 libp2p Kademlia 的周期性 provider job 维护，TTL 与重发间隔
+- provider 记录由 libp2p Kademlia 的周期性 provider 作业维护，TTL 与重发间隔
   来自 `services.kademlia.provider_record_ttl_seconds`（默认 3600s）和
   `services.kademlia.provider_publication_interval_seconds`（默认 1800s）。
 - 活跃 provider 在 TTL 前按发布间隔重发，不会因记录过期而从
@@ -111,7 +111,7 @@ ReadyToWrite --(plan)--> Writing
 Writing --(result)--> Idle
 ```
 
-- single-flight；`reconcile_dirty` 在当前链结束后触发立即重跑。
+- 单飞（single-flight）；`reconcile_dirty` 在当前链结束后触发立即重跑。
 - 失败后 30s 重试。
 - `known_types` 为 `BTreeMap<String, u64>`（服务名 -> `expires_at`），上限
   `MAX_TYPES`。
@@ -138,11 +138,11 @@ provider 续期。新节点一律写回 tuple 格式。
 
 ### 并发与背压
 
-- `services.registry.max_inflight_dht` 控制同时执行的 registry DHT job，
+- `services.registry.max_inflight_dht` 控制同时执行的 registry DHT 作业，
   默认 4，范围 1–16。
 - 命令队列 256；状态类命令等待入队（不等待 DHT），
   `Tick`/`RefreshTypes`/`Reannounce` 在队列满时丢弃或返回 busy。
-- reload 时 `generation` 使旧 job 结果失效；`JoinSet` 在 shutdown 时排空。
+- reload 时 `generation` 使旧作业结果失效；`JoinSet` 在 shutdown 时排空。
 
 ### 快照
 

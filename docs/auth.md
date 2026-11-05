@@ -5,12 +5,12 @@
 <a id="中文"></a>
 ## 中文
 
-本文档定义 NexusNet 鉴权网络的记录格式、发布流程与验证算法，供边车（权限控制程序）与任意语言的实现者参考。
+本文档定义 NexusNet 鉴权（authorization）网络的记录格式、发布流程与验证算法，供后端（权限控制程序）与任意语言的实现者参考。
 
 ### 1. 信任模型
 
 - DHT 是**不可信、可覆盖、可重放**的存储：任何节点都能 `put_record`。
-- 信任来自**权威 ed25519 签名**：记录由持权威私钥者签发，接收方用配置中固定的权威公钥验签。
+- 信任来自**权威方 ed25519 签名**：记录由持权威私钥者签发，接收方用配置中固定的权威公钥验签。
 - 采用 TUF 的三类防护：
   - **回滚（rollback）**：`version` 单调，拒绝更低版本。
   - **冻结（freeze）**：索引带 `expires_at`，过期即拒。
@@ -71,7 +71,7 @@ WhitelistDoc = {
 - `hash` = **SHA-256(该服务白名单记录的完整 value 字节)**，`length` = 该字节长度，用于 mix-and-match 防护。
 - 索引的 `expires_at` 决定索引新鲜度；白名单无自身过期时间，其新鲜度由「被新鲜索引引用 + 本地缓存」保证。
 
-### 5. 发布流程（边车）
+### 5. 发布流程（后端）
 
 1. 为每个服务构造 `WhitelistDoc`，签名得到 value 字节（`external_aad = service_key`）。
 2. 计算每个 value 的 `SHA-256` 与长度，构造 `IndexDoc`（`external_aad = index_key`），签名。
@@ -87,11 +87,11 @@ add_key { t:"add_key", id:<uuid>, key:"/oahd/auth/<net_hash>/service", value:<bs
    和 `/oahd/bootstrap` 由节点维护，后端不可写。
 4. 在 `expires_at` 之前**重发续期**；否则记录过期后节点 fail-closed，拒绝相关服务。
 
-> 本地后端协议见 README「后端协议（TCP，v2）」；规范见 `docs/sidecar.cddl`。
+> 本地边车协议见 README「边车协议（TCP，v2）」；规范见 `docs/sidecar.cddl`。
 
 ### 6. 客户端验证算法（TUF-lite）
 
-节点按以下顺序处理入站服务请求（`peer` = 传输层已认证的发起方 PeerId）：
+节点按以下顺序处理入站服务请求（`peer` = 传输层已认证（authentication）的发起方 PeerId）：
 
 1. 若节点 `auth.network == "none"` → 放行。
 2. 若该服务本地 `require_auth == false` → 放行。
@@ -144,7 +144,7 @@ require_auth = true
 
 ### 8. 安全说明
 
-- **撤销**依赖 `expires_at` 与后台刷新：权威不续发即过期失效；已缓存的正记录会继续用于判定，直到下一次刷新成功或索引过期。建议权威使用较短的 `expires_at`。
+- **吊销（revoke）**依赖 `expires_at` 与后台刷新：权威方不续发即过期失效；已缓存的正记录会继续用于判定，直到下一次刷新成功或索引过期。建议权威方使用较短的 `expires_at`。
 - **混合版本**：旧节点仍按 60 秒缓存/单记录读取；新节点使用“立即返回旧值 + 后台刷新”和多版本选择，只影响本地，不改变 wire 格式。
 - **不防枚举**：`net_hash` 仅隐藏网络名明文，知道名字即可算出哈希；白名单成员 PeerId 公开可读。
 - **无密钥轮换**：当前版本权威公钥固定在配置，轮换需改配置重启（后续可能扩展 root 委派）。
@@ -160,7 +160,7 @@ require_auth = true
 | 摘要 | SHA-256 |
 | 编码（key 哈希） | base64url 无填充 |
 | 编码（发布/权威公钥） | 标准 base64 |
-| `MAX_DOC_BYTES` | 1 MiB（Kademlia store/packet 上限已同步调大） |
+| `MAX_DOC_BYTES` | 1 MiB（Kademlia 存储/包上限已同步调大） |
 | `MAX_MEMBERS` | 100000 |
 | `MAX_SERVICES` | 10000 |
 | 保留服务名 | `service` |
@@ -170,7 +170,7 @@ require_auth = true
 <a id="english"></a>
 ## English
 
-This document defines the record format, publishing flow and verification algorithm of a NexusNet authorization network. It is intended for sidecars (policy programs) and implementers in any language.
+This document defines the record format, publishing flow and verification algorithm of a NexusNet authorization network. It is intended for backend programs (policy programs) and implementers in any language.
 
 ### 1. Trust model
 
@@ -236,7 +236,7 @@ WhitelistDoc = {
 - `hash` is **SHA-256 of the complete value bytes of that service's whitelist record**, and `length` is its byte length. Together they provide mix-and-match protection.
 - The index's `expires_at` determines index freshness. Whitelists have no expiry of their own; their freshness is guaranteed by being referenced from a fresh index and by the local cache.
 
-### 5. Publishing flow (sidecar)
+### 5. Publishing flow (backend)
 
 1. Build a `WhitelistDoc` for each service and sign it to obtain the value bytes (`external_aad = service_key`).
 2. Compute `SHA-256` and the length of each value, build the `IndexDoc` (`external_aad = index_key`), and sign it.
@@ -250,9 +250,9 @@ add_key { t:"add_key", id:<uuid>, key:"/oahd/auth/<net_hash>/service", value:<bs
    **Order**: publish every service whitelist first, then the index (the index references their hashes).
    The control layer only permits writes to `/oahd/auth/...` and `/oahd/service/<name>`;
    `/oahd/service/types` and `/oahd/bootstrap` are maintained by the node and are not writable by backends.
-4. **Republish before `expires_at`** to renew. Otherwise the record expires and nodes fail closed for the affected services.
+4. **Republish before `expires_at`** to renew. Otherwise the record expires and nodes fail-closed for the affected services.
 
-> See the README section "Backend protocol (TCP, v2)" for the local backend protocol and `docs/sidecar.cddl` for the contract.
+> See the README section "Sidecar protocol (TCP, v2)" for the local sidecar protocol and `docs/sidecar.cddl` for the contract.
 
 ### 6. Client verification algorithm (TUF-lite)
 

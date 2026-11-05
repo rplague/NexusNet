@@ -2,8 +2,6 @@
 
 > 本文是英文 [README.md](./README.md) 的中文翻译，可能滞后于英文版本。
 
-**OAHD 计划的核心网络层** — 基于 libp2p 的去中心化 P2P 节点网络。
-
 NexusNet 将一台机器接入 P2P 覆盖网络，通过 Kademlia DHT 实现节点自动发现与服务注册查询；利用边车（sidecar）模式，将远程服务请求经 TCP 转发到本地业务进程，业务端语言无关。
 
 ## 架构总览
@@ -22,7 +20,7 @@ graph TD
         SD["ServiceDispatcher<br/>UUID 帧协议 · 30s 超时 · 控制指令"]
     end
 
-    CLI["CLI 边车 :5014"]
+    CLI["CLI 后端 :5014"]
     OCR["OCR 服务 :5013"]
     MORE["... 其他后端"]
 
@@ -37,7 +35,7 @@ graph TD
     SD -->|TCP UUID 帧| MORE
 ```
 
-### 微内核 + 边车
+### 微内核 + 后端（边车模式）
 
 - **NodeController** — 单一异步事件循环，集成所有 libp2p 事件处理（Ping/Identify/Kademlia/Request-Response）和后端命令路由。
 - **ServiceDispatcher** — 独立后台任务。节点启动时主动连接所有配置的本地后端，断线后按 1–60 秒指数退避重连，维持持久 TCP 连接。P2P 入站请求经 `inbound_req_tx` 转发到此处，再由对应后端任务通过 UUID 帧协议发送给后端进程，等待响应后返回。
@@ -57,7 +55,7 @@ cargo run
 
 ### 配置
 
-监听端口、bootstrap 节点等均通过 `config.toml` 配置。正常服务不解析命令行参数；
+监听端口、引导节点（bootstrap 节点）等均通过 `config.toml` 配置。正常服务不解析命令行参数；
 安装器使用内部的 `--write-config` / `--defaults` / `--check-config` 模式生成和检查配置。
 
 ## 部署（systemd / deb）
@@ -121,7 +119,7 @@ bootstrap_nodes = []
 enabled = true
 query_timeout_secs = 60
 types_sync_secs = 300
-max_inflight_dht = 4             # 1..=16，DHT 控制命令并发上限
+max_inflight_dht = 4             # 1..=16，DHT 控制指令并发上限
 max_request_bytes = 16777216     # P2P 服务请求上限，默认 16 MiB，范围 1..=64 MiB
 max_response_bytes = 16777216    # P2P 服务响应上限，默认 16 MiB，范围 1..=64 MiB
 
@@ -131,7 +129,7 @@ port = 5014
 require_auth = false
 
 [services.registry]
-max_inflight_dht = 4             # 1..=16，registry DHT job 并发上限
+max_inflight_dht = 4             # 1..=16，registry DHT 作业并发上限
 type_ttl_secs = 1800             # 服务类型租约；必须 > 2 * types_sync_secs
 
 [services.relay]
@@ -204,14 +202,14 @@ main()
 | **service_dispatcher** | 后端连接管理与就绪状态上报 |
 | **network** | 网络层门面：身份、地址探测、行为装配、Swarm Actor（`network/identity`、`network/addr`、`network/behaviour`、`network/builder`、`network/actor`） |
 | **config** | 提供ConfigHandle |
-| **dht_cache** | read-through + 每 key 单飞的 DHT 读缓存 |
+| **dht_cache** | 读穿透（read-through）+ 每 key 单飞的 DHT 读缓存 |
 | **cose** | 共享的 COSE_Sign1 EdDSA 签名/验签 |
 | **limits** | DHT 记录与 Kademlia 包大小上限 |
 | **service_protocol** | 提供通讯协议 |
 | **auth** | 鉴权记录层：COSE_Sign1 验签、TUF-lite 一致性防护、内存缓存与判定 |
 | **log** | 自动检测输出模式：systemd 下交 journald，其余终端+文件轮转 |
 
-## 后端协议（TCP，v2）
+## 边车协议（TCP，v2）
 
 NexusNet 与后端进程之间使用**持久 TCP 连接**，由节点主动发起连接。协议为 **CBOR + CDDL** 契约，规范见 [docs/sidecar.cddl](./docs/sidecar.cddl)。
 
@@ -244,13 +242,13 @@ u32_be(len) || cbor(message)      # len <= 16 MiB
 ## P2P 服务调用流程
 
 ```text
-后端进程 → 控制消息(service_request, CBOR)
+后端进程 → 控制指令(service_request, CBOR)
   → ServiceDispatcher.backend_read_loop
   → ControlRequest(cmd_tx) → NodeController.handle_command()
   → discover_providers(service) → DHT get_providers
   → RTT 排序选最优点
   → send_request_to_peer(peer, service, payload)
-  → 无已知地址时 get_closest_peers(peer) 解析 relay 地址后重试
+  → 无已知地址时 get_closest_peers(peer) 解析中继地址后重试
   → CBOR Request-Response (libp2p)
   → 远程 NodeController → InboundServiceRequest(to_dispatcher_tx)
   → 远程 ServiceDispatcher → backend_task
@@ -262,36 +260,36 @@ u32_be(len) || cbor(message)      # len <= 16 MiB
 
 - 本地服务列表由 `config.services.dispatcher.local_services` 定义
 - `ServiceDispatcher` 持有唯一一份 `backend_ready`（后端 `hello` 握手成功），并通过 watch 发布；ServiceRegistry 订阅该状态，不再由 NodeController 转发
-- 服务注册、撤销和类型索引 reconcile 在独立的异步 registry actor 中执行；NodeController 不再等待这些 DHT 操作。并发由 `services.registry.max_inflight_dht` 控制（默认 4，范围 1–16）
+- 服务注册、撤销和类型索引 reconcile 在独立的异步服务注册 actor 中执行；NodeController 不再等待这些 DHT 操作。并发由 `services.registry.max_inflight_dht` 控制（默认 4，范围 1–16）
 - 仅当 DHT bootstrap 完成**且**对应后端 TCP 握手（`hello`）成功后，才自动调用 `start_providing`，key 为 `/oahd/service/<name>`——避免提前宣告尚不可用的服务
 - 后端连接断开后进入 3 秒宽限期（由 1 秒 tick 检查，实际撤销窗口约 3–4 秒）：期间重连则不撤销；超时仍未恢复则 `stop_providing` 撤销宣告
 - 撤销为本地行为，远端 provider 记录需待 provider TTL 过期才会消失
 - provider 记录 TTL 由 `services.kademlia.provider_record_ttl_seconds`（默认 3600s）控制，活跃 provider 按 `services.kademlia.provider_publication_interval_seconds`（默认 1800s）周期重发；停止或崩溃的 provider 最迟约一个 TTL 后从 `discover_providers` 中消失。两者必须大于 0，且 TTL 不能小于 2 倍发布间隔
 - 双栈节点在 `allow_bootstrap = true` 时声明为 `/oahd/bootstrap` provider；其他节点仅在 `accept_bootstrap_providers = true` 时才会把 Identify 发现的 provider 自动写入 bootstrap 列表
 - Kademlia 成员准入：启动时把配置 bootstrap 地址中的 PeerId 直接视为已识别；其他 peer 只有 Identify 的 `agent_version` 以 `/nexusnet` 开头才加入路由表。进入路由表的未识别 PeerId 会被移除；Kademlia 查询仍可能短暂拨号，但不会保留。
-- 同步 `/oahd/service/types` 全局服务类型记录（**带租约、会清理**）：DHT 值为无版本 tuple 数组 `[["ocr",1700003600], ...]`。本地按 `name -> expires_at` 维护，周期（`services.dispatcher.types_sync_secs`，默认 300s）从 DHT 对端读取（绕过本地 store 副本与缓存，避免自我遮蔽）后合并未过期条目并取 `max(expires_at)`，删除已过期条目并写回；本地 `announced` 服务每次 reconcile 续期为 `now + services.registry.type_ttl_secs`（默认 1800s），没有本地 provider 的节点不能延长远端过期时间。读取/写入由 registry actor 异步完成，单飞并带 dirty 重跑
+- 同步 `/oahd/service/types` 全局服务类型索引（**带租约、会清理**）：DHT 值为无版本 tuple 数组 `[["ocr",1700003600], ...]`。本地按 `name -> expires_at` 维护，周期（`services.dispatcher.types_sync_secs`，默认 300s）从 DHT 对端读取（绕过本地 store 副本与缓存，避免自我遮蔽）后合并未过期条目并取 `max(expires_at)`，删除已过期条目并写回；本地 `announced` 服务每次 reconcile 续期为 `now + services.registry.type_ttl_secs`（默认 1800s），没有本地 provider 的节点不能延长远端过期时间。读取/写入由服务注册 actor 异步完成，单飞并带 dirty 重跑
 - `/oahd/service/types` 采用**无版本格式变更**：旧节点写入的 `["ocr","cmd"]` 仍可被新节点读取，旧字符串条目获得一次迁移期过期时间（`now + type_ttl_secs`），随后必须由本地 provider 续期。新节点一律写回 tuple 格式；本版本**不做旧节点滚动兼容**，升级时应先停止旧节点写入，再升级全部节点
 - `compat.max_record_bytes` 默认 14 KiB，确保旧版 Kademlia 16 KiB 包能承载 DHT 写入；超过上限的 auth/service 写入直接拒绝。全量升级后再调大。
 - `BootstrapCompleted` / `reannounce_services` 会清空本地 `announced` 状态并重新宣告，避免 DHT 重建后停留在旧状态。
 - `list_services` → 立即返回本地快照，并在后台触发一次类型索引刷新（最终一致）
 - `reannounce_services` → 清空本地 `announced` 缓存并重新 `start_providing`，立即返回 accepted
-- DHT 控制命令（`query_key`、`discover_providers`、`service_request`、`service_request_to`，以及 `providing=false` 的 `add_key`）在独立有界 worker 中执行；并发由 `services.dispatcher.max_inflight_dht` 控制（默认 4，范围 1–16）。`whoami`/`relay_status`/`pq_status`/`auth_status`/`list_services` 不等待 DHT
+- DHT 控制指令（`query_key`、`discover_providers`、`service_request`、`service_request_to`，以及 `providing=false` 的 `add_key`）在独立有界 worker 中执行；并发由 `services.dispatcher.max_inflight_dht` 控制（默认 4，范围 1–16）。`whoami`/`relay_status`/`pq_status`/`auth_status`/`list_services` 不等待 DHT
 - `add_key` 的 `providing=true` 由 NodeController 直接调用 `start_providing`；ServiceRegistry 仍独立维护自动宣告状态
 - 本地调用优先：`service_request` 命中已就绪的本地服务时直接走 `ServiceDispatcher`，不查 DHT、不使用 PQ、不经过 AuthGate；`service_request_to(self, service)` 同样走本地。本地未就绪时，`service_request` 回退远端，`service_request_to(self)` 返回 `backend_not_ready`
-- `discover_providers` → DHT get_providers 获取提供者列表
-- `service_request` → 本地就绪优先；否则查询 provider，RTT 排序选优；直连失败时通过 `get_closest_peers(peer)` 获取 provider 的 relay 地址后重试
+- `discover_providers` → DHT get_providers 获取 provider 列表
+- `service_request` → 本地就绪优先；否则查询 provider，RTT 排序选优；直连失败时通过 `get_closest_peers(peer)` 获取 provider 的中继地址后重试
 
 ## 无公网 IP 接入（中继）
 
-单栈或没有公网地址的节点仍可加入网络并提供服务，但必须有至少一台**双栈公网节点**作为 bootstrap/relay。
+单栈或没有公网地址的节点仍可加入网络并提供服务，但必须有至少一台**双栈公网节点**作为 bootstrap/中继。
 
-- 公网 bootstrap 必须是双栈节点；双栈节点会自动开启 relay server（最多 16 个预约）。
+- 公网 bootstrap 必须是双栈节点；双栈节点会自动开启中继服务器（最多 16 个预约）。
 - NAT 节点把该 bootstrap 写入 `services.kademlia.bootstrap_nodes`，无需公网 IP；地址必须带 `/ws`，例如 `/ip6/.../tcp/5000/ws/p2p/<PeerId>`。
-- NAT 节点在获得第一个 relay circuit 前**不会宣告服务**；第一个 relay 就绪后才 `start_providing`。
-- 后续 relay 增加/失效只更新本地地址状态；只要还有 active relay，服务保持宣告。
-- `active_relays` 降到 0 时，NAT 节点执行 `stop_providing`，等新 relay 就绪后重新宣告。
+- NAT 节点在获得第一个中继电路前**不会宣告服务**；第一个中继就绪后才 `start_providing`。
+- 后续中继增加/失效只更新本地地址状态；只要还有活跃中继，服务保持宣告。
+- `active_relays` 降到 0 时，NAT 节点执行 `stop_providing`，等新中继就绪后重新宣告。
 - 调用方通过 `get_providers` 取得 provider 的 PeerId，再用 `get_closest_peers(peer)` 取得 `PeerInfo.addrs`（包含 `<relay>/p2p-circuit`），随后经中继调用。
-- relay server 的 `max_circuit_bytes` 自动等于本节点 `max_request_bytes + max_response_bytes`；bootstrap 的这两个上限应不小于客户端，否则大报文仍会被中继拒绝。
+- 中继服务器的 `max_circuit_bytes` 自动等于本节点 `max_request_bytes + max_response_bytes`；bootstrap 的这两个上限应不小于客户端，否则大报文仍会被中继拒绝。
 
 `relay_status` 返回：
 
@@ -299,8 +297,8 @@ u32_be(len) || cbor(message)      # len <= 16 MiB
 |---|---|
 | `need_relay` | 单栈或无公网地址时为 true |
 | `reachability` | `public` / `relay` / `none` |
-| `active_relays` | 已就绪的 relay PeerId |
-| `pending_relays` | 预约中的 relay PeerId |
+| `active_relays` | 已就绪的中继 PeerId |
+| `pending_relays` | 预约中的中继 PeerId |
 
 完整流程与失效语义见 [docs/nat-relay.md](./docs/nat-relay.md)。
 
@@ -316,9 +314,9 @@ TCP → HTTP WebSocket → multistream-select → TLS/Noise → Yamux → 应用
 - `network.port` 是 WebSocket 的 TCP 端口，默认 `5000`；
 - bootstrap 地址必须带 `/ws`：
   `/ip6/.../tcp/5000/ws/p2p/<PeerId>`；
-- relay 预约、provider 发现和服务调用全部经 WebSocket；
+- 中继预约、provider 发现和服务调用全部经 WebSocket；
 - 内层仍优先 TLS，Noise 作为兼容回退；
-- PeerId、keypair、服务协议、Kademlia、relay 和 PQ 均不变。
+- PeerId、keypair、服务协议、Kademlia、中继和 PQ 均不变。
 
 这是**破坏性变更**：新节点只支持 WebSocket，旧版 raw TCP 节点无法连接。  
 所有节点必须升级到本版本。
@@ -327,7 +325,7 @@ TCP → HTTP WebSocket → multistream-select → TLS/Noise → Yamux → 应用
 
 ## DHT 读缓存
 
-应用层 DHT 读缓存只做 read-through + 每 key 单飞刷新：
+应用层 DHT 读缓存只做读穿透（read-through）+ 每 key 单飞刷新：
 
 - 有上一次结果时立即返回，同时如果该 key 没有正在进行的查询，就在后台启动一次 DHT 查询。
 - 后台查询完成后覆盖缓存；成功查到“不存在”也会覆盖为空结果。
@@ -339,11 +337,11 @@ TCP → HTTP WebSocket → multistream-select → TLS/Noise → Yamux → 应用
 
 `refresh_cache` 清空上述应用缓存，并删除 Kademlia 本地 store 中非本节点发布的副本。
 
-## 抗量子加密
+## 后量子加密
 
 应用层混合 PQ 加密，用于服务请求/响应的机密性。关闭时协议不注册、行为与旧版本完全一致。
 
-- **算法**：ML-KEM-768+ X25519 混合 KEM、ChaCha20-Poly1305 AEAD、可选 ML-DSA-65（FIPS 204）签名。
+- **算法**：ML-KEM-768 + X25519 混合 KEM、ChaCha20-Poly1305 AEAD、可选 ML-DSA-65（FIPS 204）签名。
 - **协议**：`/oahd/service_req/2.0.0`与 `/oahd/pq_identity/1.0.0`，仅在启用时注册。
 - **流程**：请求方 encaps 到响应方 KEM 公钥，响应方 decaps 后双方共享同一密钥，响应复用该密钥加密——无需第二次 KEM，也不在请求里携带请求方公钥。
 - **回退**：仅当已确认对端不支持 PQ 时回退明文 `/oahd/service_req/1.0.0`；对端能力未知或身份尚未就绪时返回可重试错误，不会静默降级。`crypto.pq_required = true` 则拒绝非 PQ 对端。
@@ -359,7 +357,7 @@ TCP → HTTP WebSocket → multistream-select → TLS/Noise → Yamux → 应用
 
 ## 鉴权
 
-可选的服务级访问控制。节点加入一个**鉴权网络**，权威方（边车）把签名白名单发布到 DHT；
+可选的服务级访问控制。节点加入一个**鉴权网络**，权威方通过本地后端接口把签名白名单发布到 DHT；
 节点收到服务请求时按「DHT 为准 + fail-closed」判定，通过才转发给本地后端。
 
 - **信任模型**：记录由权威 ed25519 私钥签名，DHT 仅作传输；接收方验签后才信任（防伪造、防回滚与重放）。
@@ -368,7 +366,7 @@ TCP → HTTP WebSocket → multistream-select → TLS/Noise → Yamux → 应用
 - **服务开关**：`services.dispatcher.local_services[].require_auth`。
 - **判定**：鉴权关闭或服务未要求鉴权 → 放行；索引/白名单缺失、过期、验签失败 → 拒绝；
   服务不在索引 → 本次放行并记录 Warning，不修改本地 `require_auth`；索引恢复后自动重新生效。
-- **边车发布**：签名记录经本地后端控制消息 `add_key { key, value }` 发布（`value` 为 `bstr`，二进制安全）；
+- **后端发布**：签名记录经本地后端控制指令 `add_key { key, value }` 发布（`value` 为 `bstr`，二进制安全）；
   在 `expires_at` 前重发续期。
 - **状态查询**：`auth_status`。
 - **并发**：鉴权查询在独立 worker 池中执行，不阻塞 NodeController；队列满时入站请求立即返回 `authentication overloaded`。

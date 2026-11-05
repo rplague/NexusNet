@@ -11,17 +11,17 @@
 
 ### 进程模型
 
-节点是微内核加边车：
+节点采用微内核 + 后端的边车模式：
 
 | 组件 | 职责 |
 |---|---|
 | `main` / `runtime` | 启动编排与信号处理。`runtime::start_node` 由桌面二进制和移动端共用。 |
 | `SwarmActor` | 唯一持有 libp2p `Swarm` 的任务。所有网络命令经它串行化执行。 |
-| `NodeController` | 单事件循环，处理网络事件、后端命令、服务 tick、relay tick 和关闭。 |
+| `NodeController` | 单事件循环，处理网络事件、后端命令、服务 tick、中继 tick 和关闭。 |
 | `ServiceDispatcher` | 持有后端 TCP 连接、就绪状态、重连和请求转发。 |
-| `ServiceRegistryActor` | 纯状态机加有界 DHT job，负责宣告、撤销和类型索引。 |
+| `ServiceRegistryActor` | 纯状态机加有界 DHT 作业，负责宣告、撤销和类型索引。 |
 | `AuthGate` | 验证签名鉴权记录并执行 fail-closed 判定。 |
-| `DhtCache` | 读穿透缓存，每 key 单飞刷新。 |
+| `DhtCache` | 读穿透（read-through）缓存，每 key 单飞刷新。 |
 
 桌面二进制只是在 `runtime::start_node` 外层加了信号处理和日志模式；移动端桥接
 用同一 runtime，并传入显式路径和日志 sink。
@@ -44,7 +44,7 @@ start_node(options)
            event_rx          → 网络事件
            to_controller_rx  → 后端命令与就绪状态
            service_tick      → 到期撤销 / 重试（1 秒）
-           relay_tick        → relay 补约与 bootstrap 宣告
+           relay_tick        → 中继补约与 bootstrap 宣告
            shutdown          → 优雅退出
        }
 ```
@@ -57,14 +57,14 @@ start_node(options)
 |---|---|---|
 | 鉴权 worker | 4 个 worker × 32 | 入站请求返回 `authentication overloaded` |
 | dispatcher 入站 | 256 | 入站请求返回 `backend overloaded` |
-| controller 控制 | 128 | 控制命令失败或按操作等待 |
+| controller 控制 | 128 | 控制指令失败或按操作等待 |
 | 每后端命令 / 事件 | 各 64 | 后端任务施加背压或报错 |
 | 服务注册命令 | 256 | 状态类命令等待；`Tick`/`RefreshTypes`/`Reannounce` 丢弃或返回 busy |
 
 DHT 工作与 controller 隔离：
 
-- dispatcher 的 DHT 命令在有界 worker 池中执行（`services.dispatcher.max_inflight_dht`，默认 4，范围 1–16）。
-- registry 的 DHT job 在 `JoinSet` 中执行，上限为 `services.registry.max_inflight_dht`。
+- dispatcher 的 DHT 作业在有界 worker 池中执行（`services.dispatcher.max_inflight_dht`，默认 4，范围 1–16）。
+- registry 的 DHT 作业在 `JoinSet` 中执行，上限为 `services.registry.max_inflight_dht`。
 - `whoami`、`relay_status`、`pq_status`、`auth_status` 和 `list_services` 从不等待 DHT。
 
 ### 服务注册生命周期
@@ -73,7 +73,7 @@ DHT 工作与 controller 隔离：
 
 1. 后端完成 `hello` 握手。`ServiceDispatcher` 通过 watch 通道发布唯一的 `backend_ready` 集合。
 2. DHT bootstrap 完成。
-3. 节点可达。需要 relay 的节点在至少一条 circuit 就绪前不宣告。
+3. 节点可达。需要中继的节点在至少一条中继电路就绪前不宣告。
 
 `ServiceRegistryActor` 按以下优先级 reconcile 宣告：到期撤销、到期重试、新宣告，
 最后是类型索引 reconcile。
@@ -83,18 +83,19 @@ DHT 工作与 controller 隔离：
 `BootstrapCompleted` 和 `reannounce_services` 会清空 `announced` 缓存，使节点在
 DHT 重建后重新宣告，而不是停留在旧状态。
 
-### relay 门控
+### 中继门控
 
-除非节点是双栈**且**有公网地址，否则 `needs_relay` 为 true。需要 relay 时：
+除非节点是双栈**且**有公网地址，否则 `needs_relay` 为 true。需要中继时：
 
-- 第一个 active relay 出现前：不调度任何宣告。
-- 第一个 relay 就绪：清空 `announced` 并重新宣告服务。
-- relay 数量变化但仍大于 0：不重新宣告。
-- 最后一个 relay 消失：撤销所有已宣告服务，并在 relay 恢复前阻止新的宣告。
+- 第一个活跃中继出现前：不调度任何宣告。
+- 第一个中继就绪：清空 `announced` 并重新宣告服务。
+- 中继数量变化但仍大于 0：不重新宣告。
+- 最后一个中继消失：撤销所有已宣告服务，并在中继恢复前阻止新的宣告。
 
-provider 记录由 libp2p 的周期性 provider job 维护。活跃 provider 按
-`provider_publication_interval_seconds`（默认 1800 秒）重发；provider 停止后，
-记录最迟约一个 `provider_record_ttl_seconds`（默认 3600 秒）后消失。
+provider 记录由 libp2p 的周期性 provider 作业维护。活跃 provider 按
+`services.kademlia.provider_publication_interval_seconds`（默认 1800 秒）重发；
+provider 停止后，记录最迟约一个 `services.kademlia.provider_record_ttl_seconds`
+（默认 3600 秒）后消失。
 
 ### 请求路径
 
@@ -105,7 +106,7 @@ backend → control(service_request)
   → discover_providers（DHT get_providers）
   → 按 RTT 排序候选
   → send_request_to_peer
-  → 失败时：get_closest_peers(peer) 解析 relay 地址后重试
+  → 失败时：get_closest_peers(peer) 解析中继地址后重试
   → CBOR request-response
   → 远端 NodeController → InboundServiceRequest
   → 远端 ServiceDispatcher → backend 任务
@@ -155,12 +156,12 @@ hash 必须与索引条目一致。字节级契约见 [auth.md](./auth.md)。
 
 ### 大小限制
 
-- `services.dispatcher.max_request_bytes` / `max_response_bytes`：默认 16 MiB，每条消息范围 1–64 MiB。
+- `services.dispatcher.max_request_bytes` / `max_response_bytes`：默认 16 MiB，每条 P2P 报文范围 1–64 MiB。
 - `compat.max_record_bytes`：默认 14 KiB，保证 DHT 记录仍适配旧版 16 KiB Kademlia 包。
 - `sidecar_protocol::MAX_FRAME`：每个后端帧 16 MiB。
 - PQ 请求额外增加约 8 KiB 的 KEM、nonce 和可选身份数据。
 
-relay server 的 `max_circuit_bytes` 取 `max_request_bytes + max_response_bytes`，
+中继服务器的 `max_circuit_bytes` 取 `max_request_bytes + max_response_bytes`，
 因此 bootstrap 的上限必须不小于客户端。
 
 ---
@@ -174,7 +175,7 @@ protocol contracts see [sidecar.cddl](./sidecar.cddl), [service-registry.md](./s
 
 ### Process model
 
-A node is a microkernel surrounded by sidecars:
+A node is a microkernel surrounded by local backends (the sidecar pattern):
 
 | Component | Responsibility |
 |---|---|

@@ -33,10 +33,10 @@ NexusNet 以原生的 Debian 打包（`.deb`）分发，由 `dpkg`/`apt` 管理�
 - 至少一台机器需要**双栈公网地址**，并在各 NAT 节点的
   `services.kademlia.bootstrap_nodes` 中配置为 bootstrap。
 - 双栈 bootstrap 会自动开启 Circuit Relay v2 server；NAT 节点无需公网 IP。
-- NAT 节点在第一个 relay 就绪前不会宣告服务，最后一个 relay 失效后会撤销宣告。
+- NAT 节点在第一个中继就绪前不会宣告服务，最后一个中继失效后会撤销宣告。
 - 中继电路上限自动取 `max_request_bytes + max_response_bytes`，bootstrap 的
   这两个值应不小于客户端。
-- 调用方通过 `get_closest_peers` 解析 provider 的 relay 地址，详见
+- 调用方通过 `get_closest_peers` 解析 provider 的中继地址，详见
   [../docs/nat-relay.md](../docs/nat-relay.md)。
 - 本版本只使用 WebSocket over HTTP；`network.port` 是 WebSocket TCP 端口。
 - bootstrap 地址必须带 `/ws`，例如
@@ -65,7 +65,7 @@ preseed 和非交互兼容。依赖 `whiptail` 与 `python3 (>= 3.11)`，目标�
 - 节点名称、描述（不再询问角色和 IPv4/IPv6 监听；启动时自动检测地址族）
 - WebSocket 端口（1..65535）
 - 本地服务动态编辑器（添加/编辑/删除/保存/取消；可关闭并清空本地服务）
-- 鉴权网络名、Authority 公钥，以及逐个服务切换鉴权状态（回车切换，保存并返回）；可关闭鉴权网络
+- 鉴权网络名、authority 公钥，以及逐个服务切换鉴权状态（回车切换，保存并返回）；可关闭鉴权网络
 - Bootstrap 编辑器（添加/编辑/删除单条地址；列表中长地址中间截断，编辑时显示完整值；每项必须包含 `/ws` 和 `/p2p/<PeerId>`；可留空）
 - 汇总确认后写入配置
 
@@ -275,7 +275,7 @@ NSSM 由脚本按固定版本（2.24）+ SHA256 下载缓存到 `target/nssm-cac
 - 节点名称、描述
 - WebSocket 端口（1..65535）
 - 本地服务编辑器（添加/编辑/删除；名称、端口校验）
-- 单个鉴权网络与 Authority，以及每个服务的鉴权开关
+- 单个鉴权网络与 authority，以及每个服务的鉴权开关
 - Bootstrap 地址（每行一个或逗号分隔，必须包含 `/ws` 和 `/p2p/<PeerId>`；可留空）
 - 摘要确认
 
@@ -392,8 +392,8 @@ $env:NEXUSNET_LOG_MODE="file"
   通过 `ReadWritePaths` 放行配置与数据目录的写权限；日志经 stdout/stderr 交给 journald。
 - 收到 `SIGTERM` 时程序优雅关闭（`NodeController`/`ServiceDispatcher` 收到共享 shutdown 信号），
   `TimeoutStopSec=15` 防止卡死被强杀。Windows 下由 NSSM 以 Ctrl+C 触发同一优雅退出路径。
-- 后端边车（CLI / OCR 等）仍由外部独立管理，本服务不管理其生命周期；
-  如后续需要，可在 `nexusnet.service` 的 `[Unit]` 中追加 `After=`/`Wants=` 关联对应的边车服务。
+- 后端（CLI / OCR 等）仍由外部独立管理，本服务不管理其生命周期；
+  如后续需要，可在 `nexusnet.service` 的 `[Unit]` 中追加 `After=`/`Wants=` 关联对应的后端服务。
 
 ## CI（WebGit）
 
