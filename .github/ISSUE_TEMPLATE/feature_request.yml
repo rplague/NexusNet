@@ -1,0 +1,46 @@
+name: Feature request
+description: Suggest a capability or behavior change
+title: "[feature] "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to do, and what gets in the way today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe the behavior or API you would like.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Workarounds, existing commands or related projects.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Networking / transport
+        - DHT / service registry
+        - Sidecar protocol
+        - Authentication
+        - Post-quantum crypto
+        - Packaging / deployment
+        - Documentation
+        - Other
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checklist
+      options:
+        - label: I searched existing issues for similar requests.
+          required: true
