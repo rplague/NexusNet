@@ -23,6 +23,26 @@
 | `AuthGate` | 验证签名鉴权记录并执行 fail-closed 判定。 |
 | `DhtCache` | 读穿透（read-through）缓存，每 key 单飞刷新。 |
 
+#### 模块清单
+
+| 模块 | 职责 |
+|---|---|
+| `main` | 程序入口与信号处理 |
+| `runtime` | 可复用节点运行时（`start_node`、`NodeHandle`） |
+| `paths` | 基于环境变量的路径解析 |
+| `node_controller` | 事件循环、命令处理、远程查询、服务自动宣告 |
+| `service_dispatcher` | 后端连接、就绪状态与重连 |
+| `network` | Swarm 门面：identity / addr / behaviour / builder / actor |
+| `config` | `ConfigHandle` 与配置补全 |
+| `dht_cache` | 读穿透 + 每 key 单飞的 DHT 读缓存 |
+| `cose` | 共享的 COSE_Sign1 EdDSA 签名/验签 |
+| `limits` | DHT 记录与 Kademlia 包大小上限 |
+| `service_protocol` | P2P 请求/响应类型 |
+| `auth` | 鉴权记录层：COSE_Sign1 验签、TUF-lite、缓存与判定 |
+| `log` | 日志模式检测（journald / 文件） |
+| `setup` | 安装器配置模式（`--write-config` / `--defaults` / `--check-config`） |
+| `sidecar_protocol` | 边车协议 v2（帧与消息） |
+
 桌面二进制只是在 `runtime::start_node` 外层加了信号处理和日志模式；移动端桥接
 用同一 runtime，并传入显式路径和日志 sink。
 
@@ -186,6 +206,26 @@ A node is a microkernel surrounded by local backends (the sidecar pattern):
 | `ServiceRegistryActor` | Pure state machine plus bounded DHT jobs for announcements, withdrawals and the type index. |
 | `AuthGate` | Verifies signed authorization records and applies fail-closed decisions. |
 | `DhtCache` | Read-through cache with per-key single-flight refresh. |
+
+#### Module map
+
+| Module | Responsibility |
+|---|---|
+| `main` | Process entry point and signal handling |
+| `runtime` | Reusable node runtime (`start_node`, `NodeHandle`) |
+| `paths` | Environment-driven path resolution |
+| `node_controller` | Event loop, command handling, remote queries, service auto-announce |
+| `service_dispatcher` | Backend connections, readiness and reconnects |
+| `network` | Swarm facade: identity / addr / behaviour / builder / actor |
+| `config` | `ConfigHandle` and configuration completion |
+| `dht_cache` | Read-through DHT cache with per-key single-flight refresh |
+| `cose` | Shared COSE_Sign1 EdDSA signing and verification |
+| `limits` | DHT record and Kademlia packet size limits |
+| `service_protocol` | P2P request/response types |
+| `auth` | Auth record layer: COSE_Sign1 verification, TUF-lite, cache and decisions |
+| `log` | Logging mode detection (journald / file) |
+| `setup` | Installer configuration modes (`--write-config` / `--defaults` / `--check-config`) |
+| `sidecar_protocol` | Sidecar protocol v2 (frames and messages) |
 
 The desktop binary only adds signal handling and logging mode around
 `runtime::start_node`; mobile bridges call the same runtime with explicit paths
