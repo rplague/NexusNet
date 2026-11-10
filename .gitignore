@@ -1,6 +1,7 @@
 /target
 /config.toml
 /keypair.bin
+/keypair.pq.bin
 /log
 # Python test cache
 __pycache__/

@@ -4,7 +4,7 @@
 
 [English](./README.md) · [中文](./README.zh-CN.md)
 
-NexusNet 将一台机器接入去中心化 P2P 网络：Kademlia DHT 负责发现与服务注册，WebSocket 负责传输，Circuit Relay v2 负责 NAT 穿透，边车协议让业务进程可以用任何语言实现。它是 OAHD 计划的网络层，以可复用二进制和 Rust 库的形式发布。
+NexusNet 将一台机器接入去中心化 P2P 网络：Kademlia DHT 负责发现与服务注册，WebSocket 负责传输，Circuit Relay v2 负责 NAT 穿透，边车协议让业务进程可以用任何语言实现。
 
 **状态：** `0.6.2-11020` · 完成度约 6/10 · 接口正在稳定，尚未冻结。
 

@@ -4,7 +4,7 @@ A language-agnostic libp2p networking layer for services that need to find and c
 
 [English](./README.md) · [中文](./README.zh-CN.md)
 
-NexusNet joins a machine to a decentralized P2P network: Kademlia DHT for discovery and service registration, WebSocket transport, NAT traversal through Circuit Relay v2, and a small sidecar protocol so the business process can stay in any language. It is the networking layer of the OAHD project, packaged as a reusable binary and Rust library.
+NexusNet joins a machine to a decentralized P2P network: Kademlia DHT for discovery and service registration, WebSocket transport, NAT traversal through Circuit Relay v2, and a small sidecar protocol so the business process can stay in any language.
 
 **Status:** `0.6.2-11020` · roughly 6/10 completeness · interfaces are stabilizing, not frozen.
 
