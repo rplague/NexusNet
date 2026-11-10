@@ -644,6 +644,13 @@ pub struct LocalServiceEntry {
     /// Whether this service requires authentication.
     #[serde(default = "bool_false")]
     pub require_auth: bool,
+    /// Whether this service is announced to the network.
+    ///
+    /// Unpublished services keep their local backend connection and can still
+    /// be called by this node or by peers that address it explicitly, but they
+    /// are not written to the DHT provider records or the service-type index.
+    #[serde(default = "bool_true")]
+    pub publish: bool,
 }
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
@@ -789,6 +796,19 @@ impl ConfigHandle {
 
     pub fn load_or_create_default() -> Self {
         Self::from_toml_file(config_filepath(), true)
+    }
+
+    /// Re-read the bound config file and replace the in-memory config.
+    ///
+    /// Returns an error without touching the current config when the file
+    /// cannot be read, parsed or validated.
+    pub fn reload_from_file(&self) -> Result<(), ConfigError> {
+        let Some(path) = self.path.as_ref() else {
+            return Ok(());
+        };
+        let config = NodeConfig::try_from_toml_file(path.as_path(), true)?;
+        *self.inner.write().expect("RwLock 被污染") = config;
+        Ok(())
     }
 
     /// Path this handle was loaded from, if any.
@@ -1352,6 +1372,45 @@ mod tests {
     }
 
     #[test]
+    fn local_service_publish_defaults_to_true() {
+        let config: NodeConfig = toml::from_str(
+            r#"
+[[services.dispatcher.local_services]]
+name = "cmd"
+port = 5014
+"#,
+        )
+        .unwrap();
+        assert!(config.services.dispatcher.local_services[0].publish);
+
+        let serialized = toml::to_string_pretty(&config).unwrap();
+        assert!(serialized.contains("publish = true"));
+    }
+
+    #[test]
+    fn reload_from_file_replaces_config_and_keeps_old_on_error() {
+        let path =
+            std::env::temp_dir().join(format!("nexusnet-reload-{}.toml", uuid::Uuid::new_v4()));
+        let mut config = NodeConfig::default();
+        config.node.name = "before".to_string();
+        std::fs::write(&path, toml::to_string_pretty(&config).unwrap()).unwrap();
+
+        let handle = ConfigHandle::try_from_toml_file(&path, false).unwrap();
+        assert_eq!(handle.read().node.name, "before");
+
+        config.node.name = "after".to_string();
+        std::fs::write(&path, toml::to_string_pretty(&config).unwrap()).unwrap();
+        handle.reload_from_file().unwrap();
+        assert_eq!(handle.read().node.name, "after");
+
+        std::fs::write(&path, "not = [valid").unwrap();
+        assert!(handle.reload_from_file().is_err());
+        assert_eq!(handle.read().node.name, "after");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn rejects_duplicate_or_zero_port_local_services() {
         let mut config = NodeConfig::default();
         config.services.dispatcher.local_services = vec![
@@ -1359,11 +1418,13 @@ mod tests {
                 name: "cmd".to_string(),
                 port: 5014,
                 require_auth: false,
+                publish: true,
             },
             LocalServiceEntry {
                 name: "cmd".to_string(),
                 port: 5015,
                 require_auth: false,
+                publish: true,
             },
         ];
         assert!(config.validate().is_err());

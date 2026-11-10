@@ -9,3 +9,4 @@ require_auth = true
 name = "tts"
 port = 5015
 require_auth = false
+publish = false

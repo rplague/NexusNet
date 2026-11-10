@@ -28,13 +28,22 @@ Var AuthNetwork
 Var AuthAuthority
 Var ServicesEnabled
 Var AuthEnabled
-Var AuthDisplay
 
 Var ServicesFile
 Var IoIni
 Var SvcName
 Var SvcPort
 Var SvcFlag
+Var SvcPublish
+Var SvcNewFlag
+Var SvcNewPublish
+Var PromptSvcName
+Var PromptSvcPort
+Var PromptSvcFlag
+Var PromptSvcPublish
+Var ParseRest
+Var ParseIdx
+Var ParseChar
 Var SvcOldName
 Var SvcCount
 Var SvcSummary
@@ -64,10 +73,8 @@ Var hModeSkip
 Var hName
 Var hDescription
 Var hPort
-Var hServicesEnabled
 Var hAuthEnabled
 Var hServicesList
-Var hAuthList
 Var hAuthNetwork
 Var hAuthAuthority
 Var hBootstrap
@@ -263,33 +270,64 @@ Function ServiceParse
   StrCpy $SvcName ""
   StrCpy $SvcPort ""
   StrCpy $SvcFlag "0"
-  StrCpy $7 "0"
+  StrCpy $SvcPublish "1"
+  StrCpy $ParseIdx "0"
+  StrCpy $ParseChar ""
   StrCpy $9 ""
   ServiceParse_name:
-    StrCpy $8 $R0 1 $7
-    StrCmp $8 "" ServiceParse_done
-    StrCmp $8 ":" ServiceParse_name_done
-    StrCpy $9 "$9$8"
-    IntOp $7 $7 + 1
+    StrCpy $ParseChar "$R0" 1 "$ParseIdx"
+    StrCmp $ParseChar "" ServiceParse_done
+    StrCmp $ParseChar ":" ServiceParse_name_done
+    StrCpy $9 "$9$ParseChar"
+    IntOp $ParseIdx $ParseIdx + 1
     Goto ServiceParse_name
   ServiceParse_name_done:
     StrCpy $SvcName "$9"
-    IntOp $7 $7 + 1
+    IntOp $ParseIdx $ParseIdx + 1
     StrCpy $9 ""
   ServiceParse_port:
-    StrCpy $8 $R0 1 $7
-    StrCmp $8 "" ServiceParse_port_done
-    StrCmp $8 ":" ServiceParse_port_done
-    StrCpy $9 "$9$8"
-    IntOp $7 $7 + 1
+    StrCpy $ParseChar "$R0" 1 "$ParseIdx"
+    StrCmp $ParseChar "" ServiceParse_port_done
+    StrCmp $ParseChar ":" ServiceParse_port_done
+    StrCpy $9 "$9$ParseChar"
+    IntOp $ParseIdx $ParseIdx + 1
     Goto ServiceParse_port
   ServiceParse_port_done:
     StrCpy $SvcPort "$9"
-    StrCmp $8 ":" 0 ServiceParse_done
-    IntOp $7 $7 + 1
-    StrCpy $SvcFlag "$R0" "" $7
-    StrCmp $SvcFlag "" 0 ServiceParse_done
-    StrCpy $SvcFlag "0"
+    StrCmp $ParseChar ":" 0 ServiceParse_done
+    IntOp $ParseIdx $ParseIdx + 1
+    StrCpy $ParseRest "$R0" "" "$ParseIdx"
+    StrCmp $ParseRest "" ServiceParse_done
+    StrCpy $ParseIdx "0"
+    StrCpy $9 ""
+    ServiceParse_auth:
+      StrCpy $ParseChar "$ParseRest" 1 "$ParseIdx"
+      StrCmp $ParseChar "" ServiceParse_auth_done
+      StrCmp $ParseChar ":" ServiceParse_auth_done
+      StrCpy $9 "$9$ParseChar"
+      IntOp $ParseIdx $ParseIdx + 1
+      Goto ServiceParse_auth
+    ServiceParse_auth_done:
+      StrCpy $SvcFlag "$9"
+      StrCmp $SvcFlag "1" ServiceParse_auth_set
+      StrCmp $SvcFlag "true" ServiceParse_auth_set
+      StrCmp $SvcFlag "TRUE" ServiceParse_auth_set
+      StrCmp $SvcFlag "yes" ServiceParse_auth_set
+      StrCmp $SvcFlag "on" ServiceParse_auth_set
+      StrCpy $SvcFlag "0"
+      Goto ServiceParse_publish
+    ServiceParse_auth_set:
+      StrCpy $SvcFlag "1"
+    ServiceParse_publish:
+      StrCmp $ParseChar ":" 0 ServiceParse_done
+      IntOp $ParseIdx $ParseIdx + 1
+      StrCpy $SvcPublish "$ParseRest" "" "$ParseIdx"
+      StrCmp $SvcPublish "0" ServiceParse_done
+      StrCmp $SvcPublish "false" ServiceParse_done
+      StrCmp $SvcPublish "FALSE" ServiceParse_done
+      StrCmp $SvcPublish "no" ServiceParse_done
+      StrCmp $SvcPublish "off" ServiceParse_done
+      StrCpy $SvcPublish "1"
   ServiceParse_done:
 FunctionEnd
 
@@ -297,6 +335,7 @@ Function ServicesGetByIndex
   StrCpy $SvcName ""
   StrCpy $SvcPort ""
   StrCpy $SvcFlag "0"
+  StrCpy $SvcPublish "1"
   StrCpy $SvcIndex "0"
   StrCpy $3 "$R0"
   IfFileExists "$ServicesFile" 0 ServicesGetByIndex_done
@@ -349,7 +388,7 @@ FunctionEnd
 Function ServicesAdd
   FileOpen $0 "$ServicesFile" a
   IfErrors ServicesAdd_done
-  FileWrite $0 "$SvcName:$SvcPort:$SvcFlag$\r$\n"
+  FileWrite $0 "$SvcName:$SvcPort:$SvcFlag:$SvcPublish$\r$\n"
   FileClose $0
   ServicesAdd_done:
 FunctionEnd
@@ -401,7 +440,7 @@ Function ServicesReplace
     StrCpy $R0 "$R4"
     Call ServiceParse
     StrCmp $SvcName "$R3" 0 ServicesReplace_keep
-    FileWrite $1 "$5:$6:$SvcFlag$\r$\n"
+    FileWrite $1 "$5:$6:$SvcNewFlag:$SvcNewPublish$\r$\n"
     Goto ServicesReplace_next
   ServicesReplace_keep:
     FileWrite $1 "$R4$\r$\n"
@@ -417,85 +456,6 @@ Function ServicesReplace
     FileClose $0
     Delete "$ServicesFile.tmp"
   ServicesReplace_done:
-FunctionEnd
-
-Function ServicesSetFlag
-  StrCpy $R3 "$R0"
-  StrCpy $5 "$R1"
-  FileOpen $0 "$ServicesFile" r
-  IfErrors ServicesSetFlag_done
-  FileOpen $1 "$ServicesFile.tmp" w
-  IfErrors ServicesSetFlag_abort
-  ServicesSetFlag_loop:
-    ClearErrors
-    FileRead $0 $R4
-    IfErrors ServicesSetFlag_close
-    StrCmp $R4 "" ServicesSetFlag_close
-    ${StrTrimNewLines} $R4 $R4
-    StrCpy $R0 "$R4"
-    Call ServiceParse
-    StrCmp $SvcName "$R3" 0 ServicesSetFlag_keep
-    FileWrite $1 "$SvcName:$SvcPort:$5$\r$\n"
-    Goto ServicesSetFlag_next
-  ServicesSetFlag_keep:
-    FileWrite $1 "$R4$\r$\n"
-  ServicesSetFlag_next:
-    Goto ServicesSetFlag_loop
-  ServicesSetFlag_close:
-    FileClose $1
-    FileClose $0
-    Delete "$ServicesFile"
-    Rename "$ServicesFile.tmp" "$ServicesFile"
-    Return
-  ServicesSetFlag_abort:
-    FileClose $0
-    Delete "$ServicesFile.tmp"
-  ServicesSetFlag_done:
-FunctionEnd
-
-Function ServicesToggleAuth
-  Call ServicesGetByIndex
-  StrCmp $SvcName "" ServicesToggleAuth_done
-  StrCmp $SvcFlag "1" 0 ServicesToggleAuth_on
-  StrCpy $SvcFlag "0"
-  Goto ServicesToggleAuth_apply
-  ServicesToggleAuth_on:
-    StrCpy $SvcFlag "1"
-  ServicesToggleAuth_apply:
-    StrCpy $R0 "$SvcName"
-    StrCpy $R1 "$SvcFlag"
-    Call ServicesSetFlag
-  ServicesToggleAuth_done:
-FunctionEnd
-
-Function ServicesClearAuth
-  IfFileExists "$ServicesFile" 0 ServicesClearAuth_done
-  FileOpen $0 "$ServicesFile" r
-  IfErrors ServicesClearAuth_done
-  FileOpen $1 "$ServicesFile.tmp" w
-  IfErrors ServicesClearAuth_abort
-  ServicesClearAuth_loop:
-    ClearErrors
-    FileRead $0 $R4
-    IfErrors ServicesClearAuth_close
-    StrCmp $R4 "" ServicesClearAuth_close
-    ${StrTrimNewLines} $R4 $R4
-    StrCpy $R0 "$R4"
-    Call ServiceParse
-    StrCmp $SvcName "" ServicesClearAuth_next
-    FileWrite $1 "$SvcName:$SvcPort:0$\r$\n"
-  ServicesClearAuth_next:
-    Goto ServicesClearAuth_loop
-  ServicesClearAuth_close:
-    FileClose $1
-    FileClose $0
-    Delete "$ServicesFile"
-    Rename "$ServicesFile.tmp" "$ServicesFile"
-    Return
-  ServicesClearAuth_abort:
-    FileClose $0
-    Delete "$ServicesFile.tmp"
-  ServicesClearAuth_done:
 FunctionEnd
 
 Function ServicesSummary
@@ -520,6 +480,11 @@ Function ServicesSummary
       StrCpy $SvcSummary "$SvcName:$SvcPort"
     ${Else}
       StrCpy $SvcSummary "$SvcSummary, $SvcName:$SvcPort"
+    ${EndIf}
+    ${If} $SvcPublish == "0"
+      StrCpy $SvcSummary "$SvcSummary[仅本地]"
+    ${Else}
+      StrCpy $SvcSummary "$SvcSummary[已发布]"
     ${EndIf}
     ${If} $SvcFlag == "1"
       StrCpy $SvcSummary "$SvcSummary[鉴权]"
@@ -642,6 +607,12 @@ Function WriteServicesJson
     ${Else}
       FileWriteUTF16LE $R9 "false"
     ${EndIf}
+    FileWriteUTF16LE $R9 ',"publish":'
+    ${If} $SvcPublish == "0"
+      FileWriteUTF16LE $R9 "false"
+    ${Else}
+      FileWriteUTF16LE $R9 "true"
+    ${EndIf}
     FileWriteUTF16LE $R9 "}"
     StrCpy $2 "0"
   WriteServicesJson_next:
@@ -705,12 +676,6 @@ Function FinalizeWizard
     StrCpy $ServicesEnabled "0"
   ${EndIf}
   ${If} $AuthEnabled != "1"
-    StrCpy $AuthNetwork "none"
-    StrCpy $AuthAuthority ""
-    Call ServicesClearAuth
-  ${EndIf}
-  ${If} $ServicesEnabled != "1"
-    StrCpy $AuthEnabled "0"
     StrCpy $AuthNetwork "none"
     StrCpy $AuthAuthority ""
   ${EndIf}

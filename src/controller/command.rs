@@ -26,7 +26,7 @@ use crate::controller::service_registry::ServiceCommand;
 use crate::dht_cache::DhtCache;
 use crate::log::{LogLevel, LogStruct};
 use crate::network::NetworkHandle;
-use crate::service_dispatcher::{ControlCommand, ToController};
+use crate::service_dispatcher::{ControlCommand, DispatcherCommand, ToController};
 use crate::service_protocol;
 use crate::sidecar_protocol::Message;
 
@@ -545,18 +545,42 @@ impl NodeController {
     }
 
     async fn cmd_reload_config(&mut self) -> Result<Vec<u8>, String> {
-        // Rebuild the Swarm from the current config.toml. Note: it drops
+        // Re-read config.toml first so the Swarm, dispatcher and registry all
+        // observe the same snapshot. A parse/validation failure keeps the
+        // running configuration untouched.
+        let previous = self.config.read().clone();
+        if let Err(e) = self.config.reload_from_file() {
+            let result = serde_json::json!({"success": false, "error": e.to_string()});
+            return Ok(to_cbor(&result));
+        }
+
+        // Rebuild the Swarm from the reloaded config. Note: it drops
         // connections and clears the DHT local store.
         let result = match self.swarm.reload().await {
             Ok(_) => {
                 self.relay.reset();
                 self.bootstrap.reset();
+                if let Err(e) = self
+                    .to_dispatcher_cmd_tx
+                    .send(DispatcherCommand::Reload)
+                    .await
+                {
+                    LogStruct::new(
+                        LogLevel::Warning,
+                        "后端重载失败",
+                        format!("dispatcher 不可用: {e}"),
+                    )
+                    .emit();
+                }
                 self.send_service(ServiceCommand::Reset).await;
                 self.auth.reload();
                 self.invalidate_caches();
                 serde_json::json!({"success": true})
             }
-            Err(e) => serde_json::json!({"success": false, "error": e.to_string()}),
+            Err(e) => {
+                *self.config.write() = previous;
+                serde_json::json!({"success": false, "error": e.to_string()})
+            }
         };
         Ok(to_cbor(&result))
     }

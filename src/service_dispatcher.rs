@@ -28,7 +28,7 @@ use tokio_util::codec::Framed;
 use uuid::Uuid;
 
 use crate::auth;
-use crate::config::ConfigHandle;
+use crate::config::{ConfigHandle, LocalServiceEntry};
 use crate::log::{LogLevel, LogStruct};
 use crate::service_protocol;
 use crate::sidecar_protocol::{Message, PROTOCOL_VERSION, SidecarCodec, SidecarError};
@@ -52,6 +52,8 @@ pub struct ControlCommand {
 pub struct BackendStatus {
     pub service: String,
     pub ready: bool,
+    /// Backend task instance; stale instances are ignored after a reload.
+    instance: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -65,11 +67,25 @@ pub enum ToController {
     Control(ControlCommand),
 }
 
+/// Dispatcher endpoints handed to the controller after startup.
+pub struct DispatcherChannels {
+    pub inbound_tx: mpsc::Sender<InboundRequest>,
+    pub command_tx: mpsc::Sender<DispatcherCommand>,
+    pub readiness_rx: watch::Receiver<Arc<BackendReadiness>>,
+}
+
 /// An inbound P2P service request to forward to a local backend.
 pub struct InboundRequest {
     pub service: String,
     pub payload: Vec<u8>,
     pub response_tx: oneshot::Sender<Result<service_protocol::Response, String>>,
+}
+
+/// Control commands for the dispatcher task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DispatcherCommand {
+    /// Reconcile backend tasks with the current configuration.
+    Reload,
 }
 
 /// Commands from the router to a backend task.
@@ -78,6 +94,8 @@ enum BackendCmd {
     Request(InboundRequest),
     /// Write an already-built frame (e.g. a control reply) to the backend.
     WriteReply(Message),
+    /// Stop the backend task and close its connection.
+    Shutdown,
 }
 
 /// Events from a backend task to the router.
@@ -85,7 +103,11 @@ enum BackendEvent {
     /// A backend connection readiness change.
     Status(BackendStatus),
     /// A control message received from a backend, to relay to the controller.
-    Control { service: String, msg: Message },
+    Control {
+        service: String,
+        msg: Message,
+        instance: u64,
+    },
 }
 
 fn command_timeout(msg: &Message, base: Duration, kad: Duration) -> Duration {
@@ -133,68 +155,115 @@ pub struct ServiceDispatcher {
     inbound_rx: mpsc::Receiver<InboundRequest>,
     event_rx: mpsc::Receiver<BackendEvent>,
     /// Keeps the backend event channel open even when there are no backends.
-    _event_tx: mpsc::Sender<BackendEvent>,
+    event_tx: mpsc::Sender<BackendEvent>,
+    command_rx: mpsc::Receiver<DispatcherCommand>,
     to_controller_tx: mpsc::Sender<ToController>,
     /// Service name -> command sender for its backend task.
     backends: HashMap<String, mpsc::Sender<BackendCmd>>,
+    /// Service name -> configured backend port, used to detect reloads.
+    backend_ports: HashMap<String, u16>,
+    /// Service name -> active backend task instance.
+    backend_instances: HashMap<String, u64>,
+    next_backend_instance: u64,
     my_peer_id: PeerId,
     backend_ready: HashSet<String>,
     readiness_tx: watch::Sender<Arc<BackendReadiness>>,
+    config: ConfigHandle,
     shutdown_rx: watch::Receiver<bool>,
     query_timeout: Duration,
     kad_timeout: Duration,
 }
 
+/// Valid services that should have a backend connection under the current
+/// configuration. `publish` does not affect this list: unpublished services
+/// stay reachable locally.
+fn desired_local_services(config: &ConfigHandle) -> Vec<LocalServiceEntry> {
+    let config = config.read();
+    if !config.services.dispatcher.enabled {
+        return Vec::new();
+    }
+
+    let mut services = Vec::with_capacity(config.services.dispatcher.local_services.len());
+    let mut rejected = Vec::new();
+    let mut seen = HashSet::new();
+    for svc in &config.services.dispatcher.local_services {
+        if !auth::is_valid_service_name(&svc.name) {
+            rejected.push(svc.name.clone());
+            continue;
+        }
+        if !seen.insert(svc.name.clone()) {
+            continue;
+        }
+        services.push(svc.clone());
+    }
+    drop(config);
+
+    if !rejected.is_empty() {
+        LogStruct::new(
+            LogLevel::Warning,
+            "服务名非法，已跳过",
+            format!(
+                "{}（保留名 'service' 或含非法字符，不会建立后端连接）",
+                rejected.join(", ")
+            ),
+        )
+        .emit();
+    }
+    services
+}
+
+fn start_backend(
+    name: String,
+    port: u16,
+    instance: u64,
+    event_tx: mpsc::Sender<BackendEvent>,
+    shutdown_rx: watch::Receiver<bool>,
+) -> mpsc::Sender<BackendCmd> {
+    let (cmd_tx, cmd_rx) = mpsc::channel(BACKEND_QUEUE_CAPACITY);
+    tokio::spawn(backend_task(
+        name,
+        format!("127.0.0.1:{port}"),
+        instance,
+        cmd_rx,
+        event_tx,
+        shutdown_rx,
+    ));
+    cmd_tx
+}
+
 impl ServiceDispatcher {
     pub fn new(
         inbound_rx: mpsc::Receiver<InboundRequest>,
+        command_rx: mpsc::Receiver<DispatcherCommand>,
         to_controller_tx: mpsc::Sender<ToController>,
         config: ConfigHandle,
         my_peer_id: PeerId,
         shutdown_rx: watch::Receiver<bool>,
     ) -> (Self, watch::Receiver<Arc<BackendReadiness>>) {
-        let configured = config.read().services.dispatcher.local_services.clone();
-        // Services with invalid names (reserved "service" or illegal characters)
-        // get no backend connection.
-        let mut local_services = Vec::with_capacity(configured.len());
-        let mut rejected = Vec::new();
-        for svc in configured {
-            if auth::is_valid_service_name(&svc.name) {
-                local_services.push(svc);
-            } else {
-                rejected.push(svc.name);
-            }
-        }
-        if !rejected.is_empty() {
-            LogStruct::new(
-                LogLevel::Warning,
-                "服务名非法，已跳过",
-                format!(
-                    "{}（保留名 'service' 或含非法字符，不会建立后端连接）",
-                    rejected.join(", ")
-                ),
-            )
-            .emit();
-        }
-
+        let local_services = desired_local_services(&config);
         let query_timeout = Duration::from_secs(config.dispatcher_query_timeout().into());
         let kad_timeout = Duration::from_secs(config.kademlia_query_timeout().into());
         let (readiness_tx, readiness_rx) = watch::channel(Arc::new(BackendReadiness::default()));
         let (event_tx, event_rx) = mpsc::channel(EVENT_QUEUE_CAPACITY);
         let mut backends = HashMap::new();
-        if config.dispatcher_enabled() {
-            for svc in &local_services {
-                let (cmd_tx, cmd_rx) = mpsc::channel(BACKEND_QUEUE_CAPACITY);
-                backends.insert(svc.name.clone(), cmd_tx);
-                tokio::spawn(backend_task(
-                    svc.name.clone(),
-                    format!("127.0.0.1:{}", svc.port),
-                    cmd_rx,
-                    event_tx.clone(),
-                    shutdown_rx.clone(),
-                ));
-            }
-        } else {
+        let mut backend_ports = HashMap::new();
+        let mut backend_instances = HashMap::new();
+        let mut next_backend_instance = 1u64;
+        for svc in &local_services {
+            let instance = next_backend_instance;
+            next_backend_instance = next_backend_instance.wrapping_add(1);
+            let cmd_tx = start_backend(
+                svc.name.clone(),
+                svc.port,
+                instance,
+                event_tx.clone(),
+                shutdown_rx.clone(),
+            );
+            backends.insert(svc.name.clone(), cmd_tx);
+            backend_ports.insert(svc.name.clone(), svc.port);
+            backend_instances.insert(svc.name.clone(), instance);
+        }
+        if !config.dispatcher_enabled() {
             LogStruct::new(
                 LogLevel::Warning,
                 "ServiceDispatcher 已禁用",
@@ -207,18 +276,86 @@ impl ServiceDispatcher {
             Self {
                 inbound_rx,
                 event_rx,
-                _event_tx: event_tx,
+                event_tx,
+                command_rx,
                 to_controller_tx,
                 backends,
+                backend_ports,
+                backend_instances,
+                next_backend_instance,
                 my_peer_id,
                 backend_ready: HashSet::new(),
                 readiness_tx,
+                config,
                 shutdown_rx,
                 query_timeout,
                 kad_timeout,
             },
             readiness_rx,
         )
+    }
+
+    /// Reconcile backend tasks with the current configuration.
+    ///
+    /// Existing connections are kept, removed services are asked to stop, and
+    /// newly configured services are connected without restarting the node.
+    fn reload(&mut self) {
+        let desired = desired_local_services(&self.config);
+        let desired_ports: HashMap<String, u16> = desired
+            .iter()
+            .map(|service| (service.name.clone(), service.port))
+            .collect();
+
+        let removed: Vec<String> = self
+            .backends
+            .keys()
+            .filter(|name| {
+                desired_ports
+                    .get(*name)
+                    .is_none_or(|port| self.backend_ports.get(*name) != Some(port))
+            })
+            .cloned()
+            .collect();
+        for name in &removed {
+            if let Some(cmd_tx) = self.backends.get(name) {
+                let _ = cmd_tx.try_send(BackendCmd::Shutdown);
+            }
+        }
+        self.backends.retain(|name, _| !removed.contains(name));
+        self.backend_ports.retain(|name, _| !removed.contains(name));
+        self.backend_instances
+            .retain(|name, _| !removed.contains(name));
+
+        let mut readiness_changed = false;
+        for name in &removed {
+            readiness_changed |= self.backend_ready.remove(name);
+        }
+        if readiness_changed {
+            let _ = self.readiness_tx.send(Arc::new(BackendReadiness {
+                ready: self.backend_ready.clone(),
+            }));
+        }
+
+        for svc in desired {
+            if self.backends.contains_key(&svc.name) {
+                continue;
+            }
+            let instance = self.next_backend_instance;
+            self.next_backend_instance = self.next_backend_instance.wrapping_add(1);
+            let cmd_tx = start_backend(
+                svc.name.clone(),
+                svc.port,
+                instance,
+                self.event_tx.clone(),
+                self.shutdown_rx.clone(),
+            );
+            self.backends.insert(svc.name.clone(), cmd_tx);
+            self.backend_ports.insert(svc.name.clone(), svc.port);
+            self.backend_instances.insert(svc.name, instance);
+        }
+
+        self.query_timeout = Duration::from_secs(self.config.dispatcher_query_timeout().into());
+        self.kad_timeout = Duration::from_secs(self.config.kademlia_query_timeout().into());
     }
 
     pub async fn run(mut self) {
@@ -254,6 +391,11 @@ impl ServiceDispatcher {
                     };
                     match event {
                         BackendEvent::Status(status) => {
+                            if self.backend_instances.get(&status.service)
+                                != Some(&status.instance)
+                            {
+                                continue;
+                            }
                             if status.ready {
                                 self.backend_ready.insert(status.service.clone());
                             } else {
@@ -263,11 +405,21 @@ impl ServiceDispatcher {
                                 ready: self.backend_ready.clone(),
                             }));
                         }
-                        BackendEvent::Control { service, msg } => {
+                        BackendEvent::Control {
+                            service,
+                            msg,
+                            instance,
+                        } => {
+                            if self.backend_instances.get(&service) != Some(&instance) {
+                                continue;
+                            }
                             self.forward_control(service, msg).await
                         }
                     }
                 }
+                Some(command) = self.command_rx.recv() => match command {
+                    DispatcherCommand::Reload => self.reload(),
+                },
                 _ = self.shutdown_rx.changed() => {
                     return;
                 }
@@ -465,6 +617,7 @@ impl ServiceDispatcher {
 async fn backend_task(
     service: String,
     addr: String,
+    instance: u64,
     mut cmd_rx: mpsc::Receiver<BackendCmd>,
     event_tx: mpsc::Sender<BackendEvent>,
     mut shutdown_rx: watch::Receiver<bool>,
@@ -514,6 +667,7 @@ async fn backend_task(
             .send(BackendEvent::Status(BackendStatus {
                 service: service.clone(),
                 ready: true,
+                instance,
             }))
             .await;
 
@@ -555,6 +709,7 @@ async fn backend_task(
                             .send(BackendEvent::Control {
                                 service: service.clone(),
                                 msg: control,
+                                instance,
                             })
                             .await;
                     }
@@ -591,6 +746,10 @@ async fn backend_task(
                             break;
                         }
                     }
+                    Some(BackendCmd::Shutdown) => {
+                        shutdown = true;
+                        break;
+                    }
                 },
                 _ = shutdown_rx.changed() => {
                     shutdown = true;
@@ -611,6 +770,7 @@ async fn backend_task(
             .send(BackendEvent::Status(BackendStatus {
                 service: service.clone(),
                 ready: false,
+                instance,
             }))
             .await;
         LogStruct::new(
@@ -667,6 +827,7 @@ async fn wait_backoff(
                         .send(Err(format!("backend not connected: {service}")));
                 }
                 Some(BackendCmd::WriteReply(_)) => {}
+                Some(BackendCmd::Shutdown) => return true,
             },
         }
     }
@@ -675,6 +836,7 @@ async fn wait_backoff(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::NodeConfig;
     use uuid::Uuid;
 
     const KAD: Duration = Duration::from_secs(60);
@@ -743,6 +905,82 @@ mod tests {
             command_timeout(&msg, BASE, KAD),
             BASE.saturating_add(MARGIN)
         );
+    }
+
+    #[test]
+    fn publish_flag_does_not_gate_backend_connections() {
+        let mut config = NodeConfig::default();
+        config.services.dispatcher.local_services = vec![
+            LocalServiceEntry {
+                name: "private".to_string(),
+                port: 7001,
+                require_auth: false,
+                publish: false,
+            },
+            LocalServiceEntry {
+                name: "public".to_string(),
+                port: 7002,
+                require_auth: false,
+                publish: true,
+            },
+        ];
+        let names: Vec<String> = desired_local_services(&ConfigHandle::new(config))
+            .into_iter()
+            .map(|service| service.name)
+            .collect();
+        assert_eq!(names, vec!["private".to_string(), "public".to_string()]);
+    }
+
+    #[test]
+    fn disabled_dispatcher_has_no_backends() {
+        let mut config = NodeConfig::default();
+        config.services.dispatcher.enabled = false;
+        config.services.dispatcher.local_services = vec![LocalServiceEntry {
+            name: "cmd".to_string(),
+            port: 7003,
+            require_auth: false,
+            publish: true,
+        }];
+        assert!(desired_local_services(&ConfigHandle::new(config)).is_empty());
+    }
+
+    #[tokio::test]
+    async fn reload_adds_and_removes_backends() {
+        let config = ConfigHandle::new(NodeConfig::default());
+        let (_inbound_tx, inbound_rx) = mpsc::channel(1);
+        let (_command_tx, command_rx) = mpsc::channel(1);
+        let (controller_tx, _controller_rx) = mpsc::channel(1);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (mut dispatcher, _readiness) = ServiceDispatcher::new(
+            inbound_rx,
+            command_rx,
+            controller_tx,
+            config.clone(),
+            PeerId::random(),
+            shutdown_rx,
+        );
+        assert!(dispatcher.backends.is_empty());
+
+        config.write().services.dispatcher.local_services = vec![LocalServiceEntry {
+            name: "cmd".to_string(),
+            port: 7004,
+            require_auth: false,
+            publish: false,
+        }];
+        dispatcher.reload();
+        assert!(dispatcher.backends.contains_key("cmd"));
+        assert_eq!(dispatcher.backend_ports.get("cmd"), Some(&7004));
+
+        config.write().services.dispatcher.local_services[0].port = 7005;
+        dispatcher.reload();
+        assert_eq!(dispatcher.backend_ports.get("cmd"), Some(&7005));
+
+        config.write().services.dispatcher.local_services.clear();
+        dispatcher.reload();
+        assert!(dispatcher.backends.is_empty());
+        assert!(dispatcher.backend_ports.is_empty());
+
+        let _ = shutdown_tx.send(true);
     }
 
     #[test]

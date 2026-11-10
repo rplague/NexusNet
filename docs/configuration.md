@@ -66,6 +66,7 @@ max_response_bytes = 16777216    # P2P 服务响应上限，默认 16 MiB，范�
 name = "cmd"
 port = 5014
 require_auth = false
+publish = true                   # false = 仅本地，不发布到网络
 
 [services.registry]
 max_inflight_dht = 4             # 1..=16，registry DHT 作业并发上限
@@ -152,6 +153,10 @@ network = "none"                 # "none" = 不鉴权；启用时改为 myorg
 | `name` | 必填 | 服务名；在列表中必须唯一 |
 | `port` | 必填 | 本地后端端口；节点固定连接 `127.0.0.1:<port>` |
 | `require_auth` | `false` | 该服务是否要求鉴权 |
+| `publish` | `true` | 是否发布到网络；`false` 时不写 provider 记录与服务类型索引，但保留本地后端和显式 peer 调用 |
+
+修改 `local_services` 后发送 `SIGHUP` 或调用 `reload_config`：节点会重新读取
+`config.toml`，按新列表建立/停止后端连接，并撤销与重新宣告服务，无需重启。
 
 #### `[services.registry]`
 
@@ -289,6 +294,7 @@ max_response_bytes = 16777216    # P2P response limit, default 16 MiB, range 1..
 name = "cmd"
 port = 5014
 require_auth = false
+publish = true                   # false = keep local only
 
 [services.registry]
 max_inflight_dht = 4             # 1..=16, concurrent registry DHT jobs
@@ -375,6 +381,11 @@ network = "none"                 # "none" = no authorization; use a network name
 | `name` | required | Service name; must be unique in the list |
 | `port` | required | Local backend port; the node always connects to `127.0.0.1:<port>` |
 | `require_auth` | `false` | Whether this service requires authorization |
+| `publish` | `true` | Publish to the network; when `false` no provider record or service-type entry is written, while the local backend and explicit peer calls remain available |
+
+Send `SIGHUP` or call `reload_config` after changing `local_services`: the node
+re-reads `config.toml`, starts/stops backend connections to match the new list,
+and withdraws and re-announces services without a restart.
 
 #### `[services.registry]`
 

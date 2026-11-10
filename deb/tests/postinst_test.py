@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Exercise deb/postinst and deb/postrm with a fake environment."""
 
+import json
 import os
 import subprocess
 import tempfile
@@ -49,6 +50,9 @@ FAKE_BINARY = r'''#!/bin/sh
 printf '%s\n' "$*" >> "${TEST_BIN_LOG:?}"
 case "$1" in
   --write-config)
+    if [ -n "${TEST_ANSWERS_OUT:-}" ]; then
+      cp "$2" "${TEST_ANSWERS_OUT}"
+    fi
     _dir=""
     _prev=""
     for _arg in "$@"; do
@@ -199,6 +203,20 @@ class InstallerTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(any("--write-config" in line for line in self.bin_calls()))
         self.assertEqual((self.etc / "config.schema").read_text().strip(), "1")
+
+    def test_wizard_keeps_service_flags_when_auth_disabled(self):
+        self.preseed("setup_mode", "wizard")
+        self.preseed("auth_enabled", "false")
+        self.preseed("local_services_enabled", "true")
+        self.preseed("local_services", "ocr:5014:1:0")
+        answers = self.root / "answers.json"
+        result = self.run_script(self.render(POSTINST), TEST_ANSWERS_OUT=str(answers))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        data = json.loads(answers.read_text(encoding="utf-8"))
+        service = data["services"]["dispatcher"]["local_services"][0]
+        self.assertTrue(service["require_auth"])
+        self.assertFalse(service["publish"])
+        self.assertEqual(data["auth"]["network"], "none")
 
     def test_compatible_skip_checks_and_stamps_without_rewriting(self):
         self.etc.mkdir(parents=True)

@@ -243,19 +243,11 @@ fn validate(config: &NodeConfig, setup_mode: bool) -> SetupResult<()> {
         if service.name.is_empty() {
             return Err(SetupError::usage("local service name must not be empty"));
         }
-        if service.require_auth {
-            if !auth_enabled {
-                return Err(SetupError::usage(format!(
-                    "service {} requires auth but auth.network is none",
-                    service.name
-                )));
-            }
-            if !is_valid_service_name(&service.name) {
-                return Err(SetupError::usage(format!(
-                    "invalid auth service name: {}",
-                    service.name
-                )));
-            }
+        if service.require_auth && !is_valid_service_name(&service.name) {
+            return Err(SetupError::usage(format!(
+                "invalid auth service name: {}",
+                service.name
+            )));
         }
     }
 
@@ -395,6 +387,40 @@ mod tests {
         assert_eq!(config.network.port, 6000);
         assert!(!config.services.ping.enabled);
         assert_eq!(config.services.ping.interval_secs, 15);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_config_accepts_service_flags() {
+        let dir = temp_dir("service-flags");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let answers = dir.join("answers.json");
+        let out = dir.join("config");
+        write(
+            &answers,
+            r#"{
+                "services": {
+                    "dispatcher": {
+                        "local_services": [
+                            {"name": "ocr", "port": 5014, "require_auth": true, "publish": false}
+                        ]
+                    }
+                }
+            }"#,
+        );
+        run_write_config(&[
+            answers.display().to_string(),
+            "--config-dir".into(),
+            out.display().to_string(),
+        ])
+        .unwrap();
+        let config: NodeConfig =
+            toml::from_str(&fs::read_to_string(out.join("config.toml")).unwrap()).unwrap();
+        let service = &config.services.dispatcher.local_services[0];
+        assert_eq!(service.name, "ocr");
+        assert!(service.require_auth);
+        assert!(!service.publish);
         let _ = fs::remove_dir_all(&dir);
     }
 

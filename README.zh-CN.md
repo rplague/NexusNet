@@ -6,7 +6,7 @@
 
 NexusNet 将一台机器接入去中心化 P2P 网络：Kademlia DHT 负责发现与服务注册，WebSocket 负责传输，Circuit Relay v2 负责 NAT 穿透，边车协议让业务进程可以用任何语言实现。
 
-**状态：** `0.6.2-11020` · 完成度约 6/10 · 接口正在稳定，尚未冻结。
+**状态：** `0.6.3` · 完成度约 6/10 · 接口正在稳定，尚未冻结。
 
 [为什么](#为什么选择-nexusnet) · [快速开始](#快速开始) · [架构](#架构) · [特性](#特性) · [配置](#配置) · [兼容性](#兼容性与状态) · [文档](#文档)
 
@@ -92,7 +92,7 @@ graph TD
 | 能力 | 提供什么 | 详情 |
 |---|---|---|
 | 发现 | Kademlia provider 记录、按 RTT 排序选择 provider | [docs/service-registry.md](./docs/service-registry.md) |
-| 服务注册 | 带租约的类型索引、自动重新宣告、中继门控 | [docs/service-registry.md](./docs/service-registry.md) |
+| 服务注册 | 带租约的类型索引、自动重新宣告、中继门控、可逐服务选择不发布到网络 | [docs/service-registry.md](./docs/service-registry.md) |
 | 边车协议 | 持久 TCP、CBOR 消息、UUID 关联、默认 30 秒超时 | [docs/sidecar.cddl](./docs/sidecar.cddl) |
 | NAT 穿透 | Circuit Relay v2、预约、感知中继的宣告 | [docs/nat-relay.md](./docs/nat-relay.md) |
 | 鉴权 | COSE_Sign1 白名单、TUF-lite 回滚/冻结/mix-and-match 防护 | [docs/auth.md](./docs/auth.md) |
@@ -263,7 +263,7 @@ Windows 侧提供 NSIS 安装器和便携 zip，两者都通过 NSSM 以 `NT SER
 
 ## 兼容性与状态
 
-NexusNet 当前为 **0.6.2-11020**，完成度约 **6/10**。接口正在稳定，尚未冻结。
+NexusNet 当前为 **0.6.3**，完成度约 **6/10**。接口正在稳定，尚未冻结。
 
 - **0.6.x 起只支持 WebSocket。** 旧版 raw TCP 节点无法连接；所有节点必须一起升级。
 - **`/oahd/service/types` 无版本格式变更。** 新节点可读两种格式，但一律写回 tuple 格式。升级其余节点前先停止旧节点写入；不提供滚动兼容。

@@ -197,6 +197,17 @@ impl RegistryState {
         Duration::from_secs(self.config.dispatcher_types_sync_interval() as u64)
     }
 
+    /// Whether a local service should be announced to the network.
+    fn is_publishable(&self, service: &str) -> bool {
+        self.config
+            .read()
+            .services
+            .dispatcher
+            .local_services
+            .iter()
+            .any(|entry| entry.publish && entry.name == service)
+    }
+
     fn insert_lease(&mut self, name: &str, expires_at: u64) {
         if !auth::is_valid_service_name(name) {
             return;
@@ -320,9 +331,15 @@ impl RegistryState {
                 self.generation = self.generation.wrapping_add(1);
                 self.bootstrapped = false;
                 self.active_relays = 0;
+                // Withdraw everything that may still be advertised before
+                // re-announcing under the new configuration. This removes
+                // services that were deleted or switched to `publish = false`.
+                let mut stale = std::mem::take(&mut self.relay_withdraw);
+                stale.extend(self.announced.iter().cloned());
+                stale.extend(self.announce_inflight.iter().cloned());
                 self.announced.clear();
                 self.withdraw_deadline.clear();
-                self.relay_withdraw.clear();
+                self.relay_withdraw = stale;
                 self.relay_withdraw_retry_at.clear();
                 self.announce_inflight.clear();
                 self.withdraw_inflight.clear();
@@ -386,6 +403,7 @@ impl RegistryState {
             .filter(|(service, at)| {
                 self.relay_ready()
                     && **at <= now
+                    && self.is_publishable(service)
                     && self.backend_ready.contains(*service)
                     && !self.announced.contains(*service)
                     && !self.relay_withdraw.contains(*service)
@@ -420,7 +438,7 @@ impl RegistryState {
                 .dispatcher
                 .local_services
                 .iter()
-                .filter(|service| auth::is_valid_service_name(&service.name))
+                .filter(|service| service.publish && auth::is_valid_service_name(&service.name))
                 .map(|service| service.name.clone())
                 .collect();
             for service in local {
@@ -572,7 +590,10 @@ impl RegistryState {
                             "",
                         )
                         .emit();
-                        if self.backend_ready.contains(&service) && self.relay_ready() {
+                        if self.is_publishable(&service)
+                            && self.backend_ready.contains(&service)
+                            && self.relay_ready()
+                        {
                             self.announce_retry_at.insert(service, now);
                         }
                     }
@@ -586,10 +607,13 @@ impl RegistryState {
                         if self.relay_withdraw.contains(&service) {
                             self.relay_withdraw_retry_at
                                 .insert(service.clone(), now + ANNOUNCE_RETRY_INITIAL);
-                        } else if self.backend_ready.contains(&service) {
+                        } else if self.is_publishable(&service)
+                            && self.backend_ready.contains(&service)
+                        {
                             self.announce_retry_at.insert(service.clone(), now);
                         } else {
-                            self.withdraw_deadline
+                            self.relay_withdraw.insert(service.clone());
+                            self.relay_withdraw_retry_at
                                 .insert(service, now + ANNOUNCE_RETRY_INITIAL);
                         }
                     }
@@ -1080,6 +1104,7 @@ mod tests {
                 name: (*name).to_string(),
                 port: 6000 + index as u16,
                 require_auth: false,
+                publish: true,
             })
             .collect();
         ConfigHandle::new(config)
@@ -1184,6 +1209,95 @@ mod tests {
         let expires_at = *state.known_types.get("cmd").unwrap();
         assert!(expires_at >= before + state.config.registry_type_ttl_secs());
         assert!(state.snapshot().types.contains(&"cmd".to_string()));
+    }
+
+    #[test]
+    fn unpublished_service_is_not_announced() {
+        let mut state = RegistryState::new(config_with_services(&["cmd"]));
+        state.config.write().services.dispatcher.local_services[0].publish = false;
+        let now = Instant::now();
+        state.set_backend_ready("cmd", true, now);
+        state.handle(ServiceCommand::BootstrapCompleted, now);
+
+        let jobs = state.plan(now, 8);
+        assert!(
+            !jobs
+                .iter()
+                .any(|job| matches!(job, JobSpec::Announce { .. }))
+        );
+        assert!(!state.snapshot().types.contains(&"cmd".to_string()));
+    }
+
+    #[test]
+    fn reset_withdraws_services_that_are_no_longer_published() {
+        let mut state = RegistryState::new(config_with_services(&["cmd"]));
+        let now = Instant::now();
+        let jobs = announce_services(&mut state, &["cmd"], now);
+        let JobSpec::Announce {
+            generation,
+            service,
+            ..
+        } = jobs.into_iter().next().unwrap()
+        else {
+            panic!("expected announce");
+        };
+        state.apply(
+            JobResult::Announced {
+                generation,
+                service,
+                result: Ok(()),
+            },
+            now,
+        );
+        assert!(state.announced.contains("cmd"));
+
+        state.config.write().services.dispatcher.local_services[0].publish = false;
+        state.handle(ServiceCommand::Reset, now);
+
+        let jobs = state.plan(now, 8);
+        assert!(
+            !jobs
+                .iter()
+                .any(|job| matches!(job, JobSpec::Announce { .. }))
+        );
+        let JobSpec::Withdraw {
+            generation,
+            service,
+            ..
+        } = jobs
+            .into_iter()
+            .find(|job| matches!(job, JobSpec::Withdraw { .. }))
+            .expect("expected withdraw")
+        else {
+            unreachable!()
+        };
+        state.apply(
+            JobResult::Withdrawn {
+                generation,
+                service,
+                result: Ok(()),
+            },
+            now,
+        );
+        assert!(!state.announced.contains("cmd"));
+        assert!(!state.announce_retry_at.contains_key("cmd"));
+    }
+
+    #[test]
+    fn retries_do_not_announce_unpublished_services() {
+        let mut state = RegistryState::new(config_with_services(&["cmd"]));
+        state.config.write().services.dispatcher.local_services[0].publish = false;
+        let now = Instant::now();
+        state.set_backend_ready("cmd", true, now);
+        state.handle(ServiceCommand::BootstrapCompleted, now);
+        state.announce_retry_at.insert("cmd".to_string(), now);
+
+        let jobs = state.plan(now, 8);
+        assert!(
+            !jobs
+                .iter()
+                .any(|job| matches!(job, JobSpec::Announce { .. }))
+        );
     }
 
     #[test]

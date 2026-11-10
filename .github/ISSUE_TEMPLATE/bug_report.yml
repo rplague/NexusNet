@@ -36,7 +36,7 @@ body:
     attributes:
       label: NexusNet version
       description: The release tag, or the output of `git describe --tags`.
-      placeholder: "0.6.2-11020"
+      placeholder: "0.6.3"
     validations:
       required: true
   - type: dropdown

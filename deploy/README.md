@@ -46,7 +46,7 @@ NexusNet 以原生的 Debian 打包（`.deb`）分发，由 `dpkg`/`apt` 管理�
 - 本版本只使用 WebSocket over HTTP；`network.port` 是 WebSocket TCP 端口。
 - bootstrap 地址必须带 `/ws`，例如
   `/ip6/.../tcp/5000/ws/p2p/<PeerId>`。
-- 旧版 raw TCP 节点不兼容，所有节点必须使用 0.6.x；当前发布版本 0.6.2-11020。
+- 旧版 raw TCP 节点不兼容，所有节点必须使用 0.6.x；当前发布版本 0.6.3。
 
 ### 安装
 
@@ -67,16 +67,17 @@ preseed 和非交互兼容。依赖 `whiptail` 与 `python3 (>= 3.11)`，目标�
 向导页面：
 
 - 配置方式：向导 / 跳过（仅首次安装或破坏性升级）
-- 节点名称、描述（不再询问角色和 IPv4/IPv6 监听；启动时自动检测地址族）
-- WebSocket 端口（1..65535）
-- 本地服务动态编辑器（添加/编辑/删除/保存/取消；可关闭并清空本地服务）
-- 鉴权网络名、authority 公钥，以及逐个服务切换鉴权状态（回车切换，保存并返回）；可关闭鉴权网络
-- Bootstrap 编辑器（添加/编辑/删除单条地址；列表中长地址中间截断，编辑时显示完整值；每项必须包含 `/ws` 和 `/p2p/<PeerId>`；可留空）
+- 节点名称、描述
+- 监听端口（1..65535）
+- 本地服务编辑器（添加/编辑/删除；每项包含名称、端口、发布到网络、需要鉴权）
+- 鉴权网络：启用开关、网络名称、authority 公钥
+- Bootstrap 编辑器（添加/编辑/删除单条地址；列表中长地址中间截断，编辑时显示完整值）
 - 汇总确认后写入配置
 
-PQ 传输和 PQ 身份使用程序默认值（新安装默认启用），不在页面中显示；`pq_required`
-仍可通过 preseed 设置。已有 `/etc/<pkg>/config.toml` 时会预填节点、端口、bootstrap、
-本地服务和鉴权信息；解析失败只告警并回退默认值。
+向导只管理上述设置；未在向导中列出的配置在写入时恢复默认值。PQ、Ping、Kademlia、
+Dispatcher、Registry、Relay、Compat 等高级项不在页面中显示，仍可通过 preseed 覆盖。
+已有 `/etc/<pkg>/config.toml` 时会预填节点、端口、bootstrap、本地服务和鉴权信息；
+解析失败只告警并回退默认值。
 
 升级决策：
 
@@ -112,7 +113,7 @@ DEBIAN_FRONTEND=noninteractive apt install -y ./<pkg>_<version>_amd64.deb
 <pkg> <pkg>/node_name string node-01
 <pkg> <pkg>/bootstrap string /ip4/1.2.3.4/tcp/5000/ws/p2p/12D3KooW...
 <pkg> <pkg>/local_services_enabled boolean true
-<pkg> <pkg>/local_services string ocr:5014:1
+<pkg> <pkg>/local_services string ocr:5014:1:1
 <pkg> <pkg>/auth_enabled boolean true
 <pkg> <pkg>/auth_network string corp
 <pkg> <pkg>/auth_authority string <base64-ed25519-public-key>
@@ -278,15 +279,14 @@ NSSM 由脚本按固定版本（2.24）+ SHA256 下载缓存到 `target/nssm-cac
 
 - 配置方式：使用配置向导 / 跳过（已有配置时跳过即保留）
 - 节点名称、描述
-- WebSocket 端口（1..65535）
-- 本地服务编辑器（添加/编辑/删除；名称、端口校验）
-- 单个鉴权网络与 authority，以及每个服务的鉴权开关
-- Bootstrap 地址（每行一个或逗号分隔，必须包含 `/ws` 和 `/p2p/<PeerId>`；可留空）
+- 监听端口（1..65535）
+- 本地服务编辑器（添加/编辑/删除；每项包含名称、端口、发布到网络、需要鉴权）
+- 鉴权网络：启用开关、网络名称、authority 公钥
+- Bootstrap 地址（每行一个或逗号分隔）
 - 摘要确认
 
-不再询问角色、IPv4/IPv6 监听和防火墙；程序启动时自动探测地址族。
-PQ 传输和 PQ 身份使用程序默认值；`pq_required` 使用默认值。
-Ping/Kademlia、Dispatcher/Registry、Relay/Compat 等高级项使用默认值，不在页面中逐项询问。
+向导只管理上述设置；未在向导中列出的配置在写入时恢复默认值。
+PQ、Ping/Kademlia、Dispatcher/Registry、Relay/Compat 等高级项使用默认值，不在页面中显示。
 Windows 不预填旧 `config.toml`；重新配置从默认值开始，旧配置会备份为
 `config.toml.bak.<timestamp>`。
 
@@ -450,7 +450,7 @@ Paths are anchored by the `NEXUSNET_CONFIG_PATH` / `NEXUSNET_KEYPAIR_PATH` / `NE
 - Callers resolve a provider's relay address through `get_closest_peers`; see [../docs/nat-relay.md](../docs/nat-relay.md).
 - This version uses WebSocket over HTTP only; `network.port` is the WebSocket TCP port.
 - Bootstrap addresses must use `/ws`, for example `/ip6/.../tcp/5000/ws/p2p/<PeerId>`.
-- Older raw-TCP nodes are incompatible; every node must run 0.6.x. The current release is 0.6.2-11020.
+- Older raw-TCP nodes are incompatible; every node must run 0.6.x. The current release is 0.6.3.
 
 ### Installation
 
@@ -469,14 +469,14 @@ Interactive installs and `dpkg-reconfigure <pkg>` use the whiptail wizard; debco
 Wizard pages:
 
 - Setup mode: wizard / skip (first install or breaking upgrade only)
-- Node name and description (roles and IPv4/IPv6 listeners are no longer asked; address families are detected at startup)
-- WebSocket port (1..65535)
-- Dynamic local-service editor (add/edit/delete/save/cancel; can disable and clear local services)
-- Authorization network name, authority public key, and per-service authorization toggles (Enter toggles; save and return); the network can be disabled
-- Bootstrap editor (add/edit/delete one address at a time; long addresses are truncated in the middle in the list and shown in full while editing; each entry must contain `/ws` and `/p2p/<PeerId>`; may be left empty)
+- Node name and description
+- Listen port (1..65535)
+- Local-service editor (add/edit/delete; each entry has a name, port, publish switch and auth switch)
+- Authorization network: enable switch, network name and authority public key
+- Bootstrap editor (add/edit/delete one address at a time; long addresses are truncated in the middle in the list and shown in full while editing)
 - Summary confirmation, then write the configuration
 
-PQ transport and PQ identity use program defaults (enabled for new installs) and are not shown; `pq_required` can still be set through preseed. An existing `/etc/<pkg>/config.toml` pre-fills node, port, bootstrap, local services and authorization; parse failures only log a warning and fall back to defaults.
+Only these settings are managed by the wizard; unlisted configuration is reset to defaults on write. PQ, Ping, Kademlia, Dispatcher, Registry, Relay and Compat stay hidden and can still be overridden through preseed. An existing `/etc/<pkg>/config.toml` pre-fills node, port, bootstrap, local services and authorization; parse failures only log a warning and fall back to defaults.
 
 Upgrade decisions:
 
@@ -510,7 +510,7 @@ Without preseed this behaves as "skip the wizard": generate defaults and run `sy
 <pkg> <pkg>/node_name string node-01
 <pkg> <pkg>/bootstrap string /ip4/1.2.3.4/tcp/5000/ws/p2p/12D3KooW...
 <pkg> <pkg>/local_services_enabled boolean true
-<pkg> <pkg>/local_services string ocr:5014:1
+<pkg> <pkg>/local_services string ocr:5014:1:1
 <pkg> <pkg>/auth_enabled boolean true
 <pkg> <pkg>/auth_network string corp
 <pkg> <pkg>/auth_authority string <base64-ed25519-public-key>
@@ -665,15 +665,14 @@ The installer wizard follows the same flow as Linux:
 
 - Setup mode: use the wizard / skip (skip keeps an existing configuration)
 - Node name and description
-- WebSocket port (1..65535)
-- Local-service editor (add/edit/delete; name and port validation)
-- One authorization network with its authority, plus per-service authorization toggles
-- Bootstrap addresses (one per line or comma-separated; must contain `/ws` and `/p2p/<PeerId>`; may be empty)
+- Listen port (1..65535)
+- Local-service editor (add/edit/delete; each entry has a name, port, publish switch and auth switch)
+- Authorization network: enable switch, network name and authority public key
+- Bootstrap addresses (one per line or comma-separated)
 - Summary confirmation
 
-Roles, IPv4/IPv6 listeners and the firewall are no longer asked; address families are detected at startup.
-PQ transport and PQ identity use program defaults; `pq_required` uses its default.
-Advanced settings (Ping/Kademlia, Dispatcher/Registry, Relay/Compat) use defaults and are not asked individually.
+Only these settings are managed by the wizard; unlisted configuration is reset to defaults on write.
+PQ, Ping/Kademlia, Dispatcher/Registry, Relay/Compat use defaults and are not shown.
 Windows does not pre-fill an old `config.toml`; reconfiguration starts from defaults and backs up the old file as `config.toml.bak.<timestamp>`.
 
 Compatible upgrades do not show the wizard. To force reconfiguration:

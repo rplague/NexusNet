@@ -18,7 +18,7 @@
 | `main` / `runtime` | 启动编排与信号处理。`runtime::start_node` 由桌面二进制和移动端共用。 |
 | `SwarmActor` | 唯一持有 libp2p `Swarm` 的任务。所有网络命令经它串行化执行。 |
 | `NodeController` | 单事件循环，处理网络事件、后端命令、服务 tick、中继 tick 和关闭。 |
-| `ServiceDispatcher` | 持有后端 TCP 连接、就绪状态、重连和请求转发。 |
+| `ServiceDispatcher` | 持有后端 TCP 连接、就绪状态、重连、请求转发，并在 reload 时按配置增删后端。 |
 | `ServiceRegistryActor` | 纯状态机加有界 DHT 作业，负责宣告、撤销和类型索引。 |
 | `AuthGate` | 验证签名鉴权记录并执行 fail-closed 判定。 |
 | `DhtCache` | 读穿透（read-through）缓存，每 key 单飞刷新。 |
@@ -202,7 +202,7 @@ A node is a microkernel surrounded by local backends (the sidecar pattern):
 | `main` / `runtime` | Startup orchestration and signal handling. `runtime::start_node` is shared by the desktop binary and mobile hosts. |
 | `SwarmActor` | The only task that owns the libp2p `Swarm`. All network commands are serialized through it. |
 | `NodeController` | Single event loop that handles network events, backend commands, service ticks, relay ticks and shutdown. |
-| `ServiceDispatcher` | Owns backend TCP connections, readiness, reconnects and request forwarding. |
+| `ServiceDispatcher` | Owns backend TCP connections, readiness, reconnects and request forwarding; reload reconciles backends with the config. |
 | `ServiceRegistryActor` | Pure state machine plus bounded DHT jobs for announcements, withdrawals and the type index. |
 | `AuthGate` | Verifies signed authorization records and applies fail-closed decisions. |
 | `DhtCache` | Read-through cache with per-key single-flight refresh. |

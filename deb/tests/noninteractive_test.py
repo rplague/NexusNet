@@ -158,7 +158,7 @@ class NoninteractiveTest(unittest.TestCase):
     def test_existing_services_enable_local_service_mode(self):
         self.preseed("setup_mode", "wizard")
         self.run_config(FIXTURES / "services.toml", reconfigure=True)
-        self.assertEqual(self.value("local_services"), "ocr:5014:1,tts:5015")
+        self.assertEqual(self.value("local_services"), "ocr:5014:1:1,tts:5015:0:0")
         self.assertEqual(self.value("local_services_enabled"), "true")
         self.assertEqual(self.value("auth_enabled"), "false")
 

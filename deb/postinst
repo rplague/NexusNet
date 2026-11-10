@@ -121,44 +121,34 @@ json_services() {
         _name="${_item%%:*}"
         _rest="${_item#*:}"
         _port="${_rest%%:*}"
-        _auth=""
+        _after=""
         if [ "$_rest" != "$_port" ]; then
-            _auth="${_rest#*:}"
+            _after="${_rest#*:}"
+        fi
+        _auth=""
+        _publish="1"
+        if [ -n "$_after" ]; then
+            _auth="${_after%%:*}"
+            if [ "$_after" != "$_auth" ]; then
+                _publish="${_after#*:}"
+            fi
         fi
         _port=$(json_num "$_port" 0)
         _req=false
         case "$_auth" in
             1|true|TRUE|yes|on) _req=true ;;
         esac
+        _pub=true
+        case "$_publish" in
+            0|false|FALSE|no|off) _pub=false ;;
+        esac
         _name=$(json_escape "$_name")
-        _auth=$(json_escape "$_auth")
         [ "$_first" -eq 0 ] && _out="${_out},"
-        _out="${_out}{\"name\":\"${_name}\",\"port\":${_port},\"require_auth\":${_req}}"
+        _out="${_out}{\"name\":\"${_name}\",\"port\":${_port},\"require_auth\":${_req},\"publish\":${_pub}}"
         _first=0
     done
     IFS="$_oldifs"
     printf '[%s]' "$_out"
-}
-
-strip_auth_csv() {
-    _in="$1"
-    _out=""
-    _first=1
-    _oldifs="$IFS"
-    IFS=','
-    for _item in $_in; do
-        _item=$(printf '%s' "$_item" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-        [ -z "$_item" ] && continue
-        _name="${_item%%:*}"
-        _rest="${_item#*:}"
-        _port="${_rest%%:*}"
-        [ -z "$_name" ] || [ -z "$_port" ] && continue
-        [ "$_first" -eq 0 ] && _out="${_out},"
-        _out="${_out}${_name}:${_port}"
-        _first=0
-    done
-    IFS="$_oldifs"
-    printf '%s' "$_out"
 }
 
 db_get_mode() {
@@ -247,11 +237,9 @@ if [ "${MODE}" = "wizard" ]; then
     if [ "${AUTH_ENABLED}" != "true" ]; then
         AUTH_NETWORK="none"
         AUTH_AUTHORITY=""
-        LOCAL_SERVICES="$(strip_auth_csv "${LOCAL_SERVICES}")"
     elif [ -z "${AUTH_NETWORK}" ] || [ "${AUTH_NETWORK}" = "none" ]; then
         AUTH_NETWORK="none"
         AUTH_AUTHORITY=""
-        LOCAL_SERVICES="$(strip_auth_csv "${LOCAL_SERVICES}")"
     fi
     if [ "${PQ_REQUIRED}" = "true" ]; then
         PQ_TRANSPORT="true"

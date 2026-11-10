@@ -36,7 +36,10 @@ use crate::config::ConfigHandle;
 use crate::controller::NodeController;
 use crate::log::{self, LogEntry, LogLevel, LogStruct};
 use crate::network::{KeyManager, Network};
-use crate::service_dispatcher::{ControlCommand, InboundRequest, ServiceDispatcher, ToController};
+use crate::service_dispatcher::{
+    ControlCommand, DispatcherChannels, DispatcherCommand, InboundRequest, ServiceDispatcher,
+    ToController,
+};
 use crate::sidecar_protocol::Message;
 use crate::{network, paths};
 
@@ -227,10 +230,12 @@ pub async fn start_node(options: NodeOptions) -> Result<NodeHandle, NodeError> {
 
     let (to_controller_tx, to_controller_rx) = mpsc::channel(128);
     let (to_dispatcher_tx, to_dispatcher_rx) = mpsc::channel::<InboundRequest>(256);
+    let (dispatcher_cmd_tx, dispatcher_cmd_rx) = mpsc::channel::<DispatcherCommand>(8);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     let (dispatcher, readiness_rx) = ServiceDispatcher::new(
         to_dispatcher_rx,
+        dispatcher_cmd_rx,
         to_controller_tx.clone(),
         config_handle.clone(),
         peer_id,
@@ -247,8 +252,11 @@ pub async fn start_node(options: NodeOptions) -> Result<NodeHandle, NodeError> {
         config_handle.clone(),
         peer_id,
         to_controller_rx,
-        to_dispatcher_tx,
-        readiness_rx,
+        DispatcherChannels {
+            inbound_tx: to_dispatcher_tx,
+            command_tx: dispatcher_cmd_tx,
+            readiness_rx,
+        },
         network,
         shutdown_rx,
     );

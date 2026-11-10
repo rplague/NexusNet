@@ -141,6 +141,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         name: "echo".to_string(),
         port: backend_port,
         require_auth: false,
+        publish: true,
     }];
     save_config(provider_config, &root.join("b/config.toml"))?;
 

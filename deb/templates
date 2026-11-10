@@ -39,8 +39,8 @@ Description: 是否启用本地服务 / Enable local services:
 Template: @PKG@/local_services
 Type: string
 Description: 本地服务 / Local services:
- 逗号分隔，格式 name:port 或 name:port:auth，例如 ocr:5014
- Comma-separated name:port[:auth].
+ 逗号分隔，格式 name:port[:auth[:publish]]，例如 ocr:5014:1:1
+ Comma-separated name:port[:auth[:publish]].
 
 Template: @PKG@/auth_enabled
 Type: boolean

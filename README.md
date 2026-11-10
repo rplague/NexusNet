@@ -6,7 +6,7 @@ A language-agnostic libp2p networking layer for services that need to find and c
 
 NexusNet joins a machine to a decentralized P2P network: Kademlia DHT for discovery and service registration, WebSocket transport, NAT traversal through Circuit Relay v2, and a small sidecar protocol so the business process can stay in any language.
 
-**Status:** `0.6.2-11020` · roughly 6/10 completeness · interfaces are stabilizing, not frozen.
+**Status:** `0.6.3` · roughly 6/10 completeness · interfaces are stabilizing, not frozen.
 
 [Why](#why-nexusnet) · [Quickstart](#quickstart) · [Architecture](#architecture) · [Features](#features) · [Configuration](#configuration) · [Compatibility](#compatibility-and-status) · [Documentation](#documentation)
 
@@ -92,7 +92,7 @@ Every queue is bounded, so overload returns an explicit error instead of growing
 | Capability | What you get | Details |
 |---|---|---|
 | Discovery | Kademlia provider records, RTT-ranked provider selection | [docs/service-registry.md](./docs/service-registry.md) |
-| Service registry | Type index with leases, automatic re-announce, relay gating | [docs/service-registry.md](./docs/service-registry.md) |
+| Service registry | Type index with leases, automatic re-announce, relay gating, per-service opt-out of network publishing | [docs/service-registry.md](./docs/service-registry.md) |
 | Sidecar protocol | Persistent TCP, CBOR messages, UUID correlation, 30 s default timeout | [docs/sidecar.cddl](./docs/sidecar.cddl) |
 | NAT traversal | Circuit Relay v2, reservations, relay-aware announcements | [docs/nat-relay.md](./docs/nat-relay.md) |
 | Authorization | COSE_Sign1 whitelists, TUF-lite rollback/freeze/mix-and-match checks | [docs/auth.md](./docs/auth.md) |
@@ -263,7 +263,7 @@ Identity:
 
 ## Compatibility and status
 
-NexusNet is at **0.6.2-11020** and roughly **6/10** completeness. Treat the interfaces as stabilizing, not frozen.
+NexusNet is at **0.6.3** and roughly **6/10** completeness. Treat the interfaces as stabilizing, not frozen.
 
 - **WebSocket-only since 0.6.x.** Raw TCP peers from older versions cannot connect; upgrade every node together.
 - **`/oahd/service/types` changed format without a version bump.** New nodes read both formats but always write the tuple form. Stop old writers before upgrading the rest of the network; there is no rolling compatibility.

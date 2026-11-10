@@ -1,6 +1,6 @@
 [package]
 name = "NexusNet"
-version = "0.6.2-11020"
+version = "0.6.3"
 edition = "2024"
 license = "GPL-3.0"
 description = "Language-agnostic libp2p P2P networking layer for the OAHD project"

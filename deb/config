@@ -154,10 +154,9 @@ def load(path):
             port = entry.get("port")
             if not isinstance(name, str) or not isinstance(port, int):
                 continue
-            if entry.get("require_auth") is True:
-                services_out.append("%s:%d:1" % (name, port))
-            else:
-                services_out.append("%s:%d" % (name, port))
+            auth_flag = 1 if entry.get("require_auth") is True else 0
+            publish = 0 if entry.get("publish") is False else 1
+            services_out.append("%s:%d:%d:%d" % (name, port, auth_flag, publish))
         data["LOCAL_SERVICES"] = ",".join(services_out)
 
     network_name = _as_str(auth.get("network"), data["AUTH_NETWORK"])
@@ -541,6 +540,20 @@ bs_prompt() {
 
 # --- local service list -----------------------------------------------------
 
+normalize_flag() {
+    case "$1" in
+        1|true|TRUE|yes|on) printf '1' ;;
+        *) printf '0' ;;
+    esac
+}
+
+normalize_publish() {
+    case "$1" in
+        0|false|FALSE|no|off) printf '0' ;;
+        *) printf '1' ;;
+    esac
+}
+
 parse_local_services() {
     _csv="$1"
     _out="$2"
@@ -553,17 +566,26 @@ parse_local_services() {
         [ -z "${_item}" ] || {
             _name="${_item%%:*}"
             _rest="${_item#*:}"
-            _port="${_rest%%:*}"
-            _flag=""
-            if [ "${_rest}" != "${_port}" ]; then
-                _flag="${_rest#*:}"
+            if [ -z "${_name}" ] || [ "${_rest}" = "${_item}" ]; then
+                IFS=','
+                continue
             fi
-            case "${_flag}" in
-                1|true|TRUE|yes|on) _flag=1 ;;
-                *) _flag=0 ;;
-            esac
+            _port="${_rest%%:*}"
+            _after=""
+            if [ "${_rest}" != "${_port}" ]; then
+                _after="${_rest#*:}"
+            fi
+            _auth=0
+            _publish=1
+            if [ -n "${_after}" ]; then
+                _auth_raw="${_after%%:*}"
+                _auth="$(normalize_flag "${_auth_raw}")"
+                if [ "${_after}" != "${_auth_raw}" ]; then
+                    _publish="$(normalize_publish "${_after#*:}")"
+                fi
+            fi
             if [ -n "${_name}" ] && [ -n "${_port}" ]; then
-                printf '%s:%s:%s\n' "${_name}" "${_port}" "${_flag}" >> "${_out}"
+                printf '%s:%s:%s:%s\n' "${_name}" "${_port}" "${_auth}" "${_publish}" >> "${_out}"
             fi
         }
         IFS=','
@@ -578,16 +600,12 @@ ls_count() {
 
 ls_to_csv() {
     _first=1
-    while IFS=: read -r _name _port _flag; do
+    while IFS=: read -r _name _port _auth _publish; do
         [ -n "${_name}" ] || continue
         if [ "${_first}" -eq 0 ]; then
             printf ','
         fi
-        if [ "${_flag}" = "1" ]; then
-            printf '%s:%s:1' "${_name}" "${_port}"
-        else
-            printf '%s:%s' "${_name}" "${_port}"
-        fi
+        printf '%s:%s:%s:%s' "${_name}" "${_port}" "${_auth}" "${_publish}"
         _first=0
     done < "${LS_FILE}"
 }
@@ -598,10 +616,15 @@ ls_summary() {
         return 0
     fi
     _sep=""
-    while IFS=: read -r _name _port _flag; do
+    while IFS=: read -r _name _port _auth _publish; do
         [ -n "${_name}" ] || continue
-        printf '%s%s:%s' "${_sep}" "${_name}" "${_port}"
-        [ "${_flag}" = "1" ] && printf '[鉴权]'
+        printf '%s%s:%s ' "${_sep}" "${_name}" "${_port}"
+        if [ "${_publish}" = "0" ]; then
+            printf '[仅本地]'
+        else
+            printf '[已发布]'
+        fi
+        [ "${_auth}" = "1" ] && printf '[鉴权]'
         _sep=", "
     done < "${LS_FILE}"
 }
@@ -609,9 +632,23 @@ ls_summary() {
 ls_has_name() {
     _want="$1"
     _skip="${2:-}"
-    while IFS=: read -r _name _port _flag; do
+    while IFS=: read -r _name _port _auth _publish; do
         [ -n "${_name}" ] || continue
         if [ "${_name}" = "${_want}" ] && [ "${_name}" != "${_skip}" ]; then
+            return 0
+        fi
+    done < "${LS_FILE}"
+    return 1
+}
+
+ls_flags_for() {
+    _want="$1"
+    LS_AUTH=0
+    LS_PUBLISH=1
+    while IFS=: read -r _name _port _auth _publish; do
+        if [ "${_name}" = "${_want}" ]; then
+            LS_AUTH="${_auth:-0}"
+            LS_PUBLISH="${_publish:-1}"
             return 0
         fi
     done < "${LS_FILE}"
@@ -622,10 +659,10 @@ ls_remove() {
     _drop="$1"
     _tmp="${LS_FILE}.tmp"
     : > "${_tmp}"
-    while IFS=: read -r _name _port _flag; do
+    while IFS=: read -r _name _port _auth _publish; do
         [ -n "${_name}" ] || continue
         [ "${_name}" = "${_drop}" ] && continue
-        printf '%s:%s:%s\n' "${_name}" "${_port}" "${_flag}" >> "${_tmp}"
+        printf '%s:%s:%s:%s\n' "${_name}" "${_port}" "${_auth}" "${_publish}" >> "${_tmp}"
     done < "${LS_FILE}"
     mv "${_tmp}" "${LS_FILE}"
 }
@@ -634,43 +671,17 @@ ls_replace() {
     _old="$1"
     _new="$2"
     _newport="$3"
+    _newauth="$4"
+    _newpublish="$5"
     _tmp="${LS_FILE}.tmp"
     : > "${_tmp}"
-    while IFS=: read -r _name _port _flag; do
+    while IFS=: read -r _name _port _auth _publish; do
         [ -n "${_name}" ] || continue
         if [ "${_name}" = "${_old}" ]; then
-            printf '%s:%s:%s\n' "${_new}" "${_newport}" "${_flag}" >> "${_tmp}"
+            printf '%s:%s:%s:%s\n' "${_new}" "${_newport}" "${_newauth}" "${_newpublish}" >> "${_tmp}"
         else
-            printf '%s:%s:%s\n' "${_name}" "${_port}" "${_flag}" >> "${_tmp}"
+            printf '%s:%s:%s:%s\n' "${_name}" "${_port}" "${_auth}" "${_publish}" >> "${_tmp}"
         fi
-    done < "${LS_FILE}"
-    mv "${_tmp}" "${LS_FILE}"
-}
-
-ls_toggle_auth() {
-    _want="$1"
-    _tmp="${LS_FILE}.tmp"
-    : > "${_tmp}"
-    while IFS=: read -r _name _port _flag; do
-        [ -n "${_name}" ] || continue
-        if [ "${_name}" = "${_want}" ]; then
-            if [ "${_flag}" = "1" ]; then
-                _flag=0
-            else
-                _flag=1
-            fi
-        fi
-        printf '%s:%s:%s\n' "${_name}" "${_port}" "${_flag}" >> "${_tmp}"
-    done < "${LS_FILE}"
-    mv "${_tmp}" "${LS_FILE}"
-}
-
-ls_clear_auth() {
-    _tmp="${LS_FILE}.tmp"
-    : > "${_tmp}"
-    while IFS=: read -r _name _port _flag; do
-        [ -n "${_name}" ] || continue
-        printf '%s:%s:0\n' "${_name}" "${_port}" >> "${_tmp}"
     done < "${LS_FILE}"
     mv "${_tmp}" "${LS_FILE}"
 }
@@ -721,6 +732,44 @@ prompt_service_name() {
     done
 }
 
+prompt_service_flags() {
+    _auth="${1:-0}"
+    _publish="${2:-1}"
+    while :; do
+        if [ "${_auth}" = "1" ]; then
+            _auth_state="是"
+        else
+            _auth_state="否"
+        fi
+        if [ "${_publish}" = "1" ]; then
+            _publish_state="是"
+        else
+            _publish_state="否"
+        fi
+        set -- \
+            auth "需要鉴权：${_auth_state}" \
+            publish "发布到网络：${_publish_state}" \
+            save "保存"
+        if ! wt_menu --title "NexusNet - 本地服务开关" --menu \
+            "设置开关" 11 "${WIZ_W}" 3 "$@"; then
+            return 1
+        fi
+        case "${WT_RESULT}" in
+            auth)
+                if [ "${_auth}" = "1" ]; then _auth=0; else _auth=1; fi
+                ;;
+            publish)
+                if [ "${_publish}" = "1" ]; then _publish=0; else _publish=1; fi
+                ;;
+            save)
+                SERVICE_AUTH="${_auth}"
+                SERVICE_PUBLISH="${_publish}"
+                return 0
+                ;;
+        esac
+    done
+}
+
 # --- pages ------------------------------------------------------------------
 
 PAGE_NEXT="node"
@@ -768,6 +817,7 @@ configure_local_services_page() {
     cp "${LS_FILE}" "${_snapshot}"
     _previous_enabled="${LS_ENABLED}"
     LS_ENABLED=1
+    LS_PAGE_RESULT="save"
 
     while :; do
         _count="$(ls_count)"
@@ -778,10 +828,15 @@ configure_local_services_page() {
         fi
 
         set --
-        while IFS=: read -r _name _port _flag; do
+        while IFS=: read -r _name _port _auth _publish; do
             [ -n "${_name}" ] || continue
             _desc="${_name}:${_port}"
-            [ "${_flag}" = "1" ] && _desc="${_desc} [需鉴权]"
+            if [ "${_publish}" = "0" ]; then
+                _desc="${_desc} [仅本地]"
+            else
+                _desc="${_desc} [已发布]"
+            fi
+            [ "${_auth}" = "1" ] && _desc="${_desc}[鉴权]"
             set -- "$@" "svc:${_name}" "${_desc}"
         done < "${LS_FILE}"
         set -- "$@" "__add__" "添加本地服务" "__save__" "保存并返回" "__cancel__" "取消"
@@ -790,6 +845,7 @@ configure_local_services_page() {
             "管理本地服务（当前 ${_count} 个）" "${WIZ_H}" "${WIZ_W}" "${WIZ_LIST_H}" "$@"; then
             cp "${_snapshot}" "${LS_FILE}"
             LS_ENABLED="${_previous_enabled}"
+            LS_PAGE_RESULT="cancel"
             return 0
         fi
 
@@ -797,40 +853,47 @@ configure_local_services_page() {
             __save__)
                 if [ "$(ls_count)" -eq 0 ]; then
                     LS_ENABLED=0
-                    AUTH_ENABLED=0
-                    AUTH_NETWORK_NAME="none"
-                    AUTH_AUTHORITY=""
                 else
                     LS_ENABLED=1
                 fi
+                LS_PAGE_RESULT="save"
                 return 0
                 ;;
             __cancel__)
                 cp "${_snapshot}" "${LS_FILE}"
                 LS_ENABLED="${_previous_enabled}"
+                LS_PAGE_RESULT="cancel"
                 return 0
                 ;;
             __add__)
                 if prompt_service_name "" ""; then
                     _new_name="${NAME_RESULT}"
                     if prompt_port "7000" "本地服务 ${_new_name} 的 TCP 端口"; then
-                        printf '%s:%s:0\n' "${_new_name}" "${PORT_RESULT}" >> "${LS_FILE}"
+                        _new_port="${PORT_RESULT}"
+                        if prompt_service_flags 0 1; then
+                            printf '%s:%s:%s:%s\n' "${_new_name}" "${_new_port}" \
+                                "${SERVICE_AUTH}" "${SERVICE_PUBLISH}" >> "${LS_FILE}"
+                        fi
                     fi
                 fi
                 ;;
             svc:*)
                 _selected_service="${WT_RESULT#svc:}"
                 _selected_port=""
-                while IFS=: read -r _name _port _flag; do
+                _selected_auth=0
+                _selected_publish=1
+                while IFS=: read -r _name _port _auth _publish; do
                     if [ "${_name}" = "${_selected_service}" ]; then
                         _selected_port="${_port}"
+                        _selected_auth="${_auth:-0}"
+                        _selected_publish="${_publish:-1}"
                         break
                     fi
                 done < "${LS_FILE}"
 
                 if wt_menu --title "NexusNet - ${_selected_service}" --menu \
                     "选择操作" 11 60 3 \
-                    edit "编辑名称与端口" \
+                    edit "编辑服务" \
                     delete "删除此服务" \
                     back "返回列表"; then
                     case "${WT_RESULT}" in
@@ -840,8 +903,13 @@ configure_local_services_page() {
                                 _new_name="${NAME_RESULT}"
                                 if prompt_port "${_selected_port}" \
                                     "服务 ${_new_name} 的 TCP 端口"; then
-                                    ls_replace "${_selected_service}" "${_new_name}" \
-                                        "${PORT_RESULT}"
+                                    _new_port="${PORT_RESULT}"
+                                    if prompt_service_flags \
+                                        "${_selected_auth}" "${_selected_publish}"; then
+                                        ls_replace "${_selected_service}" "${_new_name}" \
+                                            "${_new_port}" "${SERVICE_AUTH}" \
+                                            "${SERVICE_PUBLISH}"
+                                    fi
                                 fi
                             fi
                             ;;
@@ -857,151 +925,134 @@ configure_local_services_page() {
     done
 }
 
-configure_auth_page() {
-    if [ "$(ls_count)" -eq 0 ]; then
-        wt_msg "当前没有本地服务，无法配置服务鉴权。请先添加本地服务。" 10 76
-        return 0
+page_services() {
+    configure_local_services_page
+    if [ "${LS_PAGE_RESULT}" = "cancel" ]; then
+        PAGE_NEXT="network"
+    else
+        PAGE_NEXT="auth"
     fi
+}
 
-    _network_candidate="${AUTH_NETWORK_NAME}"
-    if [ "${_network_candidate}" = "none" ]; then
-        _network_candidate=""
-    fi
-
+page_network() {
     while :; do
-        if ! wt_input "鉴权网络名称（字母、数字、_、-，最长 64）" \
-            "${_network_candidate}" "NexusNet - 鉴权网络"; then
+        if ! wt_menu --title "NexusNet - 网络" --menu \
+            "监听端口：${PORT}" "${WIZ_H}" "${WIZ_W}" "${WIZ_LIST_H}" \
+            port "修改监听端口" \
+            next "下一步：本地服务" \
+            back "返回：节点信息"; then
+            PAGE_NEXT="node"
             return 0
         fi
-        _network_candidate="${WT_RESULT}"
-        if is_valid_name "${_network_candidate}"; then
-            break
-        fi
-        wt_msg "鉴权网络名称无效：不能为空，只允许 A-Z a-z 0-9 _ -，且最长 64 字符。" 10 78
-    done
-
-    _authority_candidate="${AUTH_AUTHORITY}"
-    while :; do
-        if ! wt_input "Authority 公钥（base64 Ed25519）" \
-            "${_authority_candidate}" "NexusNet - 鉴权网络"; then
-            return 0
-        fi
-        _authority_candidate="${WT_RESULT}"
-        if [ -n "${_authority_candidate}" ]; then
-            break
-        fi
-        wt_msg "Authority 公钥不能为空。" 9 70
-    done
-
-    _snapshot="${WIZ_TMP}/local_services.auth"
-    cp "${LS_FILE}" "${_snapshot}"
-    _default_tag=""
-    _list_h=$(( $(ls_count) + 1 ))
-    [ "${_list_h}" -lt 3 ] && _list_h=3
-    [ "${_list_h}" -gt "${WIZ_LIST_H}" ] && _list_h="${WIZ_LIST_H}"
-    _menu_h=$((_list_h + 9))
-    [ "${_menu_h}" -gt "${WIZ_H}" ] && _menu_h="${WIZ_H}"
-    _menu_text="鉴权网络：${_network_candidate}
-回车切换服务鉴权；完成后选择“保存并返回”"
-
-    while :; do
-        set -- --menu "${_menu_text}" "${_menu_h}" "${WIZ_W}" "${_list_h}"
-        while IFS=: read -r _name _port _flag; do
-            [ -n "${_name}" ] || continue
-            if [ "${_flag}" = "1" ]; then
-                _state="已鉴权"
-            else
-                _state="未鉴权"
-            fi
-            set -- "$@" "svc:${_name}" "${_name}:${_port} [${_state}]"
-        done < "${LS_FILE}"
-        set -- "$@" "__save__" "保存并返回"
-        if [ -n "${_default_tag}" ]; then
-            set -- --default-item "${_default_tag}" "$@"
-        fi
-
-        if ! wt_menu --title "NexusNet - 服务鉴权" --cancel-button "返回（不保存）" "$@"; then
-            cp "${_snapshot}" "${LS_FILE}"
-            return 0
-        fi
-
         case "${WT_RESULT}" in
-            __save__)
-                AUTH_NETWORK_NAME="${_network_candidate}"
-                AUTH_AUTHORITY="${_authority_candidate}"
-                AUTH_ENABLED=1
+            port)
+                if prompt_port "${PORT}" "监听端口"; then
+                    PORT="${PORT_RESULT}"
+                fi
+                ;;
+            next)
+                PAGE_NEXT="services"
                 return 0
                 ;;
-            svc:*)
-                ls_toggle_auth "${WT_RESULT#svc:}"
-                _default_tag="${WT_RESULT}"
+            back)
+                PAGE_NEXT="node"
+                return 0
                 ;;
         esac
     done
 }
 
-page_network() {
+prompt_auth_network() {
+    _value="$1"
     while :; do
-        if [ "${LS_ENABLED}" = "1" ]; then
-            _services_state="已启用（$(ls_count) 个）"
-        else
-            _services_state="未启用"
+        if ! wt_input "鉴权网络名称" "${_value}" "NexusNet - 鉴权网络"; then
+            return 1
         fi
+        _value="${WT_RESULT}"
+        if is_valid_name "${_value}"; then
+            AUTH_NETWORK_NAME="${_value}"
+            return 0
+        fi
+        wt_msg "鉴权网络名称无效：不能为空，只允许 A-Z a-z 0-9 _ -，且最长 64 字符。" 10 78
+    done
+}
+
+prompt_auth_authority() {
+    _value="$1"
+    while :; do
+        if ! wt_input "Authority 公钥（base64 Ed25519）" \
+            "${_value}" "NexusNet - 鉴权网络"; then
+            return 1
+        fi
+        _value="${WT_RESULT}"
+        if [ -n "${_value}" ]; then
+            AUTH_AUTHORITY="${_value}"
+            return 0
+        fi
+        wt_msg "Authority 公钥不能为空。" 9 70
+    done
+}
+
+page_auth() {
+    while :; do
         if [ "${AUTH_ENABLED}" = "1" ]; then
-            _auth_state="已启用（${AUTH_NETWORK_NAME}）"
+            _enabled_state="是"
         else
-            _auth_state="未启用"
+            _enabled_state="否"
+        fi
+        if [ -n "${AUTH_NETWORK_NAME}" ]; then
+            _network_text="${AUTH_NETWORK_NAME}"
+        else
+            _network_text="未设置"
+        fi
+        if [ -n "${AUTH_AUTHORITY}" ]; then
+            _authority_text="已设置"
+        else
+            _authority_text="未设置"
         fi
 
-        set -- \
-            port "WebSocket TCP 端口：${PORT}" \
-            services "本地服务：${_services_state}" \
-            auth "鉴权网络：${_auth_state}"
-        if [ "${LS_ENABLED}" = "1" ]; then
-            set -- "$@" services_off "关闭并清空本地服务"
-        fi
-        if [ "${AUTH_ENABLED}" = "1" ]; then
-            set -- "$@" auth_off "关闭鉴权网络"
-        fi
-        set -- "$@" next "下一步：Bootstrap" back "返回：节点信息"
-
-        if ! wt_menu --title "NexusNet - 网络与功能" --menu \
-            "配置网络与功能" "${WIZ_H}" "${WIZ_W}" "${WIZ_LIST_H}" "$@"; then
-            PAGE_NEXT="node"
+        if ! wt_menu --title "NexusNet - 鉴权网络" --menu \
+            "鉴权网络" "${WIZ_H}" "${WIZ_W}" "${WIZ_LIST_H}" \
+            enabled "启用鉴权：${_enabled_state}" \
+            network "网络名称：${_network_text}" \
+            authority "Authority 公钥：${_authority_text}" \
+            next "下一步：Bootstrap" \
+            back "返回：本地服务"; then
+            PAGE_NEXT="services"
             return 0
         fi
 
         case "${WT_RESULT}" in
-            port)
-                if prompt_port "${PORT}" "WebSocket TCP 端口（1..65535）"; then
-                    PORT="${PORT_RESULT}"
+            enabled)
+                if [ "${AUTH_ENABLED}" = "1" ]; then
+                    AUTH_ENABLED=0
+                elif [ -z "${AUTH_NETWORK_NAME}" ] || [ -z "${AUTH_AUTHORITY}" ]; then
+                    if prompt_auth_network "${AUTH_NETWORK_NAME}"; then
+                        if prompt_auth_authority "${AUTH_AUTHORITY}"; then
+                            AUTH_ENABLED=1
+                        fi
+                    fi
+                else
+                    AUTH_ENABLED=1
                 fi
                 ;;
-            services)
-                configure_local_services_page
+            network)
+                prompt_auth_network "${AUTH_NETWORK_NAME}" || true
                 ;;
-            services_off)
-                : > "${LS_FILE}"
-                LS_ENABLED=0
-                AUTH_ENABLED=0
-                AUTH_NETWORK_NAME="none"
-                AUTH_AUTHORITY=""
-                ;;
-            auth)
-                configure_auth_page
-                ;;
-            auth_off)
-                AUTH_ENABLED=0
-                AUTH_NETWORK_NAME="none"
-                AUTH_AUTHORITY=""
-                ls_clear_auth
+            authority)
+                prompt_auth_authority "${AUTH_AUTHORITY}" || true
                 ;;
             next)
+                if [ "${AUTH_ENABLED}" = "1" ] && \
+                    { [ -z "${AUTH_NETWORK_NAME}" ] || [ -z "${AUTH_AUTHORITY}" ]; }; then
+                    wt_msg "启用鉴权时需要网络名称和 Authority 公钥。" 9 74
+                    continue
+                fi
                 PAGE_NEXT="bootstrap"
                 return 0
                 ;;
             back)
-                PAGE_NEXT="node"
+                PAGE_NEXT="services"
                 return 0
                 ;;
         esac
@@ -1031,7 +1082,7 @@ page_bootstrap() {
         set -- "$@" "__add__" "添加 Bootstrap" "__save__" "保存并返回"
 
         if ! wt_menu --title "NexusNet - Bootstrap" --cancel-button "取消" "$@"; then
-            PAGE_NEXT="network"
+            PAGE_NEXT="auth"
             return 0
         fi
 
@@ -1081,10 +1132,10 @@ page_bootstrap() {
 }
 
 page_summary() {
-    if [ "${LS_ENABLED}" = "1" ] && [ "$(ls_count)" -gt 0 ]; then
+    if [ "$(ls_count)" -gt 0 ]; then
         _services_text="$(ls_summary)"
     else
-        _services_text="未启用"
+        _services_text="无"
     fi
     if [ "${AUTH_ENABLED}" = "1" ]; then
         _auth_text="${AUTH_NETWORK_NAME}"
@@ -1101,28 +1152,22 @@ page_summary() {
 
 节点名称：${NODE_NAME}
 节点描述：${NODE_DESCRIPTION}
-WebSocket 端口：${PORT}
+监听端口：${PORT}
 本地服务：${_services_text}
 鉴权网络：${_auth_text}
-PQ 传输/身份：使用默认值或旧配置
 Bootstrap：${_bootstrap_text}
 
-写入配置？" 22 86
+未在向导中列出的配置将恢复默认值。
+
+写入配置？" 24 86
 }
 
 finalize_wizard() {
-    if [ "${LS_ENABLED}" != "1" ] || [ "$(ls_count)" -eq 0 ]; then
+    if [ "$(ls_count)" -eq 0 ]; then
         LS_ENABLED=0
-        AUTH_ENABLED=0
-        AUTH_NETWORK_NAME="none"
-        AUTH_AUTHORITY=""
         LOCAL_SERVICES=""
-    elif [ "${AUTH_ENABLED}" != "1" ]; then
-        LOCAL_SERVICES="$(ls_to_csv)"
-        AUTH_NETWORK_NAME="none"
-        AUTH_AUTHORITY=""
-        ls_clear_auth
     else
+        LS_ENABLED=1
         LOCAL_SERVICES="$(ls_to_csv)"
     fi
 
@@ -1213,7 +1258,7 @@ fi
 
 AUTH_NETWORK_NAME="${AUTH_NETWORK}"
 if [ "${AUTH_NETWORK_NAME}" = "none" ] || [ -z "${AUTH_NETWORK_NAME}" ]; then
-    AUTH_NETWORK_NAME="none"
+    AUTH_NETWORK_NAME=""
     AUTH_ENABLED=0
     AUTH_AUTHORITY=""
 else
@@ -1235,6 +1280,16 @@ while :; do
         network)
             PAGE_NEXT=""
             page_network
+            PAGE="${PAGE_NEXT}"
+            ;;
+        services)
+            PAGE_NEXT=""
+            page_services
+            PAGE="${PAGE_NEXT}"
+            ;;
+        auth)
+            PAGE_NEXT=""
+            page_auth
             PAGE="${PAGE_NEXT}"
             ;;
         bootstrap)

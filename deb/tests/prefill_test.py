@@ -74,7 +74,7 @@ class PrefillTest(unittest.TestCase):
 
     def test_local_services_and_auth_flags(self):
         data = self.prefill(FIXTURES / "services.toml")
-        self.assertEqual(data["LOCAL_SERVICES"], "ocr:5014:1,tts:5015")
+        self.assertEqual(data["LOCAL_SERVICES"], "ocr:5014:1:1,tts:5015:0:0")
 
     def test_auth_network_is_prefilled(self):
         data = self.prefill(FIXTURES / "auth.toml")

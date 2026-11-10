@@ -29,7 +29,7 @@ practice that means:
 
 A useful report contains:
 
-- NexusNet version or tag (for example `0.6.2-11020`).
+- NexusNet version or tag (for example `0.6.3`).
 - Operating system and how the node is deployed (systemd, Windows service, embedded).
 - The relevant configuration, with keys, keypair paths and private addresses redacted.
 - Logs from `journalctl -u nexusnet` or the configured log file.

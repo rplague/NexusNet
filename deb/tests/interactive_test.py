@@ -204,19 +204,19 @@ class InteractiveTest(unittest.TestCase):
                 {"kind": "menu", "value": "wizard"},
                 {"kind": "inputbox", "value": "node-a"},
                 {"kind": "inputbox", "value": "desc"},
-                {"kind": "menu", "value": "services"},
+                {"kind": "menu", "value": "next"},
                 {"kind": "menu", "value": "__add__"},
                 {"kind": "inputbox", "value": "ocr"},
                 {"kind": "inputbox", "value": "7000"},
-                {"kind": "menu", "value": "__save__"},
                 {"kind": "menu", "value": "auth"},
+                {"kind": "menu", "value": "save"},
+                {"kind": "menu", "value": "__save__"},
+                {"kind": "menu", "value": "enabled"},
                 {"kind": "inputbox", "value": "corp"},
                 {
                     "kind": "inputbox",
                     "value": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
                 },
-                {"kind": "menu", "value": "svc:ocr"},
-                {"kind": "menu", "value": "__save__"},
                 {"kind": "menu", "value": "next"},
                 {"kind": "menu", "value": "__add__"},
                 {
@@ -236,7 +236,7 @@ class InteractiveTest(unittest.TestCase):
         self.assertEqual(self.value("node_description"), "desc")
         self.assertEqual(self.value("port"), "5000")
         self.assertEqual(self.value("local_services_enabled"), "true")
-        self.assertEqual(self.value("local_services"), "ocr:7000:1")
+        self.assertEqual(self.value("local_services"), "ocr:7000:1:1")
         self.assertEqual(self.value("auth_enabled"), "true")
         self.assertEqual(self.value("auth_network"), "corp")
         self.assertEqual(
@@ -247,14 +247,6 @@ class InteractiveTest(unittest.TestCase):
             self.value("bootstrap"),
             "/ip4/1.2.3.4/tcp/5000/ws/p2p/12D3KooWExample",
         )
-        auth_menus = [
-            args for args in self.menu_calls()
-            if "NexusNet - 服务鉴权" in args
-        ]
-        self.assertEqual(len(auth_menus), 2)
-        self.assertTrue(all("--notags" in args for args in auth_menus))
-        default_index = auth_menus[1].index("--default-item")
-        self.assertEqual(auth_menus[1][default_index + 1], "svc:ocr")
 
         (self.dir / "config.toml").write_text(
             '[node]\nname = "node-a"\n', encoding="utf-8"
@@ -263,7 +255,7 @@ class InteractiveTest(unittest.TestCase):
         self.assertEqual(status, 0, output)
         self.assertEqual(self.calls(), 18)
         self.assertEqual(self.value("node_name"), "node-a")
-        self.assertEqual(self.value("local_services"), "ocr:7000:1")
+        self.assertEqual(self.value("local_services"), "ocr:7000:1:1")
 
     def test_existing_bootstrap_is_loaded_and_edited(self):
         self.set_responses(
@@ -271,6 +263,8 @@ class InteractiveTest(unittest.TestCase):
                 {"kind": "menu", "value": "wizard"},
                 {"kind": "inputbox", "value": "edge-01"},
                 {"kind": "inputbox", "value": "Edge node"},
+                {"kind": "menu", "value": "next"},
+                {"kind": "menu", "value": "__save__"},
                 {"kind": "menu", "value": "next"},
                 {"kind": "menu", "value": "bs:0"},
                 {"kind": "menu", "value": "edit"},
@@ -285,37 +279,26 @@ class InteractiveTest(unittest.TestCase):
 
         status, output = self.run_config(FIXTURES / "existing.toml", reconfigure=True)
         self.assertEqual(status, 0, output)
-        self.assertEqual(self.calls(), 9)
+        self.assertEqual(self.calls(), 11)
         self.assertEqual(
             self.value("bootstrap"),
             "/ip4/5.5.5.5/tcp/5000/ws/p2p/PeerEEE",
         )
 
-    def test_auth_toggle_discard_restores_flags(self):
+    def test_service_auth_flag_survives_disabled_auth_network(self):
         self.set_responses(
             [
                 {"kind": "menu", "value": "wizard"},
                 {"kind": "inputbox", "value": "node-c"},
                 {"kind": "inputbox", "value": "desc"},
-                {"kind": "menu", "value": "services"},
+                {"kind": "menu", "value": "next"},
                 {"kind": "menu", "value": "__add__"},
                 {"kind": "inputbox", "value": "ocr"},
                 {"kind": "inputbox", "value": "7000"},
-                {"kind": "menu", "value": "__save__"},
                 {"kind": "menu", "value": "auth"},
-                {"kind": "inputbox", "value": "corp"},
-                {
-                    "kind": "inputbox",
-                    "value": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
-                },
-                {"kind": "menu", "value": "svc:ocr"},
-                {"kind": "menu", "status": 1},
+                {"kind": "menu", "value": "save"},
+                {"kind": "menu", "value": "__save__"},
                 {"kind": "menu", "value": "next"},
-                {"kind": "menu", "value": "__add__"},
-                {
-                    "kind": "inputbox",
-                    "value": "/ip4/1.2.3.4/tcp/5000/ws/p2p/12D3KooWExample",
-                },
                 {"kind": "menu", "value": "__save__"},
                 {"kind": "yesno", "status": 0},
             ]
@@ -323,9 +306,9 @@ class InteractiveTest(unittest.TestCase):
 
         status, output = self.run_config()
         self.assertEqual(status, 0, output)
-        self.assertEqual(self.calls(), 18)
+        self.assertEqual(self.calls(), 13)
         self.assertEqual(self.value("local_services_enabled"), "true")
-        self.assertEqual(self.value("local_services"), "ocr:7000")
+        self.assertEqual(self.value("local_services"), "ocr:7000:1:1")
         self.assertEqual(self.value("auth_enabled"), "false")
 
     def test_bootstrap_add_edit_delete(self):
@@ -334,6 +317,8 @@ class InteractiveTest(unittest.TestCase):
                 {"kind": "menu", "value": "wizard"},
                 {"kind": "inputbox", "value": "node-d"},
                 {"kind": "inputbox", "value": "desc"},
+                {"kind": "menu", "value": "next"},
+                {"kind": "menu", "value": "__save__"},
                 {"kind": "menu", "value": "next"},
                 {"kind": "menu", "value": "__add__"},
                 {
@@ -361,7 +346,7 @@ class InteractiveTest(unittest.TestCase):
 
         status, output = self.run_config()
         self.assertEqual(status, 0, output)
-        self.assertEqual(self.calls(), 16)
+        self.assertEqual(self.calls(), 18)
         self.assertEqual(
             self.value("bootstrap"),
             "/ip4/3.3.3.3/tcp/5000/ws/p2p/PeerCCC",
@@ -375,15 +360,17 @@ class InteractiveTest(unittest.TestCase):
                 {"kind": "inputbox", "value": "desc"},
                 {"kind": "menu", "value": "next"},
                 {"kind": "menu", "value": "__save__"},
+                {"kind": "menu", "value": "next"},
+                {"kind": "menu", "value": "__save__"},
                 {"kind": "yesno", "status": 0},
             ]
         )
         status, output = self.run_config()
         self.assertEqual(status, 0, output)
-        self.assertEqual(self.calls(), 6)
+        self.assertEqual(self.calls(), 8)
         status, output = self.run_config()
         self.assertEqual(status, 0, output)
-        self.assertEqual(self.calls(), 6)
+        self.assertEqual(self.calls(), 8)
         self.assertEqual(self.value("node_name"), "node-r")
 
     def test_long_bootstrap_is_truncated_in_menu(self):
@@ -397,6 +384,8 @@ class InteractiveTest(unittest.TestCase):
                 {"kind": "inputbox", "value": "node-e"},
                 {"kind": "inputbox", "value": "desc"},
                 {"kind": "menu", "value": "next"},
+                {"kind": "menu", "value": "__save__"},
+                {"kind": "menu", "value": "next"},
                 {"kind": "menu", "value": "__add__"},
                 {"kind": "inputbox", "value": address},
                 {"kind": "menu", "value": "__save__"},
@@ -406,7 +395,7 @@ class InteractiveTest(unittest.TestCase):
 
         status, output = self.run_config()
         self.assertEqual(status, 0, output)
-        self.assertEqual(self.calls(), 8)
+        self.assertEqual(self.calls(), 10)
         self.assertEqual(self.value("bootstrap"), address)
 
         bootstrap_menus = [
@@ -419,12 +408,19 @@ class InteractiveTest(unittest.TestCase):
         )
         self.assertTrue(any("..." in arg for args in bootstrap_menus for arg in args))
 
-    def test_empty_bootstrap_and_no_services(self):
+    def test_local_service_publish_toggle(self):
         self.set_responses(
             [
                 {"kind": "menu", "value": "wizard"},
-                {"kind": "inputbox", "value": "node-b"},
+                {"kind": "inputbox", "value": "node-p"},
                 {"kind": "inputbox", "value": "desc"},
+                {"kind": "menu", "value": "next"},
+                {"kind": "menu", "value": "__add__"},
+                {"kind": "inputbox", "value": "ocr"},
+                {"kind": "inputbox", "value": "7000"},
+                {"kind": "menu", "value": "publish"},
+                {"kind": "menu", "value": "save"},
+                {"kind": "menu", "value": "__save__"},
                 {"kind": "menu", "value": "next"},
                 {"kind": "menu", "value": "__save__"},
                 {"kind": "yesno", "status": 0},
@@ -433,7 +429,25 @@ class InteractiveTest(unittest.TestCase):
 
         status, output = self.run_config()
         self.assertEqual(status, 0, output)
-        self.assertEqual(self.calls(), 6)
+        self.assertEqual(self.value("local_services"), "ocr:7000:0:0")
+
+    def test_empty_bootstrap_and_no_services(self):
+        self.set_responses(
+            [
+                {"kind": "menu", "value": "wizard"},
+                {"kind": "inputbox", "value": "node-b"},
+                {"kind": "inputbox", "value": "desc"},
+                {"kind": "menu", "value": "next"},
+                {"kind": "menu", "value": "__save__"},
+                {"kind": "menu", "value": "next"},
+                {"kind": "menu", "value": "__save__"},
+                {"kind": "yesno", "status": 0},
+            ]
+        )
+
+        status, output = self.run_config()
+        self.assertEqual(status, 0, output)
+        self.assertEqual(self.calls(), 8)
         self.assertEqual(self.value("setup_mode"), "wizard")
         self.assertEqual(self.value("node_name"), "node-b")
         self.assertEqual(self.value("local_services_enabled"), "false")

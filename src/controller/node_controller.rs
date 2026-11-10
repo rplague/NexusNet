@@ -27,7 +27,9 @@ use crate::config::ConfigHandle;
 use crate::dht_cache::DhtCache;
 use crate::log::{LogLevel, LogStruct};
 use crate::network::{AGENT_NAME, NetworkEvent, NetworkHandle, NetworkStart};
-use crate::service_dispatcher::{BackendReadiness, InboundRequest, ToController};
+use crate::service_dispatcher::{
+    DispatcherChannels, DispatcherCommand, InboundRequest, ToController,
+};
 use crate::service_protocol;
 
 use super::auth_gate::{AuthGate, Decision};
@@ -47,6 +49,7 @@ pub struct NodeController {
     pub(super) my_peer_id: PeerId,
     pub(super) swarm: NetworkHandle,
     to_controller_rx: mpsc::Receiver<ToController>,
+    pub(super) to_dispatcher_cmd_tx: mpsc::Sender<DispatcherCommand>,
     event_rx: mpsc::UnboundedReceiver<NetworkEvent>,
     shutdown_rx: watch::Receiver<bool>,
     pub(super) peers: PeerTracker,
@@ -70,11 +73,15 @@ impl NodeController {
         config: ConfigHandle,
         my_peer_id: PeerId,
         to_controller_rx: mpsc::Receiver<ToController>,
-        to_dispatcher_tx: mpsc::Sender<InboundRequest>,
-        readiness_rx: watch::Receiver<Arc<BackendReadiness>>,
+        dispatcher: DispatcherChannels,
         network: NetworkStart,
         shutdown_rx: watch::Receiver<bool>,
     ) -> Self {
+        let DispatcherChannels {
+            inbound_tx: to_dispatcher_tx,
+            command_tx: to_dispatcher_cmd_tx,
+            readiness_rx,
+        } = dispatcher;
         let NetworkStart {
             handle: swarm,
             events: event_rx,
@@ -125,6 +132,7 @@ impl NodeController {
             my_peer_id,
             swarm,
             to_controller_rx,
+            to_dispatcher_cmd_tx,
             event_rx,
             shutdown_rx,
             peers,

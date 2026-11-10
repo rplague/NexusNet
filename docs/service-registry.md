@@ -46,7 +46,7 @@ registry actor 订阅该 watch，用完整集合差分处理就绪/断开，不�
 | `Tick` | controller（1s） | 处理到期撤销/重试 |
 | `Reannounce` | 控制指令 | 后台重新调度 |
 | `RefreshTypes` | `list_services` | 后台刷新类型索引 |
-| `Reset` | reload | generation +1，清空临时状态，保留 known_types |
+| `Reset` | reload | generation +1，撤销既有宣告，保留 known_types，并按新配置重新宣告 |
 | `RelayStateChanged` | controller | 中继就绪/失效；控制 announce 门控与撤销 |
 
 ### 状态机
@@ -73,6 +73,10 @@ registry actor 订阅该 watch，用完整集合差分处理就绪/断开，不�
 
 #### announce
 
+- 只调度 `publish = true` 的本地服务；`publish = false` 的服务不会写入
+  provider 记录或类型索引，但其后端连接与显式 peer 调用保留。
+- reload 切换到 `publish = false` 时会立即撤销 provider 记录；已经写入类型
+  索引的本地条目不再续期，最迟在 `services.registry.type_ttl_secs` 后过期。
 - 成功且后端仍 ready：记入 `announced`。
 - 成功但中继已不可用：记入 `announced`，并加入强制撤销集合。
 - 成功但后端已 down：记入 `announced` 并立即调度撤销。
@@ -237,6 +241,12 @@ Scheduling priority:
 
 #### announce
 
+- Only local services with `publish = true` are scheduled. Services with
+  `publish = false` never write provider records or type-index entries, but
+  keep their backend connection and explicit peer calls.
+- Switching to `publish = false` on reload withdraws the provider record
+  immediately; an already-written local type-index entry stops being renewed
+  and expires within `services.registry.type_ttl_secs`.
 - Success and backend still ready: record it in `announced`.
 - Success but the relay is no longer available: record it in `announced` and add it to the forced-withdrawal set.
 - Success but the backend is down: record it in `announced` and schedule withdrawal immediately.
@@ -245,7 +255,7 @@ Scheduling priority:
 
 #### withdraw
 
-- Success: remove from `announced`; if the backend has recovered, schedule an announcement again.
+- Success: remove from `announced`; if the backend has recovered and the service is still published, schedule an announcement again.
 - Failure: set a new retry deadline.
 
 #### Provider record lifecycle
